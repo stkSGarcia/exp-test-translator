@@ -34,6 +34,12 @@ class TestCase:
     expected: Any = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
+    tol_abs: float | None = None
+    tol_rel: float | None = None
+    tol_strict: bool = True          # True = strict (<), False = non-strict (<=)
+    exc_type: str | None = None      # e.g. "ValueError" for typed raises
+    msg_contains: str | None = None
+    msg_regex: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -47,20 +53,96 @@ def _ast_to_value(node: ast.expr) -> Any:
     if isinstance(node, ast.List):
         return [_ast_to_value(e) for e in node.elts]
     if isinstance(node, ast.Tuple):
-        return [_ast_to_value(e) for e in node.elts]  # tuple → list (no tuple in JSON)
+        return ("__tuple__", [_ast_to_value(e) for e in node.elts])
+    if isinstance(node, ast.Set):
+        return ("__set__", [_ast_to_value(e) for e in node.elts])
     if isinstance(node, ast.Dict):
-        return {_ast_to_value(k): _ast_to_value(v) for k, v in zip(node.keys, node.values)}
+        keys = [_ast_to_value(k) for k in node.keys]
+        vals = [_ast_to_value(v) for v in node.values]
+        return ("__dict__", keys, vals)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         v = _ast_to_value(node.operand)
         return -v if isinstance(node.op, ast.USub) else v
+    # Call nodes: frozenset({...}), Counter(...), deque(...), defaultdict(...), Decimal(...)
+    if isinstance(node, ast.Call):
+        return _ast_call_to_value(node)
     raise ValueError(f"Unsupported value in tests.py: {ast.dump(node)}")
 
 
+def _ast_call_to_value(node: ast.Call) -> Any:
+    """Handle recognised stdlib call patterns as values."""
+    func = node.func
+    name = None
+    if isinstance(func, ast.Name):
+        name = func.id
+    elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        name = func.attr  # e.g. collections.Counter → "Counter"
+
+    if name == "frozenset":
+        inner = node.args[0] if node.args else ast.Set(elts=[])
+        elts = _ast_to_value(inner)
+        # inner may be a set literal → ("__set__", [...]) or a list
+        items = elts[1] if isinstance(elts, tuple) and elts[0] == "__set__" else elts
+        return ("__frozenset__", items)
+    if name == "Counter":
+        if node.args:
+            arg = _ast_to_value(node.args[0])
+        elif node.keywords:
+            arg = ("__dict__",
+                   [kw.arg for kw in node.keywords],
+                   [_ast_to_value(kw.value) for kw in node.keywords])
+        else:
+            arg = ("__dict__", [], [])
+        return ("__counter__", arg)
+    if name == "deque":
+        inner = _ast_to_value(node.args[0]) if node.args else []
+        return ("__deque__", inner)
+    if name == "defaultdict":
+        # defaultdict(factory, {...}) — we ignore factory
+        if len(node.args) >= 2:
+            inner = _ast_to_value(node.args[1])
+        elif node.keywords:
+            inner = ("__dict__",
+                     [kw.arg for kw in node.keywords],
+                     [_ast_to_value(kw.value) for kw in node.keywords])
+        else:
+            inner = ("__dict__", [], [])
+        return ("__defaultdict__", inner)
+    if name == "Decimal":
+        raw = _ast_to_value(node.args[0]) if node.args else "0"
+        return ("__decimal__", str(raw))
+    raise ValueError(f"Unsupported call in tests.py: {ast.dump(node)}")
+
+
 def _to_json_value(v: Any) -> Any:
-    """Recursively normalise to JSON-safe form (tuple → list)."""
-    if isinstance(v, (list, tuple)):
+    """Recursively normalise to JSON-safe tagged form."""
+    if isinstance(v, tuple):
+        tag = v[0]
+        if tag == "__tuple__":
+            return {"__type__": "tuple", "value": [_to_json_value(x) for x in v[1]]}
+        if tag == "__set__":
+            return {"__type__": "set", "value": [_to_json_value(x) for x in v[1]]}
+        if tag == "__frozenset__":
+            return {"__type__": "frozenset", "value": [_to_json_value(x) for x in v[1]]}
+        if tag == "__dict__":
+            keys, vals = v[1], v[2]
+            return {"__type__": "dict",
+                    "keys": [_to_json_value(k) for k in keys],
+                    "values": [_to_json_value(vv) for vv in vals]}
+        if tag == "__counter__":
+            return {"__type__": "counter", "value": _to_json_value(v[1])}
+        if tag == "__deque__":
+            return {"__type__": "deque", "value": _to_json_value(v[1])}
+        if tag == "__defaultdict__":
+            return {"__type__": "defaultdict", "value": _to_json_value(v[1])}
+        if tag == "__decimal__":
+            return {"__type__": "decimal", "value": v[1]}
+        # plain tuple shouldn't reach here after _ast_to_value refactor
+        return [_to_json_value(x) for x in v]
+    if isinstance(v, list):
         return [_to_json_value(x) for x in v]
     if isinstance(v, dict):
+        # plain Python dicts only have string keys from ast.Constant
         return {k: _to_json_value(vv) for k, vv in v.items()}
     return v
 
@@ -136,14 +218,13 @@ def _is_ep_call(node: ast.expr, ep: str) -> bool:
 
 
 def _match_raises(node: ast.Try, ep: str) -> TestCase | None:
-    """Match: try: EP(args); assert False \\n except Exception: pass"""
+    """Match typed and untyped raises blocks."""
     if len(node.body) != 2 or len(node.handlers) != 1:
         return None
     h = node.handlers[0]
-    if not (isinstance(h.type, ast.Name) and h.type.id == "Exception"):
+    if not isinstance(h.type, ast.Name):
         return None
-    if not (len(h.body) == 1 and isinstance(h.body[0], ast.Pass)):
-        return None
+    exc_name = h.type.id  # e.g. "Exception", "ValueError"
     s0, s1 = node.body
     if not (isinstance(s0, ast.Expr) and _is_ep_call(s0.value, ep)):
         return None
@@ -154,11 +235,72 @@ def _match_raises(node: ast.Try, ep: str) -> TestCase | None:
     ):
         return None
     args = [_ast_to_value(a) for a in s0.value.args]
-    return TestCase(id=str(node.lineno), kind="raises", args=args)
+    exc_type = None if exc_name == "Exception" else exc_name
+
+    # Handler body: pass (no message check) or single assert with message check
+    if len(h.body) == 1 and isinstance(h.body[0], ast.Pass):
+        return TestCase(id=str(node.lineno), kind="raises", args=args, exc_type=exc_type)
+
+    if len(h.body) == 1 and isinstance(h.body[0], ast.Assert):
+        msg_contains, msg_regex = _parse_msg_assert(h.body[0], h.name)
+        if msg_contains is not None or msg_regex is not None:
+            return TestCase(
+                id=str(node.lineno), kind="raises", args=args,
+                exc_type=exc_type, msg_contains=msg_contains, msg_regex=msg_regex,
+            )
+    return None
+
+
+def _parse_msg_assert(node: ast.Assert, exc_var: str | None) -> tuple[str | None, str | None]:
+    """Extract (msg_contains, msg_regex) from `assert "x" in str(e)` or `assert re.search(...)`."""
+    test = node.test
+
+    def _is_str_e(n: ast.expr) -> bool:
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name) and n.func.id == "str"
+            and len(n.args) == 1
+            and isinstance(n.args[0], ast.Name)
+            and (exc_var is None or n.args[0].id == exc_var)
+        )
+
+    # "substr" in str(e)
+    if (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1 and isinstance(test.ops[0], ast.In)
+        and isinstance(test.left, ast.Constant) and isinstance(test.left.value, str)
+        and _is_str_e(test.comparators[0])
+    ):
+        return test.left.value, None
+
+    # re.search(r"pattern", str(e))
+    if (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Attribute)
+        and test.func.attr == "search"
+        and isinstance(test.func.value, ast.Name) and test.func.value.id == "re"
+        and len(test.args) >= 2
+        and isinstance(test.args[0], ast.Constant) and isinstance(test.args[0].value, str)
+        and _is_str_e(test.args[1])
+    ):
+        return None, test.args[0].value
+
+    return None, None
 
 
 def _match_assert(node: ast.Assert, ep: str) -> TestCase | None:
     test = node.test
+
+    # assert math.isclose(EP(args), expected, abs_tol=..., rel_tol=...)
+    tc = _match_isclose(test, ep, node.lineno)
+    if tc is not None:
+        return tc
+
+    # assert abs(EP(args) - expected) < tol  /  <= tol
+    tc = _match_abs_tol(test, ep, node.lineno)
+    if tc is not None:
+        return tc
+
     # assert EP(args) == expected   or   assert EP(args) != expected
     if (
         isinstance(test, ast.Compare)
@@ -191,6 +333,61 @@ def _match_assert(node: ast.Assert, ep: str) -> TestCase | None:
     return None
 
 
+def _match_isclose(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
+    """Match assert math.isclose(EP(args), expected, abs_tol=..., rel_tol=...)."""
+    if not (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Attribute)
+        and test.func.attr == "isclose"
+        and isinstance(test.func.value, ast.Name) and test.func.value.id == "math"
+        and len(test.args) >= 2
+        and _is_ep_call(test.args[0], ep)
+    ):
+        return None
+    args = [_ast_to_value(a) for a in test.args[0].args]
+    exp = _ast_to_value(test.args[1])
+    tol_abs: float | None = None
+    tol_rel: float | None = None
+    for kw in test.keywords:
+        if kw.arg == "abs_tol":
+            tol_abs = float(_ast_to_value(kw.value))
+        elif kw.arg == "rel_tol":
+            tol_rel = float(_ast_to_value(kw.value))
+    return TestCase(id=str(lineno), kind="eq", args=args, expected=exp,
+                    tol_abs=tol_abs, tol_rel=tol_rel)
+
+
+def _match_abs_tol(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
+    """Match assert abs(EP(args) - expected) < tol  or  <= tol."""
+    if not (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1 and len(test.comparators) == 1
+        and isinstance(test.ops[0], (ast.Lt, ast.LtE))
+    ):
+        return None
+    lhs = test.left
+    # lhs must be abs(EP(args) - expected)
+    if not (
+        isinstance(lhs, ast.Call)
+        and isinstance(lhs.func, ast.Name) and lhs.func.id == "abs"
+        and len(lhs.args) == 1
+    ):
+        return None
+    inner = lhs.args[0]
+    if not (
+        isinstance(inner, ast.BinOp)
+        and isinstance(inner.op, ast.Sub)
+        and _is_ep_call(inner.left, ep)
+    ):
+        return None
+    args = [_ast_to_value(a) for a in inner.left.args]
+    exp = _ast_to_value(inner.right)
+    tol_abs = float(_ast_to_value(test.comparators[0]))
+    strict = isinstance(test.ops[0], ast.Lt)
+    return TestCase(id=str(lineno), kind="eq", args=args, expected=exp,
+                    tol_abs=tol_abs, tol_strict=strict)
+
+
 def _attach_annotations(tc: TestCase, lineno: int, lines: list[str]) -> None:
     """Scan backwards from the line before lineno for expect_stdout/stderr annotations."""
     i = lineno - 2  # 0-indexed line immediately before the test
@@ -213,8 +410,11 @@ def _attach_annotations(tc: TestCase, lineno: int, lines: list[str]) -> None:
 
 def emit_python(cases: list[TestCase], entrypoint: str) -> str:
     cases_data = [
-        [tc.id, tc.kind, _to_json_value(tc.args), _to_json_value(tc.expected),
-         tc.expect_stdout, tc.expect_stderr]
+        {"id": tc.id, "kind": tc.kind,
+         "args": _to_json_value(tc.args), "expected": _to_json_value(tc.expected),
+         "expOut": tc.expect_stdout, "expErr": tc.expect_stderr,
+         "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
+         "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex}
         for tc in cases
     ]
     cases_repr = repr(json.dumps(cases_data))
@@ -222,16 +422,67 @@ def emit_python(cases: list[TestCase], entrypoint: str) -> str:
 
     return f"""\
 #!/usr/bin/env python3
-import sys, json, os, io, contextlib, importlib.util
+import sys, json, os, io, re, contextlib, importlib.util
+from decimal import Decimal
+from collections import Counter, deque, defaultdict
 
 ENTRYPOINT = {ep_repr}
 CASES = json.loads({cases_repr})
 
-def _deep_eq(a, b):
+def _decode(v):
+    if not isinstance(v, dict) or "__type__" not in v:
+        if isinstance(v, list):
+            return [_decode(x) for x in v]
+        return v
+    t = v["__type__"]
+    if t == "tuple":
+        return tuple(_decode(x) for x in v["value"])
+    if t == "set":
+        return set(_decode(x) for x in v["value"])
+    if t == "frozenset":
+        return frozenset(_decode(x) for x in v["value"])
+    if t == "dict":
+        return {{_decode(k): _decode(val) for k, val in zip(v["keys"], v["values"])}}
+    if t == "counter":
+        return Counter(_decode(v["value"]))
+    if t == "deque":
+        return deque(_decode(x) for x in v["value"])
+    if t == "defaultdict":
+        d = defaultdict(None)
+        d.update(_decode(v["value"]))
+        return d
+    if t == "decimal":
+        return Decimal(v["value"])
+    return v
+
+def _near(a, b, tol_abs, tol_rel, strict):
+    try:
+        diff = abs(float(a) - float(b))
+        limit = tol_abs if tol_abs is not None else 0.0
+        if tol_rel is not None:
+            limit = max(limit, tol_rel * max(abs(float(a)), abs(float(b))))
+        return diff < limit if strict else diff <= limit
+    except (TypeError, ValueError):
+        return False
+
+def _deep_eq(a, b, tol_abs=None, tol_rel=None, strict=True):
+    if tol_abs is not None or tol_rel is not None:
+        if isinstance(a, (int, float, Decimal)) and isinstance(b, (int, float, Decimal)):
+            return _near(a, b, tol_abs, tol_rel, strict)
+    if isinstance(a, set) and isinstance(b, set):
+        return (len(a) == len(b) and
+                all(any(_deep_eq(x, y, tol_abs, tol_rel, strict) for y in b) for x in a))
+    if isinstance(a, (frozenset, set)) and isinstance(b, (frozenset, set)):
+        return (len(a) == len(b) and
+                all(any(_deep_eq(x, y, tol_abs, tol_rel, strict) for y in b) for x in a))
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(_deep_eq(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(_deep_eq(x, y, tol_abs, tol_rel, strict) for x, y in zip(a, b))
     if isinstance(a, dict) and isinstance(b, dict):
-        return set(a) == set(b) and all(_deep_eq(a[k], b[k]) for k in a)
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(_deep_eq(a[k], b[k], tol_abs, tol_rel, strict) for k in a)
+    if isinstance(a, Decimal) or isinstance(b, Decimal):
+        return Decimal(str(a)) == Decimal(str(b))
     return a == b
 
 def _load_fn(sol_path, name):
@@ -246,30 +497,52 @@ def _load_fn(sol_path, name):
 def _run():
     sol_path = sys.argv[1]
     results_path = os.environ["_BCG_RESULTS_FILE"]
+    global_tol = float(os.environ["_BCG_TOL"]) if "_BCG_TOL" in os.environ else None
     try:
         fn = _load_fn(sol_path, ENTRYPOINT)
     except Exception:
         with open(results_path, "w") as f:
-            json.dump({{"passed": [], "failed": [c[0] for c in CASES]}}, f)
+            json.dump({{"passed": [], "failed": [c["id"] for c in CASES]}}, f)
         return
     passed, failed = [], []
-    for tid, kind, args, expected, exp_out, exp_err in CASES:
+    for c in CASES:
+        tid = c["id"]
+        kind = c["kind"]
+        args = [_decode(a) for a in c["args"]]
+        expected = _decode(c["expected"])
+        exp_out, exp_err = c["expOut"], c["expErr"]
+        tol_abs = c["tolAbs"] if c["tolAbs"] is not None else global_tol
+        tol_rel = c["tolRel"]
+        tol_strict = c["tolStrict"]
+        exc_type = c["excType"]
+        msg_contains = c["msgContains"]
+        msg_regex = c["msgRegex"]
         try:
             if kind == "raises":
+                caught = None
                 try:
                     fn(*args)
                     failed.append(tid)
-                except Exception:
-                    passed.append(tid)
+                    continue
+                except Exception as _e:
+                    caught = _e
+                ok = True
+                if exc_type is not None:
+                    ok = type(caught).__name__ == exc_type
+                if ok and msg_contains is not None:
+                    ok = msg_contains in str(caught)
+                if ok and msg_regex is not None:
+                    ok = bool(re.search(msg_regex, str(caught)))
+                (passed if ok else failed).append(tid)
                 continue
             out_buf, err_buf = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
                 result = fn(*args)
             ok = True
             if kind == "eq":
-                ok = _deep_eq(result, expected)
+                ok = _deep_eq(result, expected, tol_abs, tol_rel, tol_strict)
             elif kind == "ne":
-                ok = not _deep_eq(result, expected)
+                ok = not _deep_eq(result, expected, tol_abs, tol_rel, tol_strict)
             elif kind == "truthy":
                 ok = bool(result)
             elif kind == "falsy":
@@ -290,9 +563,11 @@ _run()
 
 def emit_javascript(cases: list[TestCase], entrypoint: str) -> str:
     cases_json = json.dumps(
-        [{"id": tc.id, "kind": tc.kind, "args": _to_json_value(tc.args),
-          "expected": _to_json_value(tc.expected),
-          "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr}
+        [{"id": tc.id, "kind": tc.kind,
+          "args": _to_json_value(tc.args), "expected": _to_json_value(tc.expected),
+          "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr,
+          "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
+          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex}
          for tc in cases],
         indent=2,
     )
@@ -306,14 +581,56 @@ const path = require('path');
 const ENTRYPOINT = {ep_json};
 const CASES = {cases_json};
 
-function deepEq(a, b) {{
+function decode(v) {{
+  if (Array.isArray(v)) return v.map(decode);
+  if (v !== null && typeof v === 'object' && v.__type__) {{
+    const t = v.__type__;
+    if (t === 'tuple' || t === 'deque') return v.value.map(decode);
+    if (t === 'set' || t === 'frozenset') return {{ __isSet: true, items: v.value.map(decode) }};
+    if (t === 'dict') {{
+      const o = {{}};
+      for (let i = 0; i < v.keys.length; i++) o[JSON.stringify(decode(v.keys[i]))] = {{ k: decode(v.keys[i]), v: decode(v.values[i]) }};
+      return {{ __isDict: true, entries: o }};
+    }}
+    if (t === 'counter' || t === 'defaultdict') return decode(v.value);
+    if (t === 'decimal') return parseFloat(v.value);
+    return v;
+  }}
+  return v;
+}}
+
+function setEq(a, b) {{
+  if (a.items.length !== b.items.length) return false;
+  return a.items.every(x => b.items.some(y => deepEq(x, y)));
+}}
+
+function dictEq(a, b) {{
+  const ka = Object.keys(a.entries).sort(), kb = Object.keys(b.entries).sort();
+  if (ka.join('\\0') !== kb.join('\\0')) return false;
+  return ka.every(k => deepEq(a.entries[k].v, b.entries[k].v));
+}}
+
+function near(a, b, tolAbs, tolRel, strict) {{
+  if (typeof a !== 'number' || typeof b !== 'number') return false;
+  const diff = Math.abs(a - b);
+  let limit = tolAbs !== null ? tolAbs : 0;
+  if (tolRel !== null) limit = Math.max(limit, tolRel * Math.max(Math.abs(a), Math.abs(b)));
+  return strict ? diff < limit : diff <= limit;
+}}
+
+function deepEq(a, b, tolAbs, tolRel, strict) {{
+  if (tolAbs !== undefined && tolAbs !== null && typeof a === 'number' && typeof b === 'number') {{
+    return near(a, b, tolAbs, tolRel !== undefined ? tolRel : null, strict !== undefined ? strict : true);
+  }}
+  if (a && a.__isSet && b && b.__isSet) return setEq(a, b);
+  if (a && a.__isDict && b && b.__isDict) return dictEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) {{
-    return a.length === b.length && a.every((x, i) => deepEq(x, b[i]));
+    return a.length === b.length && a.every((x, i) => deepEq(x, b[i], tolAbs, tolRel, strict));
   }}
   if (a !== null && b !== null && typeof a === 'object' && !Array.isArray(a) &&
       typeof b === 'object' && !Array.isArray(b)) {{
     const ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
-    return ka.join('\\0') === kb.join('\\0') && ka.every(k => deepEq(a[k], b[k]));
+    return ka.join('\\0') === kb.join('\\0') && ka.every(k => deepEq(a[k], b[k], tolAbs, tolRel, strict));
   }}
   return a === b;
 }}
@@ -336,15 +653,16 @@ function captureCall(fn, args) {{
   const ew = process.stderr.write.bind(process.stderr);
   process.stdout.write = c => {{ stdout += c; return true; }};
   process.stderr.write = c => {{ stderr += c; return true; }};
-  let result, threw = false;
-  try {{ result = fn(...args); }} catch (e) {{ threw = true; }}
+  let result, threw = false, thrownErr = null;
+  try {{ result = fn(...args); }} catch (e) {{ threw = true; thrownErr = e; }}
   finally {{ process.stdout.write = ow; process.stderr.write = ew; }}
-  return {{ result, stdout, stderr, threw }};
+  return {{ result, stdout, stderr, threw, thrownErr }};
 }}
 
 function run() {{
   const solPath = process.argv[2];
   const resultsPath = process.env._BCG_RESULTS_FILE;
+  const globalTol = process.env._BCG_TOL !== undefined ? parseFloat(process.env._BCG_TOL) : null;
   const allIds = CASES.map(c => c.id);
   let fn;
   try {{
@@ -356,18 +674,28 @@ function run() {{
   }}
   const passed = [], failed = [];
   for (const c of CASES) {{
+    const args = c.args.map(decode);
+    const expected = decode(c.expected);
+    const tolAbs = c.tolAbs !== null ? c.tolAbs : globalTol;
+    const tolRel = c.tolRel;
+    const tolStrict = c.tolStrict;
     try {{
       if (c.kind === 'raises') {{
-        let threw = false;
-        try {{ fn(...c.args); }} catch (e) {{ threw = true; }}
-        (threw ? passed : failed).push(c.id);
+        let thrownErr = null;
+        try {{ fn(...args); }} catch (e) {{ thrownErr = e; }}
+        if (thrownErr === null) {{ failed.push(c.id); continue; }}
+        let ok = true;
+        if (c.excType !== null) ok = (thrownErr && thrownErr.constructor && thrownErr.constructor.name === c.excType) || (thrownErr && thrownErr.name === c.excType);
+        if (ok && c.msgContains !== null) ok = String(thrownErr && thrownErr.message || thrownErr).includes(c.msgContains);
+        if (ok && c.msgRegex !== null) ok = new RegExp(c.msgRegex).test(String(thrownErr && thrownErr.message || thrownErr));
+        (ok ? passed : failed).push(c.id);
         continue;
       }}
-      const {{ result, stdout, stderr, threw }} = captureCall(fn, c.args);
+      const {{ result, stdout, stderr, threw }} = captureCall(fn, args);
       if (threw) {{ failed.push(c.id); continue; }}
       let ok = true;
-      if (c.kind === 'eq') ok = deepEq(result, c.expected);
-      else if (c.kind === 'ne') ok = !deepEq(result, c.expected);
+      if (c.kind === 'eq') ok = deepEq(result, expected, tolAbs, tolRel, tolStrict);
+      else if (c.kind === 'ne') ok = !deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'truthy') ok = !!result;
       else if (c.kind === 'falsy') ok = !result;
       if (ok && c.expectStdout !== null) ok = stdout === c.expectStdout;
@@ -386,9 +714,11 @@ run();
 
 def emit_typescript(cases: list[TestCase], entrypoint: str) -> str:
     cases_json = json.dumps(
-        [{"id": tc.id, "kind": tc.kind, "args": _to_json_value(tc.args),
-          "expected": _to_json_value(tc.expected),
-          "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr}
+        [{"id": tc.id, "kind": tc.kind,
+          "args": _to_json_value(tc.args), "expected": _to_json_value(tc.expected),
+          "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr,
+          "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
+          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex}
          for tc in cases],
         indent=2,
     )
@@ -402,17 +732,60 @@ const ENTRYPOINT: string = {ep_json};
 interface Case {{
   id: string; kind: string; args: any[]; expected: any;
   expectStdout: string | null; expectStderr: string | null;
+  tolAbs: number | null; tolRel: number | null; tolStrict: boolean;
+  excType: string | null; msgContains: string | null; msgRegex: string | null;
 }}
 const CASES: Case[] = {cases_json};
 
-function deepEq(a: any, b: any): boolean {{
+function decode(v: any): any {{
+  if (Array.isArray(v)) return v.map(decode);
+  if (v !== null && typeof v === 'object' && v.__type__) {{
+    const t: string = v.__type__;
+    if (t === 'tuple' || t === 'deque') return (v.value as any[]).map(decode);
+    if (t === 'set' || t === 'frozenset') return {{ __isSet: true, items: (v.value as any[]).map(decode) }};
+    if (t === 'dict') {{
+      const o: any = {{}};
+      for (let i = 0; i < v.keys.length; i++) o[JSON.stringify(decode(v.keys[i]))] = {{ k: decode(v.keys[i]), v: decode(v.values[i]) }};
+      return {{ __isDict: true, entries: o }};
+    }}
+    if (t === 'counter' || t === 'defaultdict') return decode(v.value);
+    if (t === 'decimal') return parseFloat(v.value);
+    return v;
+  }}
+  return v;
+}}
+
+function near(a: number, b: number, tolAbs: number | null, tolRel: number | null, strict: boolean): boolean {{
+  const diff = Math.abs(a - b);
+  let limit = tolAbs !== null ? tolAbs : 0;
+  if (tolRel !== null) limit = Math.max(limit, tolRel * Math.max(Math.abs(a), Math.abs(b)));
+  return strict ? diff < limit : diff <= limit;
+}}
+
+function setEq(a: any, b: any): boolean {{
+  if (a.items.length !== b.items.length) return false;
+  return (a.items as any[]).every((x: any) => (b.items as any[]).some((y: any) => deepEq(x, y)));
+}}
+
+function dictEq(a: any, b: any): boolean {{
+  const ka: string[] = Object.keys(a.entries).sort(), kb: string[] = Object.keys(b.entries).sort();
+  if (ka.join('\\0') !== kb.join('\\0')) return false;
+  return ka.every((k: string) => deepEq(a.entries[k].v, b.entries[k].v));
+}}
+
+function deepEq(a: any, b: any, tolAbs?: number | null, tolRel?: number | null, strict?: boolean): boolean {{
+  if (tolAbs != null && typeof a === 'number' && typeof b === 'number') {{
+    return near(a, b, tolAbs, tolRel !== undefined ? tolRel : null, strict !== undefined ? strict : true);
+  }}
+  if (a && a.__isSet && b && b.__isSet) return setEq(a, b);
+  if (a && a.__isDict && b && b.__isDict) return dictEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) {{
-    return a.length === b.length && (a as any[]).every((x: any, i: number) => deepEq(x, b[i]));
+    return a.length === b.length && (a as any[]).every((x: any, i: number) => deepEq(x, b[i], tolAbs, tolRel, strict));
   }}
   if (a !== null && b !== null && typeof a === 'object' && !Array.isArray(a) &&
       typeof b === 'object' && !Array.isArray(b)) {{
-    const ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
-    return ka.join('\\0') === kb.join('\\0') && ka.every((k: string) => deepEq(a[k], b[k]));
+    const ka: string[] = Object.keys(a).sort(), kb: string[] = Object.keys(b).sort();
+    return ka.join('\\0') === kb.join('\\0') && ka.every((k: string) => deepEq(a[k], b[k], tolAbs, tolRel, strict));
   }}
   return a === b;
 }}
@@ -431,21 +804,22 @@ function loadFn(sol: any, name: string): (...args: any[]) => any {{
 
 function captureCall(
   fn: (...a: any[]) => any, args: any[]
-): {{ result: any; stdout: string; stderr: string; threw: boolean }} {{
+): {{ result: any; stdout: string; stderr: string; threw: boolean; thrownErr: any }} {{
   let stdout = '', stderr = '';
   const ow = process.stdout.write.bind(process.stdout);
   const ew = process.stderr.write.bind(process.stderr);
   (process.stdout as any).write = (c: any) => {{ stdout += c; return true; }};
   (process.stderr as any).write = (c: any) => {{ stderr += c; return true; }};
-  let result: any, threw = false;
-  try {{ result = fn(...args); }} catch (e) {{ threw = true; }}
+  let result: any, threw = false, thrownErr: any = null;
+  try {{ result = fn(...args); }} catch (e) {{ threw = true; thrownErr = e; }}
   finally {{ process.stdout.write = ow; process.stderr.write = ew; }}
-  return {{ result, stdout, stderr, threw }};
+  return {{ result, stdout, stderr, threw, thrownErr }};
 }}
 
 function run(): void {{
   const solPath: string = process.argv[2];
   const resultsPath: string = process.env['_BCG_RESULTS_FILE']!;
+  const globalTol: number | null = process.env['_BCG_TOL'] !== undefined ? parseFloat(process.env['_BCG_TOL']!) : null;
   const allIds: string[] = CASES.map((c: Case) => c.id);
   let fn: (...a: any[]) => any;
   try {{
@@ -458,18 +832,28 @@ function run(): void {{
   }}
   const passed: string[] = [], failed: string[] = [];
   for (const c of CASES) {{
+    const args: any[] = c.args.map(decode);
+    const expected: any = decode(c.expected);
+    const tolAbs: number | null = c.tolAbs !== null ? c.tolAbs : globalTol;
+    const tolRel: number | null = c.tolRel;
+    const tolStrict: boolean = c.tolStrict;
     try {{
       if (c.kind === 'raises') {{
-        let threw = false;
-        try {{ fn(...c.args); }} catch (e) {{ threw = true; }}
-        (threw ? passed : failed).push(c.id);
+        let thrownErr: any = null;
+        try {{ fn(...args); }} catch (e) {{ thrownErr = e; }}
+        if (thrownErr === null) {{ failed.push(c.id); continue; }}
+        let ok = true;
+        if (c.excType !== null) ok = (thrownErr && thrownErr.constructor && thrownErr.constructor.name === c.excType) || (thrownErr && thrownErr.name === c.excType);
+        if (ok && c.msgContains !== null) ok = String(thrownErr && thrownErr.message !== undefined ? thrownErr.message : thrownErr).includes(c.msgContains);
+        if (ok && c.msgRegex !== null) ok = new RegExp(c.msgRegex).test(String(thrownErr && thrownErr.message !== undefined ? thrownErr.message : thrownErr));
+        (ok ? passed : failed).push(c.id);
         continue;
       }}
-      const {{ result, stdout, stderr, threw }} = captureCall(fn, c.args);
+      const {{ result, stdout, stderr, threw }} = captureCall(fn, args);
       if (threw) {{ failed.push(c.id); continue; }}
       let ok = true;
-      if (c.kind === 'eq') ok = deepEq(result, c.expected);
-      else if (c.kind === 'ne') ok = !deepEq(result, c.expected);
+      if (c.kind === 'eq') ok = deepEq(result, expected, tolAbs, tolRel, tolStrict);
+      else if (c.kind === 'ne') ok = !deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'truthy') ok = !!result;
       else if (c.kind === 'falsy') ok = !result;
       if (ok && c.expectStdout !== null) ok = stdout === c.expectStdout;
@@ -563,6 +947,8 @@ def cmd_test(args: argparse.Namespace) -> int:
     try:
         cmd = _SUBPROC[args.lang](tester_path, sol_path)
         env = {**os.environ, "_BCG_RESULTS_FILE": results_file}
+        if args.tol is not None:
+            env["_BCG_TOL"] = str(args.tol)
         try:
             subprocess.run(cmd, env=env, check=False)
         except FileNotFoundError as e:
@@ -616,6 +1002,7 @@ def main() -> int:
     tst.add_argument("tests_dir")
     # lang validated manually inside cmd_test so we can emit error JSON
     tst.add_argument("--lang", required=True)
+    tst.add_argument("--tol", type=float, default=None)
 
     args = parser.parse_args()
     if args.command is None:
