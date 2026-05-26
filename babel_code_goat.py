@@ -29,7 +29,7 @@ from typing import Any, Literal
 @dataclass
 class TestCase:
     id: str                          # temporary: raw line number; final: "tests.py:<n>[#k]"
-    kind: Literal["eq", "ne", "truthy", "falsy", "raises"]
+    kind: Literal["eq", "ne", "truthy", "falsy", "raises", "in"]
     args: list[Any]
     expected: Any = None
     expect_stdout: str | None = None
@@ -40,6 +40,7 @@ class TestCase:
     exc_type: str | None = None      # e.g. "ValueError" for typed raises
     msg_contains: str | None = None
     msg_regex: str | None = None
+    transform: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +153,10 @@ def _to_json_value(v: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 _ANNO_RE = re.compile(r"#\s*expect_(stdout|stderr):\s*(.+)")
+
+_SUPPORTED_PRIMITIVES = frozenset({
+    "sorted", "len", "list", "set", "tuple", "str", "int", "float", "abs", "sum", "min", "max"
+})
 
 
 def parse_tests(source: str, entrypoint: str) -> list[TestCase]:
@@ -301,19 +306,39 @@ def _match_assert(node: ast.Assert, ep: str) -> TestCase | None:
     if tc is not None:
         return tc
 
-    # assert EP(args) == expected   or   assert EP(args) != expected
+    # assert prim(EP(args)) == expected  /  != expected
+    tc = _match_primitive_wrapped(test, ep, node.lineno)
+    if tc is not None:
+        return tc
+
     if (
         isinstance(test, ast.Compare)
         and len(test.ops) == 1
         and len(test.comparators) == 1
-        and _is_ep_call(test.left, ep)
     ):
-        args = [_ast_to_value(a) for a in test.left.args]
-        exp = _ast_to_value(test.comparators[0])
-        if isinstance(test.ops[0], ast.Eq):
-            return TestCase(id=str(node.lineno), kind="eq", args=args, expected=exp)
-        if isinstance(test.ops[0], ast.NotEq):
-            return TestCase(id=str(node.lineno), kind="ne", args=args, expected=exp)
+        op = test.ops[0]
+        # assert EP(args) == expected  /  != expected  (LHS call, RHS is not also EP call)
+        if (_is_ep_call(test.left, ep)
+                and not _is_ep_call(test.comparators[0], ep)
+                and isinstance(op, (ast.Eq, ast.NotEq))):
+            args = [_ast_to_value(a) for a in test.left.args]
+            exp = _ast_to_value(test.comparators[0])
+            kind: str = "eq" if isinstance(op, ast.Eq) else "ne"
+            return TestCase(id=str(node.lineno), kind=kind, args=args, expected=exp)
+        # assert expected == EP(args)  /  expected != EP(args)  (RHS call, LHS is not also EP call)
+        if (_is_ep_call(test.comparators[0], ep)
+                and not _is_ep_call(test.left, ep)
+                and isinstance(op, (ast.Eq, ast.NotEq))):
+            args = [_ast_to_value(a) for a in test.comparators[0].args]
+            exp = _ast_to_value(test.left)
+            kind = "eq" if isinstance(op, ast.Eq) else "ne"
+            return TestCase(id=str(node.lineno), kind=kind, args=args, expected=exp)
+        # assert EP(args) in container
+        if _is_ep_call(test.left, ep) and isinstance(op, ast.In):
+            args = [_ast_to_value(a) for a in test.left.args]
+            container = _ast_to_value(test.comparators[0])
+            return TestCase(id=str(node.lineno), kind="in", args=args, expected=container)
+
     # assert EP(args)
     if _is_ep_call(test, ep):
         return TestCase(
@@ -388,6 +413,32 @@ def _match_abs_tol(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
                     tol_abs=tol_abs, tol_strict=strict)
 
 
+def _match_primitive_wrapped(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
+    """Match assert prim(EP(args)) == expected  or  != expected."""
+    if not (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and len(test.comparators) == 1
+        and isinstance(test.ops[0], (ast.Eq, ast.NotEq))
+    ):
+        return None
+    lhs = test.left
+    if not (
+        isinstance(lhs, ast.Call)
+        and isinstance(lhs.func, ast.Name)
+        and lhs.func.id in _SUPPORTED_PRIMITIVES
+        and len(lhs.args) == 1
+        and not lhs.keywords
+        and _is_ep_call(lhs.args[0], ep)
+    ):
+        return None
+    transform = lhs.func.id
+    args = [_ast_to_value(a) for a in lhs.args[0].args]
+    exp = _ast_to_value(test.comparators[0])
+    kind: str = "eq" if isinstance(test.ops[0], ast.Eq) else "ne"
+    return TestCase(id=str(lineno), kind=kind, args=args, expected=exp, transform=transform)
+
+
 def _attach_annotations(tc: TestCase, lineno: int, lines: list[str]) -> None:
     """Scan backwards from the line before lineno for expect_stdout/stderr annotations."""
     i = lineno - 2  # 0-indexed line immediately before the test
@@ -414,7 +465,8 @@ def emit_python(cases: list[TestCase], entrypoint: str) -> str:
          "args": _to_json_value(tc.args), "expected": _to_json_value(tc.expected),
          "expOut": tc.expect_stdout, "expErr": tc.expect_stderr,
          "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
-         "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex}
+         "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex,
+         "transform": tc.transform}
         for tc in cases
     ]
     cases_repr = repr(json.dumps(cases_data))
@@ -485,6 +537,10 @@ def _deep_eq(a, b, tol_abs=None, tol_rel=None, strict=True):
         return Decimal(str(a)) == Decimal(str(b))
     return a == b
 
+_TRANSFORMS = {{"sorted": sorted, "len": len, "list": list, "set": set, "tuple": tuple,
+                "str": str, "int": int, "float": float, "abs": abs, "sum": sum,
+                "min": min, "max": max}}
+
 def _load_fn(sol_path, name):
     spec = importlib.util.spec_from_file_location("_sol", sol_path)
     mod = importlib.util.module_from_spec(spec)
@@ -517,6 +573,7 @@ def _run():
         exc_type = c["excType"]
         msg_contains = c["msgContains"]
         msg_regex = c["msgRegex"]
+        transform = c["transform"]
         try:
             if kind == "raises":
                 caught = None
@@ -538,6 +595,8 @@ def _run():
             out_buf, err_buf = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
                 result = fn(*args)
+            if transform is not None:
+                result = _TRANSFORMS[transform](result)
             ok = True
             if kind == "eq":
                 ok = _deep_eq(result, expected, tol_abs, tol_rel, tol_strict)
@@ -547,6 +606,8 @@ def _run():
                 ok = bool(result)
             elif kind == "falsy":
                 ok = not bool(result)
+            elif kind == "in":
+                ok = any(_deep_eq(result, x) for x in expected)
             if ok and exp_out is not None:
                 ok = out_buf.getvalue() == exp_out
             if ok and exp_err is not None:
@@ -567,7 +628,8 @@ def emit_javascript(cases: list[TestCase], entrypoint: str) -> str:
           "args": _to_json_value(tc.args), "expected": _to_json_value(tc.expected),
           "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr,
           "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
-          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex}
+          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex,
+          "transform": tc.transform}
          for tc in cases],
         indent=2,
     )
@@ -598,6 +660,21 @@ function decode(v) {{
   }}
   return v;
 }}
+
+const _TRANSFORMS = {{
+  sorted: v => {{ const a = Array.isArray(v) ? [...v] : Array.from(v); return a.sort((a, b) => typeof a === 'number' ? a - b : String(a) < String(b) ? -1 : 1); }},
+  len: v => Array.isArray(v) ? v.length : (typeof v === 'string' ? v.length : Object.keys(v).length),
+  list: v => Array.isArray(v) ? [...v] : Array.from(v),
+  set: v => ({{ __isSet: true, items: [...new Set(v)] }}),
+  tuple: v => Array.isArray(v) ? [...v] : Array.from(v),
+  str: v => String(v),
+  int: v => Math.trunc(Number(v)),
+  float: v => Number(v),
+  abs: v => Math.abs(v),
+  sum: v => v.reduce((a, b) => a + b, 0),
+  min: v => Math.min(...v),
+  max: v => Math.max(...v),
+}};
 
 function setEq(a, b) {{
   if (a.items.length !== b.items.length) return false;
@@ -691,13 +768,15 @@ function run() {{
         (ok ? passed : failed).push(c.id);
         continue;
       }}
-      const {{ result, stdout, stderr, threw }} = captureCall(fn, args);
+      const {{ result: _raw, stdout, stderr, threw }} = captureCall(fn, args);
       if (threw) {{ failed.push(c.id); continue; }}
+      const result = c.transform !== null ? _TRANSFORMS[c.transform](_raw) : _raw;
       let ok = true;
       if (c.kind === 'eq') ok = deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'ne') ok = !deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'truthy') ok = !!result;
       else if (c.kind === 'falsy') ok = !result;
+      else if (c.kind === 'in') ok = Array.isArray(expected) ? expected.some(x => deepEq(x, result)) : (expected && expected.__isSet ? expected.items.some(x => deepEq(x, result)) : false);
       if (ok && c.expectStdout !== null) ok = stdout === c.expectStdout;
       if (ok && c.expectStderr !== null) ok = stderr === c.expectStderr;
       (ok ? passed : failed).push(c.id);
@@ -718,7 +797,8 @@ def emit_typescript(cases: list[TestCase], entrypoint: str) -> str:
           "args": _to_json_value(tc.args), "expected": _to_json_value(tc.expected),
           "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr,
           "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
-          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex}
+          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex,
+          "transform": tc.transform}
          for tc in cases],
         indent=2,
     )
@@ -734,6 +814,7 @@ interface Case {{
   expectStdout: string | null; expectStderr: string | null;
   tolAbs: number | null; tolRel: number | null; tolStrict: boolean;
   excType: string | null; msgContains: string | null; msgRegex: string | null;
+  transform: string | null;
 }}
 const CASES: Case[] = {cases_json};
 
@@ -754,6 +835,21 @@ function decode(v: any): any {{
   }}
   return v;
 }}
+
+const _TRANSFORMS: Record<string, (v: any) => any> = {{
+  sorted: (v: any) => {{ const a: any[] = Array.isArray(v) ? [...v] : Array.from(v); return a.sort((a: any, b: any) => typeof a === 'number' ? a - b : String(a) < String(b) ? -1 : 1); }},
+  len: (v: any) => Array.isArray(v) ? v.length : (typeof v === 'string' ? v.length : Object.keys(v).length),
+  list: (v: any) => Array.isArray(v) ? [...v] : Array.from(v),
+  set: (v: any) => ({{ __isSet: true, items: [...new Set(v as any[])] }}),
+  tuple: (v: any) => Array.isArray(v) ? [...v] : Array.from(v),
+  str: (v: any) => String(v),
+  int: (v: any) => Math.trunc(Number(v)),
+  float: (v: any) => Number(v),
+  abs: (v: any) => Math.abs(v),
+  sum: (v: any) => (v as any[]).reduce((a: any, b: any) => a + b, 0),
+  min: (v: any) => Math.min(...(v as number[])),
+  max: (v: any) => Math.max(...(v as number[])),
+}};
 
 function near(a: number, b: number, tolAbs: number | null, tolRel: number | null, strict: boolean): boolean {{
   const diff = Math.abs(a - b);
@@ -849,13 +945,15 @@ function run(): void {{
         (ok ? passed : failed).push(c.id);
         continue;
       }}
-      const {{ result, stdout, stderr, threw }} = captureCall(fn, args);
+      const {{ result: _raw, stdout, stderr, threw }} = captureCall(fn, args);
       if (threw) {{ failed.push(c.id); continue; }}
+      const result: any = c.transform !== null ? _TRANSFORMS[c.transform](_raw) : _raw;
       let ok = true;
       if (c.kind === 'eq') ok = deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'ne') ok = !deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'truthy') ok = !!result;
       else if (c.kind === 'falsy') ok = !result;
+      else if (c.kind === 'in') ok = Array.isArray(expected) ? (expected as any[]).some((x: any) => deepEq(x, result)) : (expected && (expected as any).__isSet ? ((expected as any).items as any[]).some((x: any) => deepEq(x, result)) : false);
       if (ok && c.expectStdout !== null) ok = stdout === c.expectStdout;
       if (ok && c.expectStderr !== null) ok = stderr === c.expectStderr;
       (ok ? passed : failed).push(c.id);
