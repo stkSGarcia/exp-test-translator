@@ -23,6 +23,14 @@ from typing import Any, Literal
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class DiscoveryError(Exception):
+    """Raised when test discovery constraints are violated."""
+
+
+# ---------------------------------------------------------------------------
 # IR
 # ---------------------------------------------------------------------------
 
@@ -41,6 +49,7 @@ class TestCase:
     msg_contains: str | None = None
     msg_regex: str | None = None
     transform: str | None = None
+    mutation_check: int | None = None  # index into args to compare post-call
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +218,8 @@ _SUPPORTED_PRIMITIVES = frozenset({
 })
 
 
-def parse_tests(source: str, entrypoint: str) -> list[TestCase]:
-    """Parse tests.py source and return a list of TestCase objects."""
+def parse_tests(source: str, entrypoint: str, file_prefix: str = "tests.py") -> list[TestCase]:
+    """Parse a test source file and return a list of TestCase objects."""
     tree = ast.parse(source)
     lines = source.splitlines()
     raw: list[TestCase] = []
@@ -233,19 +242,19 @@ def parse_tests(source: str, entrypoint: str) -> list[TestCase]:
     for tc in plain_assertions:
         n = int(tc.id)
         if line_counts[n] == 1:
-            tc.id = f"tests.py:{n}"
+            tc.id = f"{file_prefix}:{n}"
         else:
             idx = line_seen.get(n, 0)
-            tc.id = f"tests.py:{n}#{idx}"
+            tc.id = f"{file_prefix}:{n}#{idx}"
             line_seen[n] = idx + 1
 
     for tc in loop_tests:
         n = int(tc.id[5:])  # strip "loop:"
-        tc.id = f"tests.py:{n}"
+        tc.id = f"{file_prefix}:{n}"
 
     for tc in iter_assertions:
         _, n_str, k_str = tc.id.split(":", 2)
-        tc.id = f"tests.py:{n_str}:{k_str}"
+        tc.id = f"{file_prefix}:{n_str}:{k_str}"
 
     return raw
 
@@ -279,33 +288,192 @@ def _handle_loop(
         out.extend(iter_out)
 
 
+def _collect_names(node: ast.expr) -> set[str]:
+    """Recursively collect all Name identifiers referenced in an AST expression."""
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _match_mutation_assert(
+    node: ast.Assert,
+    mut_names: set[str],
+    arg_vals: list[Any],
+    bindings: dict,
+    mutation_check: int | None,
+) -> TestCase | None:
+    """Parse an assertion in a mutation group into a TestCase.
+
+    mutation_check: index into arg_vals of the variable being checked post-call,
+                    or None to check the return value.
+    """
+    test = node.test
+    lineno = node.lineno
+
+    if (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and len(test.comparators) == 1
+        and isinstance(test.ops[0], (ast.Eq, ast.NotEq))
+    ):
+        op = test.ops[0]
+        kind: str = "eq" if isinstance(op, ast.Eq) else "ne"
+        left_is_mut = isinstance(test.left, ast.Name) and test.left.id in mut_names
+        right_is_mut = (
+            isinstance(test.comparators[0], ast.Name)
+            and test.comparators[0].id in mut_names
+        )
+        if left_is_mut and not right_is_mut:
+            try:
+                expected = _ast_to_value(test.comparators[0], bindings)
+            except Exception:
+                return None
+            return TestCase(id=str(lineno), kind=kind, args=arg_vals,
+                            expected=expected, mutation_check=mutation_check)
+        if right_is_mut and not left_is_mut:
+            try:
+                expected = _ast_to_value(test.left, bindings)
+            except Exception:
+                return None
+            return TestCase(id=str(lineno), kind=kind, args=arg_vals,
+                            expected=expected, mutation_check=mutation_check)
+
+    if isinstance(test, ast.Name) and test.id in mut_names:
+        return TestCase(id=str(lineno), kind="truthy", args=arg_vals,
+                        mutation_check=mutation_check)
+
+    if (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Name)
+        and test.operand.id in mut_names
+    ):
+        return TestCase(id=str(lineno), kind="falsy", args=arg_vals,
+                        mutation_check=mutation_check)
+
+    return None
+
+
+def _consume_mutation_group(
+    call: ast.Call,
+    assigned_name: str | None,
+    stmts: list[ast.stmt],
+    start_idx: int,
+    lines: list[str],
+    out: list[TestCase],
+    bindings: dict,
+) -> int:
+    """Process a mutation call and the immediately following assert statements.
+
+    Returns the index of the next statement to process after the mutation group.
+    Raises DiscoveryError if an assertion in the group violates mutation constraints.
+    """
+    arg_names: list[str | None] = []
+    arg_vals: list[Any] = []
+    resolvable = True
+    for arg in call.args:
+        if isinstance(arg, ast.Name):
+            if arg.id in bindings:
+                arg_names.append(arg.id)
+                arg_vals.append(bindings[arg.id])
+            else:
+                arg_names.append(arg.id)
+                arg_vals.append(None)
+                resolvable = False
+        else:
+            try:
+                arg_vals.append(_ast_to_value(arg, bindings))
+            except Exception:
+                arg_vals.append(None)
+                resolvable = False
+            arg_names.append(None)
+
+    mut_arg_index: dict[str, int] = {
+        name: idx for idx, name in enumerate(arg_names) if name is not None
+    }
+    all_mut_names: set[str] = set(mut_arg_index.keys())
+    if assigned_name is not None:
+        all_mut_names.add(assigned_name)
+
+    # No trackable names → treat as a plain statement, not a mutation group.
+    if not all_mut_names:
+        return start_idx + 1
+
+    i = start_idx + 1
+    while i < len(stmts) and isinstance(stmts[i], ast.Assert):
+        assert_stmt = stmts[i]
+        names_in_assert = _collect_names(assert_stmt.test)
+
+        if not names_in_assert & all_mut_names:
+            raise DiscoveryError(
+                f"line {assert_stmt.lineno}: assertion after mutation call does not "
+                f"reference any mutation-tracked variable (tracked: {sorted(all_mut_names)})"
+            )
+
+        # Prefer an arg variable over the assigned name for mutation_check.
+        mutation_check: int | None = None
+        for name in names_in_assert:
+            if name in mut_arg_index:
+                mutation_check = mut_arg_index[name]
+                break
+        # If only assigned_name referenced → mutation_check stays None (check return value).
+
+        if resolvable:
+            tc = _match_mutation_assert(
+                assert_stmt, all_mut_names, arg_vals, bindings, mutation_check
+            )
+            if tc is not None:
+                _attach_annotations(tc, assert_stmt.lineno, lines)
+                out.append(tc)
+
+        i += 1
+
+    return i
+
+
 def _collect_stmts(
     stmts: list[ast.stmt], lines: list[str], ep: str, out: list[TestCase],
     bindings: dict | None = None,
 ) -> None:
     if bindings is None:
         bindings = {}
-    for stmt in stmts:
+    i = 0
+    while i < len(stmts):
+        stmt = stmts[i]
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            try:
-                val = _ast_to_value(stmt.value, bindings)
-                target = stmt.targets[0]
-                if isinstance(target, ast.Name):
-                    bindings[target.id] = val
-                elif isinstance(target, (ast.Tuple, ast.List)):
-                    _bind_target(target, val, bindings)
-            except Exception:
-                pass
+            if isinstance(stmt.targets[0], ast.Name) and _is_ep_call(stmt.value, ep):
+                assigned_name = stmt.targets[0].id
+                i = _consume_mutation_group(
+                    stmt.value, assigned_name, stmts, i, lines, out, bindings
+                )
+            else:
+                try:
+                    val = _ast_to_value(stmt.value, bindings)
+                    target = stmt.targets[0]
+                    if isinstance(target, ast.Name):
+                        bindings[target.id] = val
+                    elif isinstance(target, (ast.Tuple, ast.List)):
+                        _bind_target(target, val, bindings)
+                except Exception:
+                    pass
+                i += 1
+        elif isinstance(stmt, ast.Expr) and _is_ep_call(stmt.value, ep):
+            i = _consume_mutation_group(
+                stmt.value, None, stmts, i, lines, out, bindings
+            )
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             _collect_stmts(stmt.body, lines, ep, out, {})
+            i += 1
         elif isinstance(stmt, ast.ClassDef):
             _collect_stmts(stmt.body, lines, ep, out, {})
+            i += 1
         elif isinstance(stmt, ast.If):
             _collect_stmts(stmt.body + stmt.orelse, lines, ep, out, dict(bindings))
+            i += 1
         elif isinstance(stmt, (ast.For, ast.While)):
             _handle_loop(stmt, lines, ep, out, bindings)
+            i += 1
         elif isinstance(stmt, ast.With):
             _collect_stmts(stmt.body, lines, ep, out, dict(bindings))
+            i += 1
         elif isinstance(stmt, ast.Try):
             tc = _match_raises(stmt, ep, bindings)
             if tc is not None:
@@ -315,11 +483,15 @@ def _collect_stmts(
                 _collect_stmts(stmt.body, lines, ep, out, dict(bindings))
                 for h in stmt.handlers:
                     _collect_stmts(h.body, lines, ep, out, dict(bindings))
+            i += 1
         elif isinstance(stmt, ast.Assert):
             tc = _match_assert(stmt, ep, bindings)
             if tc is not None:
                 _attach_annotations(tc, stmt.lineno, lines)
                 out.append(tc)
+            i += 1
+        else:
+            i += 1
 
 
 def _is_ep_call(node: ast.expr, ep: str) -> bool:
@@ -749,7 +921,7 @@ def emit_python(cases: list[TestCase], entrypoint: str) -> str:
          "expOut": tc.expect_stdout, "expErr": tc.expect_stderr,
          "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
          "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex,
-         "transform": tc.transform}
+         "transform": tc.transform, "mutationCheck": tc.mutation_check}
         for tc in cases
     ]
     cases_repr = repr(json.dumps(cases_data))
@@ -863,6 +1035,7 @@ def _run():
         msg_contains = c["msgContains"]
         msg_regex = c["msgRegex"]
         transform = c["transform"]
+        mutation_check = c["mutationCheck"]
         try:
             if kind == "raises":
                 caught = None
@@ -883,7 +1056,11 @@ def _run():
                 continue
             out_buf, err_buf = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-                result = fn(*args)
+                if mutation_check is None:
+                    result = fn(*args)
+                else:
+                    fn(*args)
+                    result = args[mutation_check]
             if transform is not None:
                 result = _TRANSFORMS[transform](result)
             ok = True
@@ -918,7 +1095,7 @@ def emit_javascript(cases: list[TestCase], entrypoint: str) -> str:
           "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr,
           "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
           "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex,
-          "transform": tc.transform}
+          "transform": tc.transform, "mutationCheck": tc.mutation_check}
          for tc in cases],
         indent=2,
     )
@@ -1059,9 +1236,11 @@ function run() {{
         (ok ? passed : failed).push(c.id);
         continue;
       }}
+      const mutationCheck = c.mutationCheck;
       const {{ result: _raw, stdout, stderr, threw }} = captureCall(fn, args);
       if (threw) {{ failed.push(c.id); continue; }}
-      const result = c.transform !== null ? _TRANSFORMS[c.transform](_raw) : _raw;
+      const _result = mutationCheck !== null ? args[mutationCheck] : _raw;
+      const result = c.transform !== null ? _TRANSFORMS[c.transform](_result) : _result;
       let ok = true;
       if (c.kind === 'eq') ok = deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'ne') ok = !deepEq(result, expected, tolAbs, tolRel, tolStrict);
@@ -1089,7 +1268,7 @@ def emit_typescript(cases: list[TestCase], entrypoint: str) -> str:
           "expectStdout": tc.expect_stdout, "expectStderr": tc.expect_stderr,
           "tolAbs": tc.tol_abs, "tolRel": tc.tol_rel, "tolStrict": tc.tol_strict,
           "excType": tc.exc_type, "msgContains": tc.msg_contains, "msgRegex": tc.msg_regex,
-          "transform": tc.transform}
+          "transform": tc.transform, "mutationCheck": tc.mutation_check}
          for tc in cases],
         indent=2,
     )
@@ -1105,7 +1284,7 @@ interface Case {{
   expectStdout: string | null; expectStderr: string | null;
   tolAbs: number | null; tolRel: number | null; tolStrict: boolean;
   excType: string | null; msgContains: string | null; msgRegex: string | null;
-  transform: string | null;
+  transform: string | null; mutationCheck: number | null;
 }}
 const CASES: Case[] = {cases_json};
 
@@ -1240,7 +1419,8 @@ function run(): void {{
       }}
       const {{ result: _raw, stdout, stderr, threw }} = captureCall(fn, args);
       if (threw) {{ failed.push(c.id); continue; }}
-      const result: any = c.transform !== null ? _TRANSFORMS[c.transform](_raw) : _raw;
+      const _result: any = c.mutationCheck !== null ? args[c.mutationCheck] : _raw;
+      const result: any = c.transform !== null ? _TRANSFORMS[c.transform](_result) : _result;
       let ok = true;
       if (c.kind === 'eq') ok = deepEq(result, expected, tolAbs, tolRel, tolStrict);
       else if (c.kind === 'ne') ok = !deepEq(result, expected, tolAbs, tolRel, tolStrict);
@@ -1278,18 +1458,45 @@ _EMITTERS = {
 }
 
 
+def discover_test_files(tests_dir: Path) -> list[Path]:
+    """Return sorted .py files under tests_dir. Raises DiscoveryError for test-like non-.py files."""
+    for f in tests_dir.rglob("*"):
+        if f.is_file() and f.suffix != ".py":
+            s = f.stem.lower()
+            if s.startswith("test") or s.endswith("_test") or s.endswith("_tests"):
+                rel = f.relative_to(tests_dir).as_posix()
+                raise DiscoveryError(f"non-.py test-like file found: {rel}")
+    return sorted(
+        (f for f in tests_dir.rglob("*.py") if f.is_file()),
+        key=lambda p: p.relative_to(tests_dir).parts,
+    )
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     tests_dir = Path(args.tests_dir)
-    tests_py = tests_dir / "tests.py"
-    if not tests_py.exists():
-        print(f"error: {tests_py} not found", file=sys.stderr)
-        return 1
 
     try:
-        source = tests_py.read_text()
-        cases = parse_tests(source, args.entrypoint)
-    except Exception as e:
-        print(f"error: failed to parse tests.py: {e}", file=sys.stderr)
+        py_files = discover_test_files(tests_dir)
+    except DiscoveryError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    cases: list[TestCase] = []
+    for py_file in py_files:
+        file_prefix = py_file.relative_to(tests_dir).as_posix()
+        try:
+            source = py_file.read_text()
+            file_cases = parse_tests(source, args.entrypoint, file_prefix=file_prefix)
+            cases.extend(file_cases)
+        except DiscoveryError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"error: failed to parse {file_prefix}: {e}", file=sys.stderr)
+            return 1
+
+    if not cases:
+        print(f"error: no tests discovered in {tests_dir}", file=sys.stderr)
         return 1
 
     code = _EMITTERS[args.lang](cases, args.entrypoint)
