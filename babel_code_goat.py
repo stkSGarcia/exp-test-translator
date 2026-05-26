@@ -29,7 +29,7 @@ from typing import Any, Literal
 @dataclass
 class TestCase:
     id: str                          # temporary: raw line number; final: "tests.py:<n>[#k]"
-    kind: Literal["eq", "ne", "truthy", "falsy", "raises", "in"]
+    kind: Literal["eq", "ne", "truthy", "falsy", "raises", "in", "loop_pass", "loop_fail"]
     args: list[Any]
     expected: Any = None
     expect_stdout: str | None = None
@@ -47,30 +47,47 @@ class TestCase:
 # Value helpers
 # ---------------------------------------------------------------------------
 
-def _ast_to_value(node: ast.expr) -> Any:
+def _ast_to_value(node: ast.expr, bindings: dict | None = None) -> Any:
     """Evaluate a constant-valued AST node to a Python value."""
+    if bindings and isinstance(node, ast.Name) and node.id in bindings:
+        return bindings[node.id]
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.List):
-        return [_ast_to_value(e) for e in node.elts]
+        return [_ast_to_value(e, bindings) for e in node.elts]
     if isinstance(node, ast.Tuple):
-        return ("__tuple__", [_ast_to_value(e) for e in node.elts])
+        return ("__tuple__", [_ast_to_value(e, bindings) for e in node.elts])
     if isinstance(node, ast.Set):
-        return ("__set__", [_ast_to_value(e) for e in node.elts])
+        return ("__set__", [_ast_to_value(e, bindings) for e in node.elts])
     if isinstance(node, ast.Dict):
-        keys = [_ast_to_value(k) for k in node.keys]
-        vals = [_ast_to_value(v) for v in node.values]
+        keys = [_ast_to_value(k, bindings) for k in node.keys]
+        vals = [_ast_to_value(v, bindings) for v in node.values]
         return ("__dict__", keys, vals)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        v = _ast_to_value(node.operand)
+        v = _ast_to_value(node.operand, bindings)
         return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.BinOp) and bindings is not None:
+        left = _ast_to_value(node.left, bindings)
+        right = _ast_to_value(node.right, bindings)
+        if isinstance(node.op, ast.Add): return left + right
+        if isinstance(node.op, ast.Sub): return left - right
+        if isinstance(node.op, ast.Mult): return left * right
+        if isinstance(node.op, ast.FloorDiv): return left // right
+        if isinstance(node.op, ast.Mod): return left % right
+    if isinstance(node, ast.Subscript) and bindings is not None:
+        obj = _ast_to_value(node.value, bindings)
+        idx = _ast_to_value(node.slice, bindings)
+        if isinstance(obj, list):
+            return obj[int(idx)]
+        if isinstance(obj, tuple) and obj and obj[0] == "__tuple__":
+            return obj[1][int(idx)]
     # Call nodes: frozenset({...}), Counter(...), deque(...), defaultdict(...), Decimal(...)
     if isinstance(node, ast.Call):
-        return _ast_call_to_value(node)
+        return _ast_call_to_value(node, bindings)
     raise ValueError(f"Unsupported value in tests.py: {ast.dump(node)}")
 
 
-def _ast_call_to_value(node: ast.Call) -> Any:
+def _ast_call_to_value(node: ast.Call, bindings: dict | None = None) -> Any:
     """Handle recognised stdlib call patterns as values."""
     func = node.func
     name = None
@@ -81,38 +98,71 @@ def _ast_call_to_value(node: ast.Call) -> Any:
 
     if name == "frozenset":
         inner = node.args[0] if node.args else ast.Set(elts=[])
-        elts = _ast_to_value(inner)
+        elts = _ast_to_value(inner, bindings)
         # inner may be a set literal → ("__set__", [...]) or a list
         items = elts[1] if isinstance(elts, tuple) and elts[0] == "__set__" else elts
         return ("__frozenset__", items)
     if name == "Counter":
         if node.args:
-            arg = _ast_to_value(node.args[0])
+            arg = _ast_to_value(node.args[0], bindings)
         elif node.keywords:
             arg = ("__dict__",
                    [kw.arg for kw in node.keywords],
-                   [_ast_to_value(kw.value) for kw in node.keywords])
+                   [_ast_to_value(kw.value, bindings) for kw in node.keywords])
         else:
             arg = ("__dict__", [], [])
         return ("__counter__", arg)
     if name == "deque":
-        inner = _ast_to_value(node.args[0]) if node.args else []
+        inner = _ast_to_value(node.args[0], bindings) if node.args else []
         return ("__deque__", inner)
     if name == "defaultdict":
         # defaultdict(factory, {...}) — we ignore factory
         if len(node.args) >= 2:
-            inner = _ast_to_value(node.args[1])
+            inner = _ast_to_value(node.args[1], bindings)
         elif node.keywords:
             inner = ("__dict__",
                      [kw.arg for kw in node.keywords],
-                     [_ast_to_value(kw.value) for kw in node.keywords])
+                     [_ast_to_value(kw.value, bindings) for kw in node.keywords])
         else:
             inner = ("__dict__", [], [])
         return ("__defaultdict__", inner)
     if name == "Decimal":
-        raw = _ast_to_value(node.args[0]) if node.args else "0"
+        raw = _ast_to_value(node.args[0], bindings) if node.args else "0"
         return ("__decimal__", str(raw))
+    if name == "len" and node.args:
+        v = _ast_to_value(node.args[0], bindings)
+        if isinstance(v, list):
+            return len(v)
+        if isinstance(v, str):
+            return len(v)
+        if isinstance(v, tuple) and v and v[0] in (
+            "__tuple__", "__set__", "__frozenset__", "__deque__"
+        ):
+            return len(v[1])
+    if name == "range" and node.args and bindings is not None:
+        r_args = [_ast_to_value(a, bindings) for a in node.args]
+        if all(isinstance(a, int) for a in r_args):
+            return list(range(*r_args))
     raise ValueError(f"Unsupported call in tests.py: {ast.dump(node)}")
+
+
+def _collect_ep_args(call: ast.Call, bindings: dict | None) -> list[Any]:
+    """Collect positional args from an entrypoint call, expanding *name starred args."""
+    result = []
+    for arg in call.args:
+        if isinstance(arg, ast.Starred):
+            val = _ast_to_value(arg.value, bindings or {})
+            if isinstance(val, list):
+                result.extend(val)
+            elif isinstance(val, tuple) and val and val[0] == "__tuple__":
+                result.extend(val[1])
+            elif isinstance(val, tuple):
+                result.extend(val)
+            else:
+                raise ValueError(f"Cannot expand starred: {val!r}")
+        else:
+            result.append(_ast_to_value(arg, bindings))
+    return result
 
 
 def _to_json_value(v: Any) -> Any:
@@ -166,14 +216,21 @@ def parse_tests(source: str, entrypoint: str) -> list[TestCase]:
     raw: list[TestCase] = []
     _collect_stmts(tree.body, lines, entrypoint, raw)
 
-    # Assign proper IDs: "tests.py:<line>" or "tests.py:<line>#N" for collisions.
-    # tc.id is stored as str(lineno) initially.
+    # Assign final IDs.  Raw IDs use three formats:
+    #   "loop:<n>"      → loop-as-test (loop_pass / loop_fail)
+    #   "iter:<n>:<k>"  → loop body assertion at iteration k
+    #   str(lineno)     → unlooped assertion; dedup with #N suffix on collision
+    loop_tests = [tc for tc in raw if tc.id.startswith("loop:")]
+    iter_assertions = [tc for tc in raw if tc.id.startswith("iter:")]
+    plain_assertions = [tc for tc in raw
+                        if not tc.id.startswith("loop:") and not tc.id.startswith("iter:")]
+
     line_counts: dict[int, int] = {}
-    for tc in raw:
+    for tc in plain_assertions:
         n = int(tc.id)
         line_counts[n] = line_counts.get(n, 0) + 1
     line_seen: dict[int, int] = {}
-    for tc in raw:
+    for tc in plain_assertions:
         n = int(tc.id)
         if line_counts[n] == 1:
             tc.id = f"tests.py:{n}"
@@ -181,34 +238,85 @@ def parse_tests(source: str, entrypoint: str) -> list[TestCase]:
             idx = line_seen.get(n, 0)
             tc.id = f"tests.py:{n}#{idx}"
             line_seen[n] = idx + 1
+
+    for tc in loop_tests:
+        n = int(tc.id[5:])  # strip "loop:"
+        tc.id = f"tests.py:{n}"
+
+    for tc in iter_assertions:
+        _, n_str, k_str = tc.id.split(":", 2)
+        tc.id = f"tests.py:{n_str}:{k_str}"
+
     return raw
 
 
-def _collect_stmts(
-    stmts: list[ast.stmt], lines: list[str], ep: str, out: list[TestCase]
+def _handle_loop(
+    stmt: ast.stmt, lines: list[str], ep: str, out: list[TestCase], bindings: dict
 ) -> None:
+    # ID tagging convention:
+    #   loop-as-test uses id "loop:<lineno>"
+    #   loop body assertions use id "iter:<lineno>:<iteration_index>"
+    loop_lineno = stmt.lineno
+    iterations = _eval_loop_iterations(stmt, bindings)
+
+    if not iterations:
+        out.append(TestCase(id=f"loop:{loop_lineno}", kind="loop_fail", args=[]))
+        return
+
+    out.append(TestCase(id=f"loop:{loop_lineno}", kind="loop_pass", args=[]))
+
+    for k, iter_bindings in enumerate(iterations):
+        loop_bindings = {**bindings, **iter_bindings}
+        iter_out: list[TestCase] = []
+        _collect_stmts(stmt.body, lines, ep, iter_out, loop_bindings)
+
+        for tc in iter_out:
+            # Rewrite plain lineno IDs to iteration-indexed form; leave loop:/iter: prefixed
+            # IDs from nested loops unchanged — they carry their own independent IDs.
+            if not tc.id.startswith("loop:") and not tc.id.startswith("iter:"):
+                tc.id = f"iter:{tc.id}:{k}"
+
+        out.extend(iter_out)
+
+
+def _collect_stmts(
+    stmts: list[ast.stmt], lines: list[str], ep: str, out: list[TestCase],
+    bindings: dict | None = None,
+) -> None:
+    if bindings is None:
+        bindings = {}
     for stmt in stmts:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            _collect_stmts(stmt.body, lines, ep, out)
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            try:
+                val = _ast_to_value(stmt.value, bindings)
+                target = stmt.targets[0]
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = val
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    _bind_target(target, val, bindings)
+            except Exception:
+                pass
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _collect_stmts(stmt.body, lines, ep, out, {})
         elif isinstance(stmt, ast.ClassDef):
-            _collect_stmts(stmt.body, lines, ep, out)
+            _collect_stmts(stmt.body, lines, ep, out, {})
         elif isinstance(stmt, ast.If):
-            _collect_stmts(stmt.body + stmt.orelse, lines, ep, out)
+            _collect_stmts(stmt.body + stmt.orelse, lines, ep, out, dict(bindings))
         elif isinstance(stmt, (ast.For, ast.While)):
-            _collect_stmts(stmt.body + stmt.orelse, lines, ep, out)
+            _handle_loop(stmt, lines, ep, out, bindings)
         elif isinstance(stmt, ast.With):
-            _collect_stmts(stmt.body, lines, ep, out)
+            _collect_stmts(stmt.body, lines, ep, out, dict(bindings))
         elif isinstance(stmt, ast.Try):
-            tc = _match_raises(stmt, ep)
+            tc = _match_raises(stmt, ep, bindings)
             if tc is not None:
                 _attach_annotations(tc, stmt.lineno, lines)
                 out.append(tc)
             else:
-                _collect_stmts(stmt.body, lines, ep, out)
+                _collect_stmts(stmt.body, lines, ep, out, dict(bindings))
                 for h in stmt.handlers:
-                    _collect_stmts(h.body, lines, ep, out)
+                    _collect_stmts(h.body, lines, ep, out, dict(bindings))
         elif isinstance(stmt, ast.Assert):
-            tc = _match_assert(stmt, ep)
+            tc = _match_assert(stmt, ep, bindings)
             if tc is not None:
                 _attach_annotations(tc, stmt.lineno, lines)
                 out.append(tc)
@@ -222,7 +330,7 @@ def _is_ep_call(node: ast.expr, ep: str) -> bool:
     )
 
 
-def _match_raises(node: ast.Try, ep: str) -> TestCase | None:
+def _match_raises(node: ast.Try, ep: str, bindings: dict | None = None) -> TestCase | None:
     """Match typed and untyped raises blocks."""
     if len(node.body) != 2 or len(node.handlers) != 1:
         return None
@@ -239,7 +347,7 @@ def _match_raises(node: ast.Try, ep: str) -> TestCase | None:
         and s1.test.value is False
     ):
         return None
-    args = [_ast_to_value(a) for a in s0.value.args]
+    args = _collect_ep_args(s0.value, bindings)
     exc_type = None if exc_name == "Exception" else exc_name
 
     # Handler body: pass (no message check) or single assert with message check
@@ -293,21 +401,21 @@ def _parse_msg_assert(node: ast.Assert, exc_var: str | None) -> tuple[str | None
     return None, None
 
 
-def _match_assert(node: ast.Assert, ep: str) -> TestCase | None:
+def _match_assert(node: ast.Assert, ep: str, bindings: dict | None = None) -> TestCase | None:
     test = node.test
 
     # assert math.isclose(EP(args), expected, abs_tol=..., rel_tol=...)
-    tc = _match_isclose(test, ep, node.lineno)
+    tc = _match_isclose(test, ep, node.lineno, bindings)
     if tc is not None:
         return tc
 
     # assert abs(EP(args) - expected) < tol  /  <= tol
-    tc = _match_abs_tol(test, ep, node.lineno)
+    tc = _match_abs_tol(test, ep, node.lineno, bindings)
     if tc is not None:
         return tc
 
     # assert prim(EP(args)) == expected  /  != expected
-    tc = _match_primitive_wrapped(test, ep, node.lineno)
+    tc = _match_primitive_wrapped(test, ep, node.lineno, bindings)
     if tc is not None:
         return tc
 
@@ -321,29 +429,29 @@ def _match_assert(node: ast.Assert, ep: str) -> TestCase | None:
         if (_is_ep_call(test.left, ep)
                 and not _is_ep_call(test.comparators[0], ep)
                 and isinstance(op, (ast.Eq, ast.NotEq))):
-            args = [_ast_to_value(a) for a in test.left.args]
-            exp = _ast_to_value(test.comparators[0])
+            args = _collect_ep_args(test.left, bindings)
+            exp = _ast_to_value(test.comparators[0], bindings)
             kind: str = "eq" if isinstance(op, ast.Eq) else "ne"
             return TestCase(id=str(node.lineno), kind=kind, args=args, expected=exp)
         # assert expected == EP(args)  /  expected != EP(args)  (RHS call, LHS is not also EP call)
         if (_is_ep_call(test.comparators[0], ep)
                 and not _is_ep_call(test.left, ep)
                 and isinstance(op, (ast.Eq, ast.NotEq))):
-            args = [_ast_to_value(a) for a in test.comparators[0].args]
-            exp = _ast_to_value(test.left)
+            args = _collect_ep_args(test.comparators[0], bindings)
+            exp = _ast_to_value(test.left, bindings)
             kind = "eq" if isinstance(op, ast.Eq) else "ne"
             return TestCase(id=str(node.lineno), kind=kind, args=args, expected=exp)
         # assert EP(args) in container
         if _is_ep_call(test.left, ep) and isinstance(op, ast.In):
-            args = [_ast_to_value(a) for a in test.left.args]
-            container = _ast_to_value(test.comparators[0])
+            args = _collect_ep_args(test.left, bindings)
+            container = _ast_to_value(test.comparators[0], bindings)
             return TestCase(id=str(node.lineno), kind="in", args=args, expected=container)
 
     # assert EP(args)
     if _is_ep_call(test, ep):
         return TestCase(
             id=str(node.lineno), kind="truthy",
-            args=[_ast_to_value(a) for a in test.args],
+            args=_collect_ep_args(test, bindings),
         )
     # assert not EP(args)
     if (
@@ -353,12 +461,12 @@ def _match_assert(node: ast.Assert, ep: str) -> TestCase | None:
     ):
         return TestCase(
             id=str(node.lineno), kind="falsy",
-            args=[_ast_to_value(a) for a in test.operand.args],
+            args=_collect_ep_args(test.operand, bindings),
         )
     return None
 
 
-def _match_isclose(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
+def _match_isclose(test: ast.expr, ep: str, lineno: int, bindings: dict | None = None) -> TestCase | None:
     """Match assert math.isclose(EP(args), expected, abs_tol=..., rel_tol=...)."""
     if not (
         isinstance(test, ast.Call)
@@ -369,20 +477,20 @@ def _match_isclose(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
         and _is_ep_call(test.args[0], ep)
     ):
         return None
-    args = [_ast_to_value(a) for a in test.args[0].args]
-    exp = _ast_to_value(test.args[1])
+    args = _collect_ep_args(test.args[0], bindings)
+    exp = _ast_to_value(test.args[1], bindings)
     tol_abs: float | None = None
     tol_rel: float | None = None
     for kw in test.keywords:
         if kw.arg == "abs_tol":
-            tol_abs = float(_ast_to_value(kw.value))
+            tol_abs = float(_ast_to_value(kw.value, bindings))
         elif kw.arg == "rel_tol":
-            tol_rel = float(_ast_to_value(kw.value))
+            tol_rel = float(_ast_to_value(kw.value, bindings))
     return TestCase(id=str(lineno), kind="eq", args=args, expected=exp,
                     tol_abs=tol_abs, tol_rel=tol_rel)
 
 
-def _match_abs_tol(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
+def _match_abs_tol(test: ast.expr, ep: str, lineno: int, bindings: dict | None = None) -> TestCase | None:
     """Match assert abs(EP(args) - expected) < tol  or  <= tol."""
     if not (
         isinstance(test, ast.Compare)
@@ -405,15 +513,15 @@ def _match_abs_tol(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
         and _is_ep_call(inner.left, ep)
     ):
         return None
-    args = [_ast_to_value(a) for a in inner.left.args]
-    exp = _ast_to_value(inner.right)
-    tol_abs = float(_ast_to_value(test.comparators[0]))
+    args = _collect_ep_args(inner.left, bindings)
+    exp = _ast_to_value(inner.right, bindings)
+    tol_abs = float(_ast_to_value(test.comparators[0], bindings))
     strict = isinstance(test.ops[0], ast.Lt)
     return TestCase(id=str(lineno), kind="eq", args=args, expected=exp,
                     tol_abs=tol_abs, tol_strict=strict)
 
 
-def _match_primitive_wrapped(test: ast.expr, ep: str, lineno: int) -> TestCase | None:
+def _match_primitive_wrapped(test: ast.expr, ep: str, lineno: int, bindings: dict | None = None) -> TestCase | None:
     """Match assert prim(EP(args)) == expected  or  != expected."""
     if not (
         isinstance(test, ast.Compare)
@@ -433,8 +541,8 @@ def _match_primitive_wrapped(test: ast.expr, ep: str, lineno: int) -> TestCase |
     ):
         return None
     transform = lhs.func.id
-    args = [_ast_to_value(a) for a in lhs.args[0].args]
-    exp = _ast_to_value(test.comparators[0])
+    args = _collect_ep_args(lhs.args[0], bindings)
+    exp = _ast_to_value(test.comparators[0], bindings)
     kind: str = "eq" if isinstance(test.ops[0], ast.Eq) else "ne"
     return TestCase(id=str(lineno), kind=kind, args=args, expected=exp, transform=transform)
 
@@ -453,6 +561,181 @@ def _attach_annotations(tc: TestCase, lineno: int, lines: list[str]) -> None:
         elif kind == "stderr" and tc.expect_stderr is None:
             tc.expect_stderr = parsed
         i -= 1
+
+
+# ---------------------------------------------------------------------------
+# Loop evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _eval_expr(node: ast.expr, bindings: dict) -> Any:
+    """Evaluate expression to a plain Python value (used for while-loop simulation)."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id not in bindings:
+            raise ValueError(f"Unknown variable: {node.id!r}")
+        return bindings[node.id]
+    if isinstance(node, ast.List):
+        return [_eval_expr(e, bindings) for e in node.elts]
+    if isinstance(node, ast.Tuple):
+        return tuple(_eval_expr(e, bindings) for e in node.elts)
+    if isinstance(node, ast.Subscript):
+        obj = _eval_expr(node.value, bindings)
+        idx = _eval_expr(node.slice, bindings)
+        return obj[int(idx)]
+    if isinstance(node, ast.UnaryOp):
+        v = _eval_expr(node.operand, bindings)
+        if isinstance(node.op, ast.USub): return -v
+        if isinstance(node.op, ast.Not): return not v
+        raise ValueError(f"Unsupported unary op: {type(node.op).__name__}")
+    if isinstance(node, ast.BinOp):
+        left = _eval_expr(node.left, bindings)
+        right = _eval_expr(node.right, bindings)
+        if isinstance(node.op, ast.Add): return left + right
+        if isinstance(node.op, ast.Sub): return left - right
+        if isinstance(node.op, ast.Mult): return left * right
+        if isinstance(node.op, ast.FloorDiv): return left // right
+        if isinstance(node.op, ast.Mod): return left % right
+        raise ValueError(f"Unsupported binary op: {type(node.op).__name__}")
+    if isinstance(node, ast.Compare):
+        left = _eval_expr(node.left, bindings)
+        for op, comp_node in zip(node.ops, node.comparators):
+            right = _eval_expr(comp_node, bindings)
+            if isinstance(op, ast.Lt): cmp = left < right
+            elif isinstance(op, ast.LtE): cmp = left <= right
+            elif isinstance(op, ast.Gt): cmp = left > right
+            elif isinstance(op, ast.GtE): cmp = left >= right
+            elif isinstance(op, ast.Eq): cmp = left == right
+            elif isinstance(op, ast.NotEq): cmp = left != right
+            else: raise ValueError(f"Unsupported compare op: {type(op).__name__}")
+            if not cmp: return False
+            left = right
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        fn_name = node.func.id
+        if fn_name == "len":
+            return len(_eval_expr(node.args[0], bindings))
+        if fn_name == "range":
+            r_args = [int(_eval_expr(a, bindings)) for a in node.args]
+            return list(range(*r_args))
+    raise ValueError(f"Cannot evaluate: {ast.dump(node)}")
+
+
+def _bind_target(target: ast.expr, val: Any, bindings: dict) -> None:
+    """Bind loop target variable(s), handling tuple/list destructuring."""
+    if isinstance(target, ast.Name):
+        bindings[target.id] = val
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        if isinstance(val, tuple) and val and val[0] == "__tuple__":
+            items: list = val[1]
+        elif isinstance(val, (list, tuple)):
+            items = list(val)
+        else:
+            raise ValueError(f"Cannot unpack {val!r} into {ast.dump(target)}")
+        if len(target.elts) != len(items):
+            raise ValueError(
+                f"Unpack mismatch: {len(items)} values for {len(target.elts)} targets"
+            )
+        for sub_t, sub_v in zip(target.elts, items):
+            _bind_target(sub_t, sub_v, bindings)
+
+
+def _eval_iterable_items(node: ast.expr, bindings: dict) -> list:
+    """Evaluate an iterable AST node to a list of internally-encoded items."""
+    val = _ast_to_value(node, bindings)
+    if isinstance(val, list):
+        return val
+    if isinstance(val, tuple) and val and val[0] == "__tuple__":
+        return val[1]
+    raise ValueError(f"Not iterable: {val!r}")
+
+
+def _eval_for_iterations(stmt: ast.For, bindings: dict) -> list[dict]:
+    """Return one binding-dict per for-loop iteration."""
+    iter_node = stmt.iter
+
+    # enumerate(iterable) or enumerate(iterable, start)
+    if (
+        isinstance(iter_node, ast.Call)
+        and isinstance(iter_node.func, ast.Name)
+        and iter_node.func.id == "enumerate"
+    ):
+        inner_items = _eval_iterable_items(iter_node.args[0], bindings)
+        start_node = iter_node.args[1] if len(iter_node.args) > 1 else ast.Constant(value=0)
+        start = _ast_to_value(start_node, bindings)
+        if not isinstance(start, int):
+            raise ValueError("enumerate start must be int")
+        items: list = [("__tuple__", [start + i, item]) for i, item in enumerate(inner_items)]
+    else:
+        items = _eval_iterable_items(iter_node, bindings)
+
+    result = []
+    for item in items:
+        iter_bindings: dict = {}
+        _bind_target(stmt.target, item, iter_bindings)
+        result.append(iter_bindings)
+    return result
+
+
+def _eval_while_iterations(stmt: ast.While, outer_bindings: dict) -> list[dict]:
+    """Simulate a simple while loop; return one binding-dict per iteration.
+
+    Assign statements update both sim_bindings and the per-iteration snapshot.
+    AugAssign statements (typically loop counters) update only sim_bindings so
+    that the snapshot reflects pre-increment state when assertions run.
+    """
+    _MAX_ITER = 1000
+    sim_bindings = dict(outer_bindings)
+    iterations = []
+
+    for _ in range(_MAX_ITER):
+        if not _eval_expr(stmt.test, sim_bindings):
+            break
+
+        # Snapshot starts from current state; updated by Assign but not AugAssign.
+        iter_snapshot: dict = dict(sim_bindings)
+
+        for body_stmt in stmt.body:
+            if isinstance(body_stmt, ast.Assign) and len(body_stmt.targets) == 1:
+                val = _eval_expr(body_stmt.value, sim_bindings)
+                target = body_stmt.targets[0]
+                if isinstance(target, ast.Name):
+                    sim_bindings[target.id] = val
+                    iter_snapshot[target.id] = val
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    _bind_target(target, val, sim_bindings)
+                    _bind_target(target, val, iter_snapshot)
+                else:
+                    raise ValueError(f"Unsupported assign target: {ast.dump(target)}")
+            elif isinstance(body_stmt, ast.AugAssign) and isinstance(body_stmt.target, ast.Name):
+                old = sim_bindings.get(body_stmt.target.id)
+                delta = _eval_expr(body_stmt.value, sim_bindings)
+                op = body_stmt.op
+                if isinstance(op, ast.Add): sim_bindings[body_stmt.target.id] = old + delta
+                elif isinstance(op, ast.Sub): sim_bindings[body_stmt.target.id] = old - delta
+                elif isinstance(op, ast.Mult): sim_bindings[body_stmt.target.id] = old * delta
+                else: raise ValueError(f"Unsupported augassign: {type(op).__name__}")
+                # AugAssign intentionally NOT applied to iter_snapshot (loop counter)
+            elif isinstance(body_stmt, ast.Assert):
+                pass  # skip during simulation
+            else:
+                raise ValueError(f"Cannot simulate: {type(body_stmt).__name__}")
+
+        iterations.append(iter_snapshot)
+
+    return iterations
+
+
+def _eval_loop_iterations(stmt: ast.stmt, bindings: dict) -> list[dict]:
+    """Dispatch to for/while iteration evaluator; return [] on any failure."""
+    try:
+        if isinstance(stmt, ast.For):
+            return _eval_for_iterations(stmt, bindings)
+        if isinstance(stmt, ast.While):
+            return _eval_while_iterations(stmt, bindings)
+    except Exception:
+        pass
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +847,12 @@ def _run():
     for c in CASES:
         tid = c["id"]
         kind = c["kind"]
+        if kind == "loop_pass":
+            passed.append(tid)
+            continue
+        if kind == "loop_fail":
+            failed.append(tid)
+            continue
         args = [_decode(a) for a in c["args"]]
         expected = _decode(c["expected"])
         exp_out, exp_err = c["expOut"], c["expErr"]
@@ -751,6 +1040,8 @@ function run() {{
   }}
   const passed = [], failed = [];
   for (const c of CASES) {{
+    if (c.kind === 'loop_pass') {{ passed.push(c.id); continue; }}
+    if (c.kind === 'loop_fail') {{ failed.push(c.id); continue; }}
     const args = c.args.map(decode);
     const expected = decode(c.expected);
     const tolAbs = c.tolAbs !== null ? c.tolAbs : globalTol;
@@ -928,6 +1219,8 @@ function run(): void {{
   }}
   const passed: string[] = [], failed: string[] = [];
   for (const c of CASES) {{
+    if (c.kind === 'loop_pass') {{ passed.push(c.id); continue; }}
+    if (c.kind === 'loop_fail') {{ failed.push(c.id); continue; }}
     const args: any[] = c.args.map(decode);
     const expected: any = decode(c.expected);
     const tolAbs: number | null = c.tolAbs !== null ? c.tolAbs : globalTol;
