@@ -1442,6 +1442,646 @@ run();
 
 
 # ---------------------------------------------------------------------------
+# C++ helpers & emitter
+# ---------------------------------------------------------------------------
+
+def _cpp_str_escape(s: str) -> str:
+    out = []
+    for ch in s:
+        if ch == '\\': out.append('\\\\')
+        elif ch == '"': out.append('\\"')
+        elif ch == '\n': out.append('\\n')
+        elif ch == '\r': out.append('\\r')
+        elif ch == '\t': out.append('\\t')
+        elif ch == '\0': out.append('\\0')
+        else: out.append(ch)
+    return ''.join(out)
+
+
+def _cpp_type(v: Any) -> str:
+    if v is None:
+        return "std::nullopt_t"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "long long"
+    if isinstance(v, float):
+        return "long double"
+    if isinstance(v, str):
+        return "std::string"
+    if isinstance(v, list):
+        return f"std::vector<{_cpp_type(v[0]) if v else 'long long'}>"
+    if isinstance(v, tuple):
+        tag = v[0]
+        if tag == "__decimal__":
+            return "long double"
+        if tag in ("__tuple__", "__deque__"):
+            inner = v[1]
+            return f"std::vector<{_cpp_type(inner[0]) if inner else 'long long'}>"
+        if tag in ("__set__", "__frozenset__"):
+            inner = v[1]
+            return f"std::set<{_cpp_type(inner[0]) if inner else 'long long'}>"
+        if tag == "__dict__":
+            keys, vals = v[1], v[2]
+            if not keys:
+                return "std::map<std::string, long long>"
+            return f"std::map<{_cpp_type(keys[0])}, {_cpp_type(vals[0])}>"
+        if tag in ("__counter__", "__defaultdict__"):
+            inner = v[1]
+            if isinstance(inner, tuple) and inner[0] == "__dict__" and inner[1]:
+                return f"std::map<{_cpp_type(inner[1][0])}, long long>"
+            return "std::map<std::string, long long>"
+    return "long long"
+
+
+def _cpp_val(v: Any) -> str:
+    if v is None:
+        return "std::nullopt"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return f"{v}LL"
+    if isinstance(v, float):
+        if v != v:
+            return "std::numeric_limits<long double>::quiet_NaN()"
+        if v == float('inf'):
+            return "std::numeric_limits<long double>::infinity()"
+        if v == float('-inf'):
+            return "-std::numeric_limits<long double>::infinity()"
+        return repr(v) + "L"
+    if isinstance(v, str):
+        return f'std::string("{_cpp_str_escape(v)}")'
+    if isinstance(v, list):
+        if not v:
+            return "{}"
+        et = _cpp_type(v[0])
+        return f"std::vector<{et}>{{{', '.join(_cpp_val(x) for x in v)}}}"
+    if isinstance(v, tuple):
+        tag = v[0]
+        if tag == "__decimal__":
+            return repr(float(v[1])) + "L"
+        if tag == "__tuple__":
+            items = v[1]
+            if not items:
+                return "std::vector<long long>{}"
+            et = _cpp_type(items[0])
+            return f"std::vector<{et}>{{{', '.join(_cpp_val(x) for x in items)}}}"
+        if tag == "__deque__":
+            items = v[1]
+            if not items:
+                return "std::deque<long long>{}"
+            et = _cpp_type(items[0])
+            return f"std::deque<{et}>{{{', '.join(_cpp_val(x) for x in items)}}}"
+        if tag in ("__set__", "__frozenset__"):
+            items = v[1]
+            if not items:
+                return "std::set<long long>{}"
+            et = _cpp_type(items[0])
+            return f"std::set<{et}>{{{', '.join(_cpp_val(x) for x in items)}}}"
+        if tag == "__dict__":
+            keys, vals = v[1], v[2]
+            if not keys:
+                return "std::map<std::string, long long>{}"
+            kt = _cpp_type(keys[0])
+            vt = _cpp_type(vals[0])
+            pairs = ", ".join(
+                f"{{{_cpp_val(k)}, {_cpp_val(val)}}}"
+                for k, val in zip(keys, vals)
+            )
+            return f"std::map<{kt}, {vt}>{{{pairs}}}"
+        if tag in ("__counter__", "__defaultdict__"):
+            inner = v[1]
+            if isinstance(inner, tuple) and inner[0] == "__dict__":
+                keys, vals = inner[1], inner[2]
+                if not keys:
+                    return "std::map<std::string, long long>{}"
+                kt = _cpp_type(keys[0])
+                pairs = ", ".join(
+                    f"{{{_cpp_val(k)}, {_cpp_val(val)}}}"
+                    for k, val in zip(keys, vals)
+                )
+                return f"std::map<{kt}, long long>{{{pairs}}}"
+            return "std::map<std::string, long long>{}"
+    raise ValueError(f"Cannot encode C++ value: {v!r}")
+
+
+def _cpp_is_numeric(v: Any) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return True
+    if isinstance(v, tuple) and v and v[0] == "__decimal__":
+        return True
+    return False
+
+
+def _cpp_tc_block(tc: TestCase, ep: str) -> str:
+    tid = tc.id.replace('\\', '\\\\').replace('"', '\\"')
+    args_code = ", ".join(_cpp_val(a) for a in tc.args)
+    I = "    "
+    L = [f"{I}// {tc.id}", f"{I}{{"]
+
+    if tc.kind == "loop_pass":
+        L += [f'{I}    _passed.push_back("{tid}");', f"{I}}}"]
+        return "\n".join(L)
+    if tc.kind == "loop_fail":
+        L += [f'{I}    _failed.push_back("{tid}");', f"{I}}}"]
+        return "\n".join(L)
+    if tc.expect_stdout is not None or tc.expect_stderr is not None:
+        L += [f'{I}    _failed.push_back("{tid}"); // stdout/stderr not supported', f"{I}}}"]
+        return "\n".join(L)
+
+    call = f"{ep}({args_code})"
+
+    if tc.kind == "raises":
+        L += [
+            f"{I}    bool _threw = false;",
+            f"{I}    try {{ {call}; }}",
+            f"{I}    catch (...) {{ _threw = true; }}",
+            f'{I}    (_threw ? _passed : _failed).push_back("{tid}");',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    transforms_cpp = {
+        "sorted": f"[&](){{ auto _t = {call}; std::sort(_t.begin(), _t.end()); return _t; }}()",
+        "len":    f"(long long)({call}).size()",
+        "list":   call,
+        "tuple":  call,
+        "set":    f"[&](){{ auto _t = {call}; return std::set<typename decltype(_t)::value_type>(_t.begin(), _t.end()); }}()",
+        "str":    f"std::to_string({call})",
+        "int":    f"(long long)({call})",
+        "float":  f"(long double)({call})",
+        "abs":    f"[&](){{ auto _v = {call}; return _v < 0 ? -_v : _v; }}()",
+        "sum":    f"[&](){{ auto _t = {call}; return std::accumulate(_t.begin(), _t.end(), decltype(*_t.begin()){{}}); }}()",
+        "min":    f"[&](){{ auto _t = {call}; return *std::min_element(_t.begin(), _t.end()); }}()",
+        "max":    f"[&](){{ auto _t = {call}; return *std::max_element(_t.begin(), _t.end()); }}()",
+    }
+    result_expr = transforms_cpp.get(tc.transform, call) if tc.transform else call
+
+    L.append(f"{I}    try {{")
+    L.append(f"{I}        auto _result = {result_expr};")
+
+    if tc.mutation_check is not None:
+        L += [
+            f"{I}        // mutation_check not supported in C++ tester",
+            f'{I}        _failed.push_back("{tid}");',
+            f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    if tc.kind in ("truthy", "falsy"):
+        neg = "!" if tc.kind == "falsy" else ""
+        L += [
+            f"{I}        bool _ok = {neg}(bool)_result;",
+            f'{I}        (_ok ? _passed : _failed).push_back("{tid}");',
+            f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    if tc.kind == "in":
+        exp_t = _cpp_type(tc.expected)
+        L.append(f"{I}        auto _expected = {_cpp_val(tc.expected)};")
+        if "set" in exp_t:
+            L.append(f"{I}        bool _ok = _expected.count(_result) > 0;")
+        else:
+            L.append(f"{I}        bool _ok = std::find(_expected.begin(), _expected.end(), _result) != _expected.end();")
+        L += [
+            f'{I}        (_ok ? _passed : _failed).push_back("{tid}");',
+            f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    # eq / ne
+    L.append(f"{I}        auto _expected = {_cpp_val(tc.expected)};")
+    use_tol = tc.tol_abs is not None or tc.tol_rel is not None
+    is_num = _cpp_is_numeric(tc.expected)
+    ta = f"{tc.tol_abs}L" if tc.tol_abs is not None else "-1.0L"
+    tr = f"{tc.tol_rel}L" if tc.tol_rel is not None else "-1.0L"
+    ts = "true" if tc.tol_strict else "false"
+
+    if use_tol:
+        L.append(f"{I}        bool _ok = _bcg_eq_num(_result, _expected, {ta}, {tr}, {ts});")
+    elif is_num:
+        L += [
+            f"{I}        bool _ok = (_global_tol >= 0.0L)",
+            f"{I}            ? _bcg_eq_num(_result, _expected, _global_tol, -1.0L, true)",
+            f"{I}            : (_result == _expected);",
+        ]
+    else:
+        L.append(f"{I}        bool _ok = (_result == _expected);")
+
+    if tc.kind == "ne":
+        L.append(f"{I}        _ok = !_ok;")
+
+    L += [
+        f'{I}        (_ok ? _passed : _failed).push_back("{tid}");',
+        f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
+        f"{I}}}",
+    ]
+    return "\n".join(L)
+
+
+def emit_cpp(cases: list[TestCase], entrypoint: str) -> str:
+    preamble = """\
+// Auto-generated by babel_code_goat -- do not edit
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <deque>
+#include <fstream>
+#include <functional>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+static long double _global_tol = -1.0L;
+
+template<typename T, typename U>
+bool _bcg_eq_num(const T& a, const U& b, long double tol_abs, long double tol_rel, bool strict) {
+    if (tol_abs < 0.0L && tol_rel < 0.0L) return (long double)a == (long double)b;
+    long double da = (long double)a, db = (long double)b;
+    long double diff = fabsl(da - db);
+    long double lim = tol_abs >= 0.0L ? tol_abs : 0.0L;
+    if (tol_rel >= 0.0L) lim = std::max(lim, tol_rel * std::max(fabsl(da), fabsl(db)));
+    return strict ? diff < lim : diff <= lim;
+}
+
+static std::string _json_esc(const std::string& s) {
+    std::string r; r.reserve(s.size() + 4);
+    for (unsigned char c : s) {
+        if (c == 34) { r += (char)92; r += (char)34; }
+        else if (c == 92) { r += (char)92; r += (char)92; }
+        else r += (char)c;
+    }
+    return r;
+}
+
+int main() {
+    const char* _tol_env = std::getenv("_BCG_TOL");
+    if (_tol_env) _global_tol = std::stold(std::string(_tol_env));
+    const char* _res_env = std::getenv("_BCG_RESULTS_FILE");
+    if (!_res_env) return 1;
+    std::vector<std::string> _passed, _failed;
+
+"""
+    test_blocks = "\n".join(_cpp_tc_block(tc, entrypoint) for tc in cases)
+    epilogue = """
+    std::ofstream _out(_res_env);
+    _out << R"({"passed":[)";
+    for (size_t i = 0; i < _passed.size(); i++) {
+        if (i) _out << (char)44;
+        _out << (char)34 << _json_esc(_passed[i]) << (char)34;
+    }
+    _out << R"(],"failed":[)";
+    for (size_t i = 0; i < _failed.size(); i++) {
+        if (i) _out << (char)44;
+        _out << (char)34 << _json_esc(_failed[i]) << (char)34;
+    }
+    _out << "]}";
+    return 0;
+}
+"""
+    return preamble + test_blocks + epilogue
+
+
+# ---------------------------------------------------------------------------
+# Rust helpers & emitter
+# ---------------------------------------------------------------------------
+
+def _rust_str_escape(s: str) -> str:
+    out = []
+    for ch in s:
+        if ch == '\\': out.append('\\\\')
+        elif ch == '"': out.append('\\"')
+        elif ch == '\n': out.append('\\n')
+        elif ch == '\r': out.append('\\r')
+        elif ch == '\t': out.append('\\t')
+        elif ch == '\0': out.append('\\0')
+        else: out.append(ch)
+    return ''.join(out)
+
+
+def _has_deque(v: Any) -> bool:
+    if isinstance(v, tuple) and v:
+        if v[0] == "__deque__":
+            return True
+        if v[0] in ("__tuple__", "__set__", "__frozenset__"):
+            return any(_has_deque(x) for x in v[1])
+        if v[0] == "__dict__":
+            return any(_has_deque(x) for x in v[1]) or any(_has_deque(x) for x in v[2])
+        if v[0] in ("__counter__", "__defaultdict__"):
+            return _has_deque(v[1])
+    if isinstance(v, list):
+        return any(_has_deque(x) for x in v)
+    return False
+
+
+def _rust_val(v: Any) -> str:
+    if v is None:
+        return "None"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return f"{v}_i64"
+    if isinstance(v, float):
+        if v != v:
+            return "f64::NAN"
+        if v == float('inf'):
+            return "f64::INFINITY"
+        if v == float('-inf'):
+            return "f64::NEG_INFINITY"
+        return repr(v) + "_f64"
+    if isinstance(v, str):
+        return f'String::from("{_rust_str_escape(v)}")'
+    if isinstance(v, list):
+        if not v:
+            return "Vec::<i64>::new()"
+        items = ", ".join(_rust_val(x) for x in v)
+        return f"vec![{items}]"
+    if isinstance(v, tuple):
+        tag = v[0]
+        if tag == "__decimal__":
+            return repr(float(v[1])) + "_f64"
+        if tag == "__tuple__":
+            items = v[1]
+            if not items:
+                return "Vec::<i64>::new()"
+            return f"vec![{', '.join(_rust_val(x) for x in items)}]"
+        if tag == "__deque__":
+            return "/* deque */"
+        if tag in ("__set__", "__frozenset__"):
+            items = v[1]
+            if not items:
+                return "BTreeSet::<i64>::new()"
+            inserts = " ".join(f"_s.insert({_rust_val(x)});" for x in items)
+            return f"{{ let mut _s = BTreeSet::new(); {inserts} _s }}"
+        if tag == "__dict__":
+            keys, vals = v[1], v[2]
+            if not keys:
+                return "BTreeMap::<String, i64>::new()"
+            inserts = " ".join(
+                f"_m.insert({_rust_val(k)}, {_rust_val(val)});"
+                for k, val in zip(keys, vals)
+            )
+            return f"{{ let mut _m = BTreeMap::new(); {inserts} _m }}"
+        if tag in ("__counter__", "__defaultdict__"):
+            inner = v[1]
+            if isinstance(inner, tuple) and inner[0] == "__dict__":
+                keys, vals = inner[1], inner[2]
+                if not keys:
+                    return "BTreeMap::<String, i64>::new()"
+                inserts = " ".join(
+                    f"_m.insert({_rust_val(k)}, {_rust_val(val)});"
+                    for k, val in zip(keys, vals)
+                )
+                return f"{{ let mut _m = BTreeMap::new(); {inserts} _m }}"
+            return "BTreeMap::<String, i64>::new()"
+    raise ValueError(f"Cannot encode Rust value: {v!r}")
+
+
+def _rust_is_numeric(v: Any) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return True
+    if isinstance(v, tuple) and v and v[0] == "__decimal__":
+        return True
+    return False
+
+
+def _rust_tc_block(tc: TestCase, ep: str) -> str:
+    tid_safe = tc.id.replace('\\', '\\\\').replace('"', '\\"')
+    args_code = ", ".join(_rust_val(a) for a in tc.args)
+    I = "    "
+    L = [f"{I}// {tc.id}", f"{I}{{"]
+
+    if tc.kind == "loop_pass":
+        L += [f'{I}    _passed.push(String::from("{tid_safe}"));', f"{I}}}"]
+        return "\n".join(L)
+    if tc.kind == "loop_fail":
+        L += [f'{I}    _failed.push(String::from("{tid_safe}"));', f"{I}}}"]
+        return "\n".join(L)
+
+    has_dq = any(_has_deque(a) for a in tc.args) or _has_deque(tc.expected)
+    if has_dq:
+        L += [
+            f'{I}    _failed.push(String::from("{tid_safe}")); // deque not supported in Rust',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    if tc.expect_stdout is not None or tc.expect_stderr is not None:
+        L += [
+            f'{I}    _failed.push(String::from("{tid_safe}")); // stdout/stderr not supported',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    call = f"{ep}({args_code})"
+
+    if tc.kind == "raises":
+        L += [
+            f"{I}    let _threw = std::panic::catch_unwind(",
+            f"{I}        std::panic::AssertUnwindSafe(|| {{ {call}; }})",
+            f"{I}    ).is_err();",
+            f'{I}    if _threw {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    if tc.mutation_check is not None:
+        L += [
+            f"{I}    let _ = {{ {call}; }};",
+            f"{I}    // mutation_check not supported in Rust tester",
+            f'{I}    _failed.push(String::from("{tid_safe}"));',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    transforms_rust = {
+        "sorted": f"{{ let mut _t = {call}; _t.sort(); _t }}",
+        "len":    f"({call}).len() as i64",
+        "list":   call,
+        "tuple":  call,
+        "set":    f"({call}).into_iter().collect::<BTreeSet<_>>()",
+        "str":    f"({call}).to_string()",
+        "int":    f"({call}) as i64",
+        "float":  f"({call}) as f64",
+        "abs":    f"{{ let _v = {call}; if _v < Default::default() {{ -_v }} else {{ _v }} }}",
+        "sum":    f"({call}).iter().copied().sum::<_>()",
+        "min":    f"*({call}).iter().min().unwrap()",
+        "max":    f"*({call}).iter().max().unwrap()",
+    }
+    result_expr = transforms_rust.get(tc.transform, call) if tc.transform else call
+
+    L.append(f"{I}    let _result = {result_expr};")
+
+    if tc.kind in ("truthy", "falsy"):
+        neg = "!" if tc.kind == "falsy" else ""
+        L += [
+            f"{I}    let _ok = {neg}_result;",
+            f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    if tc.kind == "in":
+        L.append(f"{I}    let _container = {_rust_val(tc.expected)};")
+        L += [
+            f"{I}    let _ok = _container.iter().any(|x| x == &_result);",
+            f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    # eq / ne
+    is_num = _rust_is_numeric(tc.expected)
+    expected_is_none = tc.expected is None
+
+    if expected_is_none:
+        ok_expr = "_result.is_none()" if tc.kind == "eq" else "_result.is_some()"
+        L += [
+            f"{I}    let _ok = {ok_expr};",
+            f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
+            f"{I}}}",
+        ]
+        return "\n".join(L)
+
+    L.append(f"{I}    let _expected = {_rust_val(tc.expected)};")
+    use_tol = tc.tol_abs is not None or tc.tol_rel is not None
+
+    if use_tol:
+        ta = f"{tc.tol_abs}_f64"
+        tr_val = tc.tol_rel
+        ts = tc.tol_strict
+        if tr_val is not None:
+            lim = f"({ta}).max({tr_val}_f64 * (_result as f64).abs().max((_expected as f64).abs()))"
+            cmp = "<" if ts else "<="
+            ok_inner = f"(_result as f64 - _expected as f64).abs() {cmp} {lim}"
+        else:
+            cmp = "<" if ts else "<="
+            ok_inner = f"(_result as f64 - _expected as f64).abs() {cmp} {ta}"
+        ok_expr = ok_inner if tc.kind == "eq" else f"!({ok_inner})"
+    elif is_num:
+        ok_inner = "if _global_tol >= 0.0_f64 { (_result as f64 - _expected as f64).abs() <= _global_tol } else { _result == _expected }"
+        ok_expr = ok_inner if tc.kind == "eq" else f"!({{ {ok_inner} }})"
+    else:
+        ok_expr = "_result == _expected" if tc.kind == "eq" else "_result != _expected"
+
+    L += [
+        f"{I}    let _ok = {ok_expr};",
+        f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+        f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
+        f"{I}}}",
+    ]
+    return "\n".join(L)
+
+
+def emit_rust(cases: list[TestCase], entrypoint: str) -> str:
+    preamble = """\
+// Auto-generated by babel_code_goat -- do not edit
+#![allow(unused_imports, dead_code, unused_variables, unused_mut, non_snake_case)]
+use std::collections::{BTreeMap, BTreeSet};
+
+fn main() {
+    let _global_tol: f64 = std::env::var("_BCG_TOL")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(-1.0_f64);
+    let _results_path = match std::env::var("_BCG_RESULTS_FILE") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut _passed: Vec<String> = Vec::new();
+    let mut _failed: Vec<String> = Vec::new();
+
+"""
+    test_blocks = "\n".join(_rust_tc_block(tc, entrypoint) for tc in cases)
+    epilogue = """
+    let mut _out = String::new();
+    _out.push_str(r#"{"passed":["#);
+    for (i, id) in _passed.iter().enumerate() {
+        if i > 0 { _out.push(char::from(44u8)); }
+        _out.push(char::from(34u8));
+        _out.push_str(id);
+        _out.push(char::from(34u8));
+    }
+    _out.push_str(r#"],"failed":["#);
+    for (i, id) in _failed.iter().enumerate() {
+        if i > 0 { _out.push(char::from(44u8)); }
+        _out.push(char::from(34u8));
+        _out.push_str(id);
+        _out.push(char::from(34u8));
+    }
+    _out.push_str("]}");
+    std::fs::write(&_results_path, _out).unwrap();
+}
+"""
+    return preamble + test_blocks + epilogue
+
+
+# ---------------------------------------------------------------------------
+# Compile functions for compiled targets
+# ---------------------------------------------------------------------------
+
+def _cpp_compile(tester: Path, sol: Path, out: Path) -> int:
+    try:
+        result = subprocess.run(
+            ["g++", "-std=c++17", f"-include{sol}", str(tester), "-o", str(out)],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr.decode(errors="replace"), file=sys.stderr)
+        return result.returncode
+    except FileNotFoundError as e:
+        print(f"error: compiler not found: {e}", file=sys.stderr)
+        return 1
+
+
+def _rust_compile(tester: Path, sol: Path, out: Path) -> int:
+    fd, combined = tempfile.mkstemp(suffix=".rs")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(sol.read_text())
+            f.write("\n")
+            f.write(tester.read_text())
+        result = subprocess.run(
+            ["rustc", "--edition", "2021", combined, "-o", str(out)],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr.decode(errors="replace"), file=sys.stderr)
+        return result.returncode
+    except FileNotFoundError as e:
+        print(f"error: compiler not found: {e}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            os.unlink(combined)
+        except OSError:
+            pass
+
+
+_COMPILE: dict[str, Any] = {
+    "cpp": _cpp_compile,
+    "rust": _rust_compile,
+}
+
+
+# ---------------------------------------------------------------------------
 # generate command
 # ---------------------------------------------------------------------------
 
@@ -1449,19 +2089,26 @@ _TESTER_NAMES = {
     "python": "tester.py",
     "javascript": "tester.js",
     "typescript": "tester.ts",
+    "cpp": "tester.cpp",
+    "rust": "tester.rs",
 }
 
 _EMITTERS = {
     "python": emit_python,
     "javascript": emit_javascript,
     "typescript": emit_typescript,
+    "cpp": emit_cpp,
+    "rust": emit_rust,
 }
 
 
 def discover_test_files(tests_dir: Path) -> list[Path]:
     """Return sorted .py files under tests_dir. Raises DiscoveryError for test-like non-.py files."""
+    _generated_names = set(_TESTER_NAMES.values())
     for f in tests_dir.rglob("*"):
         if f.is_file() and f.suffix != ".py":
+            if f.name in _generated_names:
+                continue
             s = f.stem.lower()
             if s.startswith("test") or s.endswith("_test") or s.endswith("_tests"):
                 rel = f.relative_to(tests_dir).as_posix()
@@ -1542,8 +2189,19 @@ def cmd_test(args: argparse.Namespace) -> int:
     sol_path = Path(args.solution_path)
     fd, results_file = tempfile.mkstemp(suffix=".json")
     os.close(fd)
+
+    bin_path: str | None = None
     try:
-        cmd = _SUBPROC[args.lang](tester_path, sol_path)
+        if args.lang in _COMPILE:
+            fd_bin, bin_path = tempfile.mkstemp()
+            os.close(fd_bin)
+            rc = _COMPILE[args.lang](tester_path, sol_path, Path(bin_path))
+            if rc != 0:
+                return _error_exit()
+            cmd: list[str] = [bin_path]
+        else:
+            cmd = _SUBPROC[args.lang](tester_path, sol_path)
+
         env = {**os.environ, "_BCG_RESULTS_FILE": results_file}
         if args.tol is not None:
             env["_BCG_TOL"] = str(args.tol)
@@ -1569,6 +2227,11 @@ def cmd_test(args: argparse.Namespace) -> int:
             os.unlink(results_file)
         except OSError:
             pass
+        if bin_path is not None:
+            try:
+                os.unlink(bin_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1581,7 +2244,7 @@ _VALID_LANGS = frozenset(_TESTER_NAMES)
 def _lang_type(value: str) -> str:
     if value not in _VALID_LANGS:
         raise argparse.ArgumentTypeError(
-            f"lang must be python/javascript/typescript, got: {value!r}"
+            f"lang must be python/javascript/typescript/cpp/rust, got: {value!r}"
         )
     return value
 
