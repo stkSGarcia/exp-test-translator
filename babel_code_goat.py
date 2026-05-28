@@ -926,10 +926,13 @@ def emit_python(cases: list[TestCase], entrypoint: str) -> str:
     ]
     cases_repr = repr(json.dumps(cases_data))
     ep_repr = json.dumps(entrypoint)
+    ids_json = json.dumps([tc.id for tc in cases])
 
     return f"""\
 #!/usr/bin/env python3
-import sys, json, os, io, re, contextlib, importlib.util
+# _BCG_IDS: {ids_json}
+import sys, json, os, io, re, contextlib, importlib.util, asyncio
+import signal as _signal
 from decimal import Decimal
 from collections import Counter, deque, defaultdict
 
@@ -1002,21 +1005,43 @@ def _load_fn(sol_path, name):
     spec.loader.exec_module(mod)
     obj = getattr(mod, name)
     if isinstance(obj, type):
-        return getattr(obj(), name)
-    return obj
+        fn = getattr(obj(), name)
+    else:
+        fn = obj
+    return fn, asyncio.iscoroutinefunction(fn)
+
+def _call(fn, is_async, args):
+    if is_async:
+        return asyncio.run(fn(*args))
+    return fn(*args)
 
 def _run():
     sol_path = sys.argv[1]
     results_path = os.environ["_BCG_RESULTS_FILE"]
     global_tol = float(os.environ["_BCG_TOL"]) if "_BCG_TOL" in os.environ else None
+    run_id = os.environ.get("_BCG_RUN_ID")
+    cases = [c for c in CASES if c["id"] == run_id] if run_id is not None else CASES
+    timeout_ms_env = os.environ.get("_BCG_TIMEOUT_MS")
+    timeout_sec = float(timeout_ms_env) / 1000.0 if timeout_ms_env else None
+    _has_sigalrm = hasattr(_signal, "SIGALRM")
+    if timeout_sec is not None and _has_sigalrm:
+        def _sigalrm_handler(signum, frame):
+            raise TimeoutError("per-test timeout")
+        _signal.signal(_signal.SIGALRM, _sigalrm_handler)
+    def _arm():
+        if timeout_sec is not None and _has_sigalrm:
+            _signal.setitimer(_signal.ITIMER_REAL, timeout_sec)
+    def _disarm():
+        if timeout_sec is not None and _has_sigalrm:
+            _signal.setitimer(_signal.ITIMER_REAL, 0)
     try:
-        fn = _load_fn(sol_path, ENTRYPOINT)
+        fn, is_async = _load_fn(sol_path, ENTRYPOINT)
     except Exception:
         with open(results_path, "w") as f:
-            json.dump({{"passed": [], "failed": [c["id"] for c in CASES]}}, f)
+            json.dump({{"passed": [], "failed": [c["id"] for c in cases]}}, f)
         return
     passed, failed = [], []
-    for c in CASES:
+    for c in cases:
         tid = c["id"]
         kind = c["kind"]
         if kind == "loop_pass":
@@ -1039,11 +1064,17 @@ def _run():
         try:
             if kind == "raises":
                 caught = None
+                _arm()
                 try:
-                    fn(*args)
+                    _call(fn, is_async, args)
+                    _disarm()
+                    failed.append(tid)
+                    continue
+                except TimeoutError:
                     failed.append(tid)
                     continue
                 except Exception as _e:
+                    _disarm()
                     caught = _e
                 ok = True
                 if exc_type is not None:
@@ -1056,11 +1087,17 @@ def _run():
                 continue
             out_buf, err_buf = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-                if mutation_check is None:
-                    result = fn(*args)
-                else:
-                    fn(*args)
-                    result = args[mutation_check]
+                _arm()
+                try:
+                    if mutation_check is None:
+                        result = _call(fn, is_async, args)
+                    else:
+                        _call(fn, is_async, args)
+                        result = args[mutation_check]
+                    _disarm()
+                except TimeoutError:
+                    failed.append(tid)
+                    continue
             if transform is not None:
                 result = _TRANSFORMS[transform](result)
             ok = True
@@ -1100,14 +1137,18 @@ def emit_javascript(cases: list[TestCase], entrypoint: str) -> str:
         indent=2,
     )
     ep_json = json.dumps(entrypoint)
+    ids_json = json.dumps([tc.id for tc in cases])
 
     return f"""\
 'use strict';
+// _BCG_IDS: {ids_json}
 const fs = require('fs');
 const path = require('path');
 
 const ENTRYPOINT = {ep_json};
 const CASES = {cases_json};
+
+const _TIMEOUT_SENTINEL = Symbol('timeout');
 
 function decode(v) {{
   if (Array.isArray(v)) return v.map(decode);
@@ -1190,23 +1231,32 @@ function loadFn(sol, name) {{
   throw new Error('Cannot resolve entrypoint: ' + name);
 }}
 
-function captureCall(fn, args) {{
+async function captureCall(fn, args) {{
   let stdout = '', stderr = '';
   const ow = process.stdout.write.bind(process.stdout);
   const ew = process.stderr.write.bind(process.stderr);
   process.stdout.write = c => {{ stdout += c; return true; }};
   process.stderr.write = c => {{ stderr += c; return true; }};
   let result, threw = false, thrownErr = null;
-  try {{ result = fn(...args); }} catch (e) {{ threw = true; thrownErr = e; }}
+  try {{ result = await fn(...args); }} catch (e) {{ threw = true; thrownErr = e; }}
   finally {{ process.stdout.write = ow; process.stderr.write = ew; }}
   return {{ result, stdout, stderr, threw, thrownErr }};
 }}
 
-function run() {{
+function withTimeout(promise, ms) {{
+  if (ms === null) return promise;
+  const tout = new Promise(r => setTimeout(() => r(_TIMEOUT_SENTINEL), ms));
+  return Promise.race([promise, tout]);
+}}
+
+async function run() {{
   const solPath = process.argv[2];
   const resultsPath = process.env._BCG_RESULTS_FILE;
   const globalTol = process.env._BCG_TOL !== undefined ? parseFloat(process.env._BCG_TOL) : null;
-  const allIds = CASES.map(c => c.id);
+  const runId = process.env._BCG_RUN_ID || null;
+  const timeoutMs = process.env._BCG_TIMEOUT_MS ? parseInt(process.env._BCG_TIMEOUT_MS) : null;
+  const cases = runId ? CASES.filter(c => c.id === runId) : CASES;
+  const allIds = cases.map(c => c.id);
   let fn;
   try {{
     const sol = require(path.resolve(solPath));
@@ -1216,7 +1266,7 @@ function run() {{
     return;
   }}
   const passed = [], failed = [];
-  for (const c of CASES) {{
+  for (const c of cases) {{
     if (c.kind === 'loop_pass') {{ passed.push(c.id); continue; }}
     if (c.kind === 'loop_fail') {{ failed.push(c.id); continue; }}
     const args = c.args.map(decode);
@@ -1226,9 +1276,14 @@ function run() {{
     const tolStrict = c.tolStrict;
     try {{
       if (c.kind === 'raises') {{
-        let thrownErr = null;
-        try {{ fn(...args); }} catch (e) {{ thrownErr = e; }}
-        if (thrownErr === null) {{ failed.push(c.id); continue; }}
+        const raiseP = (async () => {{
+          try {{ await fn(...args); return null; }}
+          catch (e) {{ return e; }}
+        }})();
+        const raiseResult = await withTimeout(raiseP, timeoutMs);
+        if (raiseResult === _TIMEOUT_SENTINEL) {{ failed.push(c.id); continue; }}
+        if (raiseResult === null) {{ failed.push(c.id); continue; }}
+        const thrownErr = raiseResult;
         let ok = true;
         if (c.excType !== null) ok = (thrownErr && thrownErr.constructor && thrownErr.constructor.name === c.excType) || (thrownErr && thrownErr.name === c.excType);
         if (ok && c.msgContains !== null) ok = String(thrownErr && thrownErr.message || thrownErr).includes(c.msgContains);
@@ -1237,7 +1292,9 @@ function run() {{
         continue;
       }}
       const mutationCheck = c.mutationCheck;
-      const {{ result: _raw, stdout, stderr, threw }} = captureCall(fn, args);
+      const captureResult = await withTimeout(captureCall(fn, args), timeoutMs);
+      if (captureResult === _TIMEOUT_SENTINEL) {{ failed.push(c.id); continue; }}
+      const {{ result: _raw, stdout, stderr, threw }} = captureResult;
       if (threw) {{ failed.push(c.id); continue; }}
       const _result = mutationCheck !== null ? args[mutationCheck] : _raw;
       const result = c.transform !== null ? _TRANSFORMS[c.transform](_result) : _result;
@@ -1257,7 +1314,7 @@ function run() {{
   fs.writeFileSync(resultsPath, JSON.stringify({{passed, failed}}));
 }}
 
-run();
+run().catch(() => process.exit(2));
 """
 
 
@@ -1273,8 +1330,10 @@ def emit_typescript(cases: list[TestCase], entrypoint: str) -> str:
         indent=2,
     )
     ep_json = json.dumps(entrypoint)
+    ids_json = json.dumps([tc.id for tc in cases])
 
     return f"""\
+// _BCG_IDS: {ids_json}
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -1287,6 +1346,8 @@ interface Case {{
   transform: string | null; mutationCheck: number | null;
 }}
 const CASES: Case[] = {cases_json};
+
+const _TIMEOUT_SENTINEL: unique symbol = Symbol('timeout');
 
 function decode(v: any): any {{
   if (Array.isArray(v)) return v.map(decode);
@@ -1368,25 +1429,34 @@ function loadFn(sol: any, name: string): (...args: any[]) => any {{
   throw new Error('Cannot resolve entrypoint: ' + name);
 }}
 
-function captureCall(
+async function captureCall(
   fn: (...a: any[]) => any, args: any[]
-): {{ result: any; stdout: string; stderr: string; threw: boolean; thrownErr: any }} {{
+): Promise<{{ result: any; stdout: string; stderr: string; threw: boolean; thrownErr: any }}> {{
   let stdout = '', stderr = '';
   const ow = process.stdout.write.bind(process.stdout);
   const ew = process.stderr.write.bind(process.stderr);
   (process.stdout as any).write = (c: any) => {{ stdout += c; return true; }};
   (process.stderr as any).write = (c: any) => {{ stderr += c; return true; }};
   let result: any, threw = false, thrownErr: any = null;
-  try {{ result = fn(...args); }} catch (e) {{ threw = true; thrownErr = e; }}
+  try {{ result = await fn(...args); }} catch (e) {{ threw = true; thrownErr = e; }}
   finally {{ process.stdout.write = ow; process.stderr.write = ew; }}
   return {{ result, stdout, stderr, threw, thrownErr }};
 }}
 
-function run(): void {{
+function withTimeout<T>(promise: Promise<T>, ms: number | null): Promise<T | typeof _TIMEOUT_SENTINEL> {{
+  if (ms === null) return promise;
+  const tout = new Promise<typeof _TIMEOUT_SENTINEL>(r => setTimeout(() => r(_TIMEOUT_SENTINEL), ms));
+  return Promise.race([promise, tout]);
+}}
+
+async function run(): Promise<void> {{
   const solPath: string = process.argv[2];
   const resultsPath: string = process.env['_BCG_RESULTS_FILE']!;
   const globalTol: number | null = process.env['_BCG_TOL'] !== undefined ? parseFloat(process.env['_BCG_TOL']!) : null;
-  const allIds: string[] = CASES.map((c: Case) => c.id);
+  const runId: string | null = process.env['_BCG_RUN_ID'] || null;
+  const timeoutMs: number | null = process.env['_BCG_TIMEOUT_MS'] ? parseInt(process.env['_BCG_TIMEOUT_MS']!) : null;
+  const cases: Case[] = runId ? CASES.filter((c: Case) => c.id === runId) : CASES;
+  const allIds: string[] = cases.map((c: Case) => c.id);
   let fn: (...a: any[]) => any;
   try {{
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -1397,7 +1467,7 @@ function run(): void {{
     return;
   }}
   const passed: string[] = [], failed: string[] = [];
-  for (const c of CASES) {{
+  for (const c of cases) {{
     if (c.kind === 'loop_pass') {{ passed.push(c.id); continue; }}
     if (c.kind === 'loop_fail') {{ failed.push(c.id); continue; }}
     const args: any[] = c.args.map(decode);
@@ -1407,17 +1477,24 @@ function run(): void {{
     const tolStrict: boolean = c.tolStrict;
     try {{
       if (c.kind === 'raises') {{
-        let thrownErr: any = null;
-        try {{ fn(...args); }} catch (e) {{ thrownErr = e; }}
-        if (thrownErr === null) {{ failed.push(c.id); continue; }}
+        const raiseP: Promise<any> = (async () => {{
+          try {{ await fn(...args); return null; }}
+          catch (e) {{ return e; }}
+        }})();
+        const raiseResult = await withTimeout(raiseP, timeoutMs);
+        if (raiseResult === _TIMEOUT_SENTINEL) {{ failed.push(c.id); continue; }}
+        if (raiseResult === null) {{ failed.push(c.id); continue; }}
+        const thrownErr: any = raiseResult;
         let ok = true;
         if (c.excType !== null) ok = (thrownErr && thrownErr.constructor && thrownErr.constructor.name === c.excType) || (thrownErr && thrownErr.name === c.excType);
-        if (ok && c.msgContains !== null) ok = String(thrownErr && thrownErr.message !== undefined ? thrownErr.message : thrownErr).includes(c.msgContains);
-        if (ok && c.msgRegex !== null) ok = new RegExp(c.msgRegex).test(String(thrownErr && thrownErr.message !== undefined ? thrownErr.message : thrownErr));
+        if (ok && c.msgContains !== null) ok = String(thrownErr && thrownErr.message !== undefined ? thrownErr.message : thrownErr).includes(c.msgContains!);
+        if (ok && c.msgRegex !== null) ok = new RegExp(c.msgRegex!).test(String(thrownErr && thrownErr.message !== undefined ? thrownErr.message : thrownErr));
         (ok ? passed : failed).push(c.id);
         continue;
       }}
-      const {{ result: _raw, stdout, stderr, threw }} = captureCall(fn, args);
+      const captureResult = await withTimeout(captureCall(fn, args), timeoutMs);
+      if (captureResult === _TIMEOUT_SENTINEL) {{ failed.push(c.id); continue; }}
+      const {{ result: _raw, stdout, stderr, threw }} = captureResult as Awaited<ReturnType<typeof captureCall>>;
       if (threw) {{ failed.push(c.id); continue; }}
       const _result: any = c.mutationCheck !== null ? args[c.mutationCheck] : _raw;
       const result: any = c.transform !== null ? _TRANSFORMS[c.transform](_result) : _result;
@@ -1437,7 +1514,7 @@ function run(): void {{
   fs.writeFileSync(resultsPath, JSON.stringify({{passed, failed}}));
 }}
 
-run();
+run().catch(() => process.exit(2));
 """
 
 
@@ -1579,121 +1656,141 @@ def _cpp_tc_block(tc: TestCase, ep: str) -> str:
     tid = tc.id.replace('\\', '\\\\').replace('"', '\\"')
     args_code = ", ".join(_cpp_val(a) for a in tc.args)
     I = "    "
-    L = [f"{I}// {tc.id}", f"{I}{{"]
+    II = I + "    "
+    III = II + "    "
+    open_block = f'{I}if (_run_id == nullptr || std::string(_run_id) == "{tid}") {{'
+    L = [f"{I}// {tc.id}", open_block]
 
     if tc.kind == "loop_pass":
-        L += [f'{I}    _passed.push_back("{tid}");', f"{I}}}"]
+        L += [f'{II}_passed.push_back("{tid}");', f"{I}}}"]
         return "\n".join(L)
     if tc.kind == "loop_fail":
-        L += [f'{I}    _failed.push_back("{tid}");', f"{I}}}"]
+        L += [f'{II}_failed.push_back("{tid}");', f"{I}}}"]
         return "\n".join(L)
     if tc.expect_stdout is not None or tc.expect_stderr is not None:
-        L += [f'{I}    _failed.push_back("{tid}"); // stdout/stderr not supported', f"{I}}}"]
+        L += [f'{II}_failed.push_back("{tid}"); // stdout/stderr not supported', f"{I}}}"]
         return "\n".join(L)
 
     call = f"{ep}({args_code})"
+    call_u = f"_bcg_unwrap({call})"
 
+    # ---- raises ----
     if tc.kind == "raises":
         L += [
-            f"{I}    bool _threw = false;",
-            f"{I}    try {{ {call}; }}",
-            f"{I}    catch (...) {{ _threw = true; }}",
-            f'{I}    (_threw ? _passed : _failed).push_back("{tid}");',
+            f"{II}auto _bcg_raises_ = [&]() -> bool {{",
+            f"{III}try {{ {call_u}; return false; }}",
+            f"{III}catch (...) {{ return true; }}",
+            f"{II}}};",
+            f"{II}if (_timeout_ms > 0) {{",
+            f"{II}    auto _f_ = std::async(std::launch::async, _bcg_raises_);",
+            f"{II}    if (_f_.wait_for(std::chrono::milliseconds(_timeout_ms)) != std::future_status::ready) {{",
+            f'{II}        _failed.push_back("{tid}"); }}',
+            f"{II}    else {{ (_f_.get() ? _passed : _failed).push_back(\"{tid}\"); }}",
+            f"{II}}} else {{",
+            f'{II}    (_bcg_raises_() ? _passed : _failed).push_back("{tid}");',
+            f"{II}}}",
             f"{I}}}",
         ]
         return "\n".join(L)
 
+    # ---- transforms ----
     transforms_cpp = {
-        "sorted": f"[&](){{ auto _t = {call}; std::sort(_t.begin(), _t.end()); return _t; }}()",
-        "len":    f"(long long)({call}).size()",
-        "list":   call,
-        "tuple":  call,
-        "set":    f"[&](){{ auto _t = {call}; return std::set<typename decltype(_t)::value_type>(_t.begin(), _t.end()); }}()",
-        "str":    f"std::to_string({call})",
-        "int":    f"(long long)({call})",
-        "float":  f"(long double)({call})",
-        "abs":    f"[&](){{ auto _v = {call}; return _v < 0 ? -_v : _v; }}()",
-        "sum":    f"[&](){{ auto _t = {call}; return std::accumulate(_t.begin(), _t.end(), decltype(*_t.begin()){{}}); }}()",
-        "min":    f"[&](){{ auto _t = {call}; return *std::min_element(_t.begin(), _t.end()); }}()",
-        "max":    f"[&](){{ auto _t = {call}; return *std::max_element(_t.begin(), _t.end()); }}()",
+        "sorted": f"[&](){{ auto _t = {call_u}; std::sort(_t.begin(), _t.end()); return _t; }}()",
+        "len":    f"(long long)({call_u}).size()",
+        "list":   call_u,
+        "tuple":  call_u,
+        "set":    f"[&](){{ auto _t = {call_u}; return std::set<typename decltype(_t)::value_type>(_t.begin(), _t.end()); }}()",
+        "str":    f"std::to_string({call_u})",
+        "int":    f"(long long)({call_u})",
+        "float":  f"(long double)({call_u})",
+        "abs":    f"[&](){{ auto _v = {call_u}; return _v < 0 ? -_v : _v; }}()",
+        "sum":    f"[&](){{ auto _t = {call_u}; return std::accumulate(_t.begin(), _t.end(), decltype(*_t.begin()){{}}); }}()",
+        "min":    f"[&](){{ auto _t = {call_u}; return *std::min_element(_t.begin(), _t.end()); }}()",
+        "max":    f"[&](){{ auto _t = {call_u}; return *std::max_element(_t.begin(), _t.end()); }}()",
     }
-    result_expr = transforms_cpp.get(tc.transform, call) if tc.transform else call
+    result_expr = transforms_cpp.get(tc.transform, call_u) if tc.transform else call_u
 
-    L.append(f"{I}    try {{")
-    L.append(f"{I}        auto _result = {result_expr};")
-
+    # ---- mutation_check (no timeout support) ----
     if tc.mutation_check is not None:
         L += [
-            f"{I}        // mutation_check not supported in C++ tester",
-            f'{I}        _failed.push_back("{tid}");',
-            f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
+            f"{II}try {{",
+            f"{III}auto _result = {result_expr};",
+            f"{III}// mutation_check not supported in C++ tester",
+            f'{III}_failed.push_back("{tid}");',
+            f'{II}}} catch (...) {{ _failed.push_back("{tid}"); }}',
             f"{I}}}",
         ]
         return "\n".join(L)
 
+    # ---- build comparison lines for _bcg_cmp_ lambda ----
+    cmp_lines: list[str] = []
     if tc.kind in ("truthy", "falsy"):
         neg = "!" if tc.kind == "falsy" else ""
-        L += [
-            f"{I}        bool _ok = {neg}(bool)_result;",
-            f'{I}        (_ok ? _passed : _failed).push_back("{tid}");',
-            f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
-            f"{I}}}",
+        cmp_lines += [
+            f"bool _ok = {neg}(bool)_result;",
+            f'(_ok ? _passed : _failed).push_back("{tid}");',
         ]
-        return "\n".join(L)
-
-    if tc.kind == "in":
+    elif tc.kind == "in":
         exp_t = _cpp_type(tc.expected)
-        L.append(f"{I}        auto _expected = {_cpp_val(tc.expected)};")
+        cmp_lines.append(f"auto _expected = {_cpp_val(tc.expected)};")
         if "set" in exp_t:
-            L.append(f"{I}        bool _ok = _expected.count(_result) > 0;")
+            cmp_lines.append("bool _ok = _expected.count(_result) > 0;")
         else:
-            L.append(f"{I}        bool _ok = std::find(_expected.begin(), _expected.end(), _result) != _expected.end();")
-        L += [
-            f'{I}        (_ok ? _passed : _failed).push_back("{tid}");',
-            f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
-            f"{I}}}",
-        ]
-        return "\n".join(L)
-
-    # eq / ne
-    L.append(f"{I}        auto _expected = {_cpp_val(tc.expected)};")
-    use_tol = tc.tol_abs is not None or tc.tol_rel is not None
-    is_num = _cpp_is_numeric(tc.expected)
-    ta = f"{tc.tol_abs}L" if tc.tol_abs is not None else "-1.0L"
-    tr = f"{tc.tol_rel}L" if tc.tol_rel is not None else "-1.0L"
-    ts = "true" if tc.tol_strict else "false"
-
-    if use_tol:
-        L.append(f"{I}        bool _ok = _bcg_eq_num(_result, _expected, {ta}, {tr}, {ts});")
-    elif is_num:
-        L += [
-            f"{I}        bool _ok = (_global_tol >= 0.0L)",
-            f"{I}            ? _bcg_eq_num(_result, _expected, _global_tol, -1.0L, true)",
-            f"{I}            : (_result == _expected);",
-        ]
+            cmp_lines.append("bool _ok = std::find(_expected.begin(), _expected.end(), _result) != _expected.end();")
+        cmp_lines.append(f'(_ok ? _passed : _failed).push_back("{tid}");')
     else:
-        L.append(f"{I}        bool _ok = (_result == _expected);")
+        # eq / ne
+        cmp_lines.append(f"auto _expected = {_cpp_val(tc.expected)};")
+        use_tol = tc.tol_abs is not None or tc.tol_rel is not None
+        is_num = _cpp_is_numeric(tc.expected)
+        ta = f"{tc.tol_abs}L" if tc.tol_abs is not None else "-1.0L"
+        tr_val = f"{tc.tol_rel}L" if tc.tol_rel is not None else "-1.0L"
+        ts = "true" if tc.tol_strict else "false"
+        if use_tol:
+            cmp_lines.append(f"bool _ok = _bcg_eq_num(_result, _expected, {ta}, {tr_val}, {ts});")
+        elif is_num:
+            cmp_lines += [
+                "bool _ok = (_global_tol >= 0.0L)",
+                f"    ? _bcg_eq_num(_result, _expected, _global_tol, -1.0L, true)",
+                "    : (_result == _expected);",
+            ]
+        else:
+            cmp_lines.append("bool _ok = (_result == _expected);")
+        if tc.kind == "ne":
+            cmp_lines.append("_ok = !_ok;")
+        cmp_lines.append(f'(_ok ? _passed : _failed).push_back("{tid}");')
 
-    if tc.kind == "ne":
-        L.append(f"{I}        _ok = !_ok;")
-
-    L += [
-        f'{I}        (_ok ? _passed : _failed).push_back("{tid}");',
-        f"{I}    }} catch (...) {{ _failed.push_back(\"{tid}\"); }}",
-        f"{I}}}",
-    ]
+    # ---- emit the timeout-aware block ----
+    L.append(f"{II}auto _bcg_cmp_ = [&](auto&& _result) {{")
+    for line in cmp_lines:
+        L.append(f"{III}{line}")
+    L.append(f"{II}}};")
+    L.append(f"{II}auto _bcg_fn_ = [&]{{ return {result_expr}; }};")
+    L.append(f"{II}if (_timeout_ms > 0) {{")
+    L.append(f"{II}    auto _f_ = std::async(std::launch::async, _bcg_fn_);")
+    L.append(f"{II}    if (_f_.wait_for(std::chrono::milliseconds(_timeout_ms)) != std::future_status::ready) {{")
+    L.append(f'{II}        _failed.push_back("{tid}"); }}')
+    L.append(f'{II}    else {{ try {{ _bcg_cmp_(_f_.get()); }} catch (...) {{ _failed.push_back("{tid}"); }} }}')
+    L.append(f"{II}}} else {{")
+    L.append(f'{II}    try {{ _bcg_cmp_(_bcg_fn_()); }} catch (...) {{ _failed.push_back("{tid}"); }}')
+    L.append(f"{II}}}")
+    L.append(f"{I}}}")
     return "\n".join(L)
 
 
 def emit_cpp(cases: list[TestCase], entrypoint: str) -> str:
-    preamble = """\
+    ids_json = json.dumps([tc.id for tc in cases])
+    preamble = f"""\
 // Auto-generated by babel_code_goat -- do not edit
+// _BCG_IDS: {ids_json}
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -1706,30 +1803,50 @@ def emit_cpp(cases: list[TestCase], entrypoint: str) -> str:
 static long double _global_tol = -1.0L;
 
 template<typename T, typename U>
-bool _bcg_eq_num(const T& a, const U& b, long double tol_abs, long double tol_rel, bool strict) {
+bool _bcg_eq_num(const T& a, const U& b, long double tol_abs, long double tol_rel, bool strict) {{
     if (tol_abs < 0.0L && tol_rel < 0.0L) return (long double)a == (long double)b;
     long double da = (long double)a, db = (long double)b;
     long double diff = fabsl(da - db);
     long double lim = tol_abs >= 0.0L ? tol_abs : 0.0L;
     if (tol_rel >= 0.0L) lim = std::max(lim, tol_rel * std::max(fabsl(da), fabsl(db)));
     return strict ? diff < lim : diff <= lim;
-}
+}}
 
-static std::string _json_esc(const std::string& s) {
+template<typename T> struct _BCGIsFuture : std::false_type {{}};
+template<typename T> struct _BCGIsFuture<std::future<T>> : std::true_type {{}};
+template<typename T> struct _BCGIsFuture<std::shared_future<T>> : std::true_type {{}};
+
+template<typename T>
+auto _bcg_unwrap(T&& v) -> decltype(std::forward<T>(v)) {{
+    return std::forward<T>(v);
+}}
+template<typename T>
+auto _bcg_unwrap(std::future<T>& v) -> T {{ return v.get(); }}
+template<typename T>
+auto _bcg_unwrap(std::future<T>&& v) -> T {{ return v.get(); }}
+template<typename T>
+auto _bcg_unwrap(std::shared_future<T>& v) -> T {{ return v.get(); }}
+template<typename T>
+auto _bcg_unwrap(std::shared_future<T>&& v) -> T {{ return v.get(); }}
+
+static std::string _json_esc(const std::string& s) {{
     std::string r; r.reserve(s.size() + 4);
-    for (unsigned char c : s) {
-        if (c == 34) { r += (char)92; r += (char)34; }
-        else if (c == 92) { r += (char)92; r += (char)92; }
+    for (unsigned char c : s) {{
+        if (c == 34) {{ r += (char)92; r += (char)34; }}
+        else if (c == 92) {{ r += (char)92; r += (char)92; }}
         else r += (char)c;
-    }
+    }}
     return r;
-}
+}}
 
-int main() {
+int main() {{
     const char* _tol_env = std::getenv("_BCG_TOL");
     if (_tol_env) _global_tol = std::stold(std::string(_tol_env));
     const char* _res_env = std::getenv("_BCG_RESULTS_FILE");
     if (!_res_env) return 1;
+    const char* _run_id = std::getenv("_BCG_RUN_ID");
+    const char* _timeout_env = std::getenv("_BCG_TIMEOUT_MS");
+    long long _timeout_ms = _timeout_env ? std::stoll(std::string(_timeout_env)) : -1LL;
     std::vector<std::string> _passed, _failed;
 
 """
@@ -1858,14 +1975,96 @@ def _rust_is_numeric(v: Any) -> bool:
     return False
 
 
+def _rust_cmp_lines(tc: TestCase, tid_safe: str, result_var: str, indent: str) -> list[str]:
+    """Generate comparison + push lines for a Rust test block."""
+    I = indent
+    is_num = _rust_is_numeric(tc.expected)
+    expected_is_none = tc.expected is None
+
+    if tc.kind in ("truthy", "falsy"):
+        neg = "!" if tc.kind == "falsy" else ""
+        return [
+            f"{I}let _ok = {neg}{result_var};",
+            f'{I}if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}else {{ _failed.push(String::from("{tid_safe}")); }}',
+        ]
+
+    if tc.kind == "in":
+        return [
+            f"{I}let _container = {_rust_val(tc.expected)};",
+            f"{I}let _ok = _container.iter().any(|x| x == &{result_var});",
+            f'{I}if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}else {{ _failed.push(String::from("{tid_safe}")); }}',
+        ]
+
+    # eq / ne
+    if expected_is_none:
+        ok_expr = f"{result_var}.is_none()" if tc.kind == "eq" else f"{result_var}.is_some()"
+        return [
+            f"{I}let _ok = {ok_expr};",
+            f'{I}if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{I}else {{ _failed.push(String::from("{tid_safe}")); }}',
+        ]
+
+    use_tol = tc.tol_abs is not None or tc.tol_rel is not None
+    if use_tol:
+        ta = f"{tc.tol_abs}_f64"
+        tr_val = tc.tol_rel
+        ts = tc.tol_strict
+        if tr_val is not None:
+            lim = f"({ta}).max({tr_val}_f64 * ({result_var} as f64).abs().max((_expected as f64).abs()))"
+            cmp = "<" if ts else "<="
+            ok_inner = f"({result_var} as f64 - _expected as f64).abs() {cmp} {lim}"
+        else:
+            cmp = "<" if ts else "<="
+            ok_inner = f"({result_var} as f64 - _expected as f64).abs() {cmp} {ta}"
+        ok_expr = ok_inner if tc.kind == "eq" else f"!({ok_inner})"
+    elif is_num:
+        ok_inner = f"if _global_tol >= 0.0_f64 {{ ({result_var} as f64 - _expected as f64).abs() <= _global_tol }} else {{ {result_var} == _expected }}"
+        ok_expr = ok_inner if tc.kind == "eq" else f"!({{ {ok_inner} }})"
+    else:
+        ok_expr = f"{result_var} == _expected" if tc.kind == "eq" else f"{result_var} != _expected"
+
+    return [
+        f"{I}let _expected = {_rust_val(tc.expected)};",
+        f"{I}let _ok = {ok_expr};",
+        f'{I}if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
+        f'{I}else {{ _failed.push(String::from("{tid_safe}")); }}',
+    ]
+
+
+def _rust_async_transform(transform: str | None, raw_var: str) -> str:
+    """Build Rust transform expression applied to an already-awaited variable."""
+    if not transform:
+        return raw_var
+    t = {
+        "sorted": f"{{ let mut _t = {raw_var}; _t.sort(); _t }}",
+        "len":    f"({raw_var}).len() as i64",
+        "list":   raw_var,
+        "tuple":  raw_var,
+        "set":    f"({raw_var}).into_iter().collect::<BTreeSet<_>>()",
+        "str":    f"({raw_var}).to_string()",
+        "int":    f"({raw_var}) as i64",
+        "float":  f"({raw_var}) as f64",
+        "abs":    f"{{ let _v = {raw_var}; if _v < Default::default() {{ -_v }} else {{ _v }} }}",
+        "sum":    f"({raw_var}).iter().copied().sum::<_>()",
+        "min":    f"*({raw_var}).iter().min().unwrap()",
+        "max":    f"*({raw_var}).iter().max().unwrap()",
+    }
+    return t.get(transform, raw_var)
+
+
 def _rust_tc_block(tc: TestCase, ep: str) -> str:
     tid_safe = tc.id.replace('\\', '\\\\').replace('"', '\\"')
     args_code = ", ".join(_rust_val(a) for a in tc.args)
     I = "    "
-    L = [f"{I}// {tc.id}", f"{I}{{"]
+    II = I + "    "
+    III = II + "    "
+    open_block = f'{I}if _run_id.as_deref().map_or(true, |id| id == "{tid_safe}") {{'
+    L = [f"{I}// {tc.id}", open_block]
 
     if tc.kind == "loop_pass":
-        L += [f'{I}    _passed.push(String::from("{tid_safe}"));', f"{I}}}"]
+        L += [f'{II}_passed.push(String::from("{tid_safe}"));', f"{I}}}"]
         return "\n".join(L)
     if tc.kind == "loop_fail":
         L += [f'{I}    _failed.push(String::from("{tid_safe}"));', f"{I}}}"]
@@ -1873,42 +2072,37 @@ def _rust_tc_block(tc: TestCase, ep: str) -> str:
 
     has_dq = any(_has_deque(a) for a in tc.args) or _has_deque(tc.expected)
     if has_dq:
-        L += [
-            f'{I}    _failed.push(String::from("{tid_safe}")); // deque not supported in Rust',
-            f"{I}}}",
-        ]
+        L += [f'{II}_failed.push(String::from("{tid_safe}")); // deque not supported in Rust', f"{I}}}"]
         return "\n".join(L)
 
     if tc.expect_stdout is not None or tc.expect_stderr is not None:
-        L += [
-            f'{I}    _failed.push(String::from("{tid_safe}")); // stdout/stderr not supported',
-            f"{I}}}",
-        ]
+        L += [f'{II}_failed.push(String::from("{tid_safe}")); // stdout/stderr not supported', f"{I}}}"]
         return "\n".join(L)
 
     call = f"{ep}({args_code})"
 
     if tc.kind == "raises":
         L += [
-            f"{I}    let _threw = std::panic::catch_unwind(",
-            f"{I}        std::panic::AssertUnwindSafe(|| {{ {call}; }})",
-            f"{I}    ).is_err();",
-            f'{I}    if _threw {{ _passed.push(String::from("{tid_safe}")); }}',
-            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
+            f"{II}let _threw = std::panic::catch_unwind(",
+            f"{II}    std::panic::AssertUnwindSafe(|| {{ {call}; }})",
+            f"{II}).is_err();",
+            f'{II}if _threw {{ _passed.push(String::from("{tid_safe}")); }}',
+            f'{II}else {{ _failed.push(String::from("{tid_safe}")); }}',
             f"{I}}}",
         ]
         return "\n".join(L)
 
     if tc.mutation_check is not None:
         L += [
-            f"{I}    let _ = {{ {call}; }};",
-            f"{I}    // mutation_check not supported in Rust tester",
-            f'{I}    _failed.push(String::from("{tid_safe}"));',
+            f"{II}let _ = {{ {call}; }};",
+            f"{II}// mutation_check not supported in Rust tester",
+            f'{II}_failed.push(String::from("{tid_safe}"));',
             f"{I}}}",
         ]
         return "\n".join(L)
 
-    transforms_rust = {
+    # Sync result expression (for #[cfg(not(bcg_async))])
+    sync_transforms = {
         "sorted": f"{{ let mut _t = {call}; _t.sort(); _t }}",
         "len":    f"({call}).len() as i64",
         "list":   call,
@@ -1922,89 +2116,70 @@ def _rust_tc_block(tc: TestCase, ep: str) -> str:
         "min":    f"*({call}).iter().min().unwrap()",
         "max":    f"*({call}).iter().max().unwrap()",
     }
-    result_expr = transforms_rust.get(tc.transform, call) if tc.transform else call
+    sync_result_expr = sync_transforms.get(tc.transform, call) if tc.transform else call
+    async_result_expr = _rust_async_transform(tc.transform, "_raw")
 
-    L.append(f"{I}    let _result = {result_expr};")
+    IIII = III + "    "
 
-    if tc.kind in ("truthy", "falsy"):
-        neg = "!" if tc.kind == "falsy" else ""
-        L += [
-            f"{I}    let _ok = {neg}_result;",
-            f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
-            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
-            f"{I}}}",
-        ]
-        return "\n".join(L)
+    cmp_lines = _rust_cmp_lines(tc, tid_safe, "_result", IIII)
 
-    if tc.kind == "in":
-        L.append(f"{I}    let _container = {_rust_val(tc.expected)};")
-        L += [
-            f"{I}    let _ok = _container.iter().any(|x| x == &_result);",
-            f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
-            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
-            f"{I}}}",
-        ]
-        return "\n".join(L)
-
-    # eq / ne
-    is_num = _rust_is_numeric(tc.expected)
-    expected_is_none = tc.expected is None
-
-    if expected_is_none:
-        ok_expr = "_result.is_none()" if tc.kind == "eq" else "_result.is_some()"
-        L += [
-            f"{I}    let _ok = {ok_expr};",
-            f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
-            f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
-            f"{I}}}",
-        ]
-        return "\n".join(L)
-
-    L.append(f"{I}    let _expected = {_rust_val(tc.expected)};")
-    use_tol = tc.tol_abs is not None or tc.tol_rel is not None
-
-    if use_tol:
-        ta = f"{tc.tol_abs}_f64"
-        tr_val = tc.tol_rel
-        ts = tc.tol_strict
-        if tr_val is not None:
-            lim = f"({ta}).max({tr_val}_f64 * (_result as f64).abs().max((_expected as f64).abs()))"
-            cmp = "<" if ts else "<="
-            ok_inner = f"(_result as f64 - _expected as f64).abs() {cmp} {lim}"
-        else:
-            cmp = "<" if ts else "<="
-            ok_inner = f"(_result as f64 - _expected as f64).abs() {cmp} {ta}"
-        ok_expr = ok_inner if tc.kind == "eq" else f"!({ok_inner})"
-    elif is_num:
-        ok_inner = "if _global_tol >= 0.0_f64 { (_result as f64 - _expected as f64).abs() <= _global_tol } else { _result == _expected }"
-        ok_expr = ok_inner if tc.kind == "eq" else f"!({{ {ok_inner} }})"
-    else:
-        ok_expr = "_result == _expected" if tc.kind == "eq" else "_result != _expected"
-
+    # Use loop{} for early-exit-on-timeout via break
     L += [
-        f"{I}    let _ok = {ok_expr};",
-        f'{I}    if _ok {{ _passed.push(String::from("{tid_safe}")); }}',
-        f'{I}    else {{ _failed.push(String::from("{tid_safe}")); }}',
-        f"{I}}}",
+        f"{II}loop {{",
+        # ---- async branch ----
+        f"{III}#[cfg(bcg_async)] {{",
+        f"{IIII}let _raw = if _timeout_ms > 0 {{",
+        f"{IIII}    match _rt.block_on(tokio::time::timeout(",
+        f"{IIII}        std::time::Duration::from_millis(_timeout_ms),",
+        f"{IIII}        {call}",
+        f"{IIII}    )) {{",
+        f"{IIII}        Ok(r) => r,",
+        f'{IIII}        Err(_) => {{ _failed.push(String::from("{tid_safe}")); break; }}',
+        f"{IIII}    }}",
+        f"{IIII}}} else {{",
+        f"{IIII}    _rt.block_on({call})",
+        f"{IIII}}};",
+        f"{IIII}let _result = {async_result_expr};",
+        *cmp_lines,
+        f"{III}}}",
+        # ---- sync branch ----
+        f"{III}#[cfg(not(bcg_async))] {{",
+        f"{IIII}let _result = {sync_result_expr};",
+        *cmp_lines,
+        f"{III}}}",
+        f"{III}break;",
+        f"{II}}}",  # end loop
+        f"{I}}}",   # end if _run_id
     ]
     return "\n".join(L)
 
 
 def emit_rust(cases: list[TestCase], entrypoint: str) -> str:
-    preamble = """\
+    ids_json = json.dumps([tc.id for tc in cases])
+    ep_repr = json.dumps(entrypoint)
+    preamble = f"""\
 // Auto-generated by babel_code_goat -- do not edit
+// _BCG_IDS: {ids_json}
+// _BCG_EP: {ep_repr}
 #![allow(unused_imports, dead_code, unused_variables, unused_mut, non_snake_case)]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{{BTreeMap, BTreeSet}};
+#[cfg(bcg_async)] use tokio;
 
-fn main() {
+fn main() {{
     let _global_tol: f64 = std::env::var("_BCG_TOL")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(-1.0_f64);
-    let _results_path = match std::env::var("_BCG_RESULTS_FILE") {
+    let _results_path = match std::env::var("_BCG_RESULTS_FILE") {{
         Ok(p) => p,
         Err(_) => return,
-    };
+    }};
+    let _run_id: Option<String> = std::env::var("_BCG_RUN_ID").ok();
+    let _timeout_ms: u64 = std::env::var("_BCG_TIMEOUT_MS")
+        .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    #[cfg(bcg_async)]
+    let _rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().unwrap();
     let mut _passed: Vec<String> = Vec::new();
     let mut _failed: Vec<String> = Vec::new();
 
@@ -2051,7 +2226,30 @@ def _cpp_compile(tester: Path, sol: Path, out: Path) -> int:
         return 1
 
 
+def _rust_read_ep(tester: Path) -> str:
+    """Extract the entrypoint name from the _BCG_EP comment in a generated Rust tester."""
+    try:
+        with open(tester) as f:
+            for line in f:
+                if "_BCG_EP:" in line:
+                    idx = line.index("_BCG_EP:") + len("_BCG_EP:")
+                    return json.loads(line[idx:].strip())
+    except Exception:
+        pass
+    return ""
+
+
 def _rust_compile(tester: Path, sol: Path, out: Path) -> int:
+    sol_text = sol.read_text()
+    ep_name = _rust_read_ep(tester)
+    # Detect async entrypoint in the solution
+    is_async = bool(ep_name and re.search(rf'\basync\s+fn\s+{re.escape(ep_name)}\b', sol_text))
+    return _rust_compile_cargo(tester, sol, out, async_ep=is_async) if is_async \
+        else _rust_compile_rustc(tester, sol, out)
+
+
+def _rust_compile_rustc(tester: Path, sol: Path, out: Path) -> int:
+    """Plain rustc compilation for sync solutions (no tokio)."""
     fd, combined = tempfile.mkstemp(suffix=".rs")
     try:
         with os.fdopen(fd, "w") as f:
@@ -2073,6 +2271,48 @@ def _rust_compile(tester: Path, sol: Path, out: Path) -> int:
             os.unlink(combined)
         except OSError:
             pass
+
+
+def _rust_compile_cargo(tester: Path, sol: Path, out: Path, async_ep: bool) -> int:
+    """Cargo-based compilation supporting tokio for async solutions."""
+    import shutil
+    cargo_dir = Path(tempfile.mkdtemp(prefix="bcg_rust_"))
+    try:
+        # Write Cargo.toml
+        (cargo_dir / "Cargo.toml").write_text(
+            '[package]\nname = "bcg_tester"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            '[dependencies]\ntokio = { version = "1", features = ["full"] }\n'
+        )
+        src_dir = cargo_dir / "src"
+        src_dir.mkdir()
+        with open(src_dir / "main.rs", "w") as f:
+            f.write(sol.read_text())
+            f.write("\n")
+            f.write(tester.read_text())
+        cfg_flags = ["--cfg", "bcg_async"] if async_ep else []
+        try:
+            result = subprocess.run(
+                ["cargo", "rustc", "--release", "--", *cfg_flags],
+                capture_output=True,
+                cwd=str(cargo_dir),
+            )
+        except FileNotFoundError as e:
+            print(f"error: cargo not found: {e}", file=sys.stderr)
+            return 1
+        if result.returncode != 0:
+            print(result.stderr.decode(errors="replace"), file=sys.stderr)
+            return result.returncode
+        built = cargo_dir / "target" / "release" / "bcg_tester"
+        if not built.exists():
+            print("error: cargo build succeeded but binary not found", file=sys.stderr)
+            return 1
+        shutil.copy2(str(built), str(out))
+        return 0
+    except Exception as e:
+        print(f"error: cargo compilation failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(str(cargo_dir), ignore_errors=True)
 
 
 _COMPILE: dict[str, Any] = {
@@ -2177,6 +2417,19 @@ def _error_exit() -> int:
     return 2
 
 
+def _read_tester_ids(tester_path: Path) -> list[str]:
+    """Extract test IDs from the _BCG_IDS comment line in a generated tester file."""
+    try:
+        with open(tester_path) as f:
+            for line in f:
+                if "_BCG_IDS:" in line:
+                    idx = line.index("_BCG_IDS:") + len("_BCG_IDS:")
+                    return json.loads(line[idx:].strip())
+    except Exception:
+        pass
+    return []
+
+
 def cmd_test(args: argparse.Namespace) -> int:
     if args.lang not in _TESTER_NAMES:
         return _error_exit()
@@ -2185,6 +2438,19 @@ def cmd_test(args: argparse.Namespace) -> int:
     tester_path = tests_dir / _TESTER_NAMES[args.lang]
     if not tester_path.exists():
         return _error_exit()
+
+    # --list-tests: return all IDs as passed without running the solution
+    if getattr(args, "list_tests", False):
+        all_ids = _read_tester_ids(tester_path)
+        print(json.dumps({"status": "pass", "passed": all_ids, "failed": []}))
+        return 0
+
+    # --run: validate the requested ID exists before running
+    run_id: str | None = getattr(args, "run_id", None)
+    if run_id is not None:
+        all_ids = _read_tester_ids(tester_path)
+        if run_id not in all_ids:
+            return _error_exit()
 
     sol_path = Path(args.solution_path)
     fd, results_file = tempfile.mkstemp(suffix=".json")
@@ -2205,8 +2471,19 @@ def cmd_test(args: argparse.Namespace) -> int:
         env = {**os.environ, "_BCG_RESULTS_FILE": results_file}
         if args.tol is not None:
             env["_BCG_TOL"] = str(args.tol)
+        if run_id is not None:
+            env["_BCG_RUN_ID"] = run_id
+        timeout_ms: int | None = getattr(args, "timeout_ms", None)
+        if timeout_ms is not None:
+            env["_BCG_TIMEOUT_MS"] = str(timeout_ms)
+        total_timeout_ms: int | None = getattr(args, "total_timeout_ms", None)
+
+        proc_timeout = total_timeout_ms / 1000.0 if total_timeout_ms is not None else None
+        timed_out = False
         try:
-            subprocess.run(cmd, env=env, check=False)
+            subprocess.run(cmd, env=env, check=False, timeout=proc_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
         except FileNotFoundError as e:
             print(f"error: subprocess not found: {e}", file=sys.stderr)
             return _error_exit()
@@ -2214,9 +2491,22 @@ def cmd_test(args: argparse.Namespace) -> int:
         try:
             with open(results_file) as f:
                 data = json.load(f)
-            passed: list[str] = data["passed"]
-            failed: list[str] = data["failed"]
+            passed: list[str] = data.get("passed", [])
+            failed: list[str] = data.get("failed", [])
         except Exception:
+            passed, failed = [], []
+
+        if timed_out:
+            # Move any IDs not yet recorded into failed
+            recorded = set(passed) | set(failed)
+            all_ids = _read_tester_ids(tester_path)
+            if run_id is not None:
+                all_ids = [i for i in all_ids if i == run_id]
+            for tid in all_ids:
+                if tid not in recorded:
+                    failed.append(tid)
+
+        if not passed and not failed:
             return _error_exit()
 
         status = "fail" if failed else "pass"
@@ -2264,6 +2554,10 @@ def main() -> int:
     # lang validated manually inside cmd_test so we can emit error JSON
     tst.add_argument("--lang", required=True)
     tst.add_argument("--tol", type=float, default=None)
+    tst.add_argument("--list-tests", dest="list_tests", action="store_true", default=False)
+    tst.add_argument("--run", dest="run_id", type=str, default=None)
+    tst.add_argument("--timeout-ms", dest="timeout_ms", type=int, default=None)
+    tst.add_argument("--total-timeout-ms", dest="total_timeout_ms", type=int, default=None)
 
     args = parser.parse_args()
     if args.command is None:
