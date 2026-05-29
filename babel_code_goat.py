@@ -12,14 +12,23 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
+import platform
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+try:
+    import resource as _resource
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False
 
 
 # ---------------------------------------------------------------------------
@@ -2525,6 +2534,186 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# profile command
+# ---------------------------------------------------------------------------
+
+def _run_one_trial(
+    cmd: list[str],
+    env: dict,
+    results_file: str,
+    all_ids: list[str],
+    run_id: str | None,
+    total_timeout_ms: int | None,
+    measure_memory: bool,
+) -> tuple[list[str], list[str], int, float | None]:
+    """Run one subprocess trial. Returns (passed, failed, duration_ns, memory_kb_or_None)."""
+    proc_timeout = total_timeout_ms / 1000.0 if total_timeout_ms is not None else None
+
+    if measure_memory and _HAS_RESOURCE:
+        before = _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss
+    else:
+        before = None
+
+    t0 = time.perf_counter_ns()
+    timed_out = False
+    try:
+        subprocess.run(cmd, env=env, check=False, timeout=proc_timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except FileNotFoundError as e:
+        print(f"error: subprocess not found: {e}", file=sys.stderr)
+        return [], list(all_ids if run_id is None else [run_id]), time.perf_counter_ns() - t0, None
+    duration_ns = time.perf_counter_ns() - t0
+
+    if measure_memory and _HAS_RESOURCE and before is not None:
+        after = _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss
+        delta_raw = after - before
+        import platform
+        if platform.system() == "Darwin":
+            memory_kb: float | None = delta_raw / 1024.0
+        else:
+            memory_kb = float(delta_raw)  # Linux: ru_maxrss already in KB
+        if memory_kb < 0:
+            memory_kb = 0.0
+    else:
+        memory_kb = None
+
+    try:
+        with open(results_file) as f:
+            data = json.load(f)
+        passed: list[str] = data.get("passed", [])
+        failed: list[str] = data.get("failed", [])
+    except Exception:
+        passed, failed = [], []
+
+    if timed_out:
+        recorded = set(passed) | set(failed)
+        ids_scope = all_ids if run_id is None else [i for i in all_ids if i == run_id]
+        for tid in ids_scope:
+            if tid not in recorded:
+                failed.append(tid)
+
+    open(results_file, "w").close()
+    return passed, failed, duration_ns, memory_kb
+
+
+def _stats(samples: list[float]) -> dict:
+    n = len(samples)
+    if n == 0:
+        return {"mean": 0.0, "std": 0.0}
+    mean = sum(samples) / n
+    variance = sum((x - mean) ** 2 for x in samples) / n
+    return {"mean": mean, "std": math.sqrt(variance)}
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    if args.lang not in _TESTER_NAMES:
+        return _error_exit()
+
+    tests_dir = Path(args.tests_dir)
+    tester_path = tests_dir / _TESTER_NAMES[args.lang]
+    if not tester_path.exists():
+        return _error_exit()
+
+    n: int = args.n
+    warmup: int = args.warmup
+    if warmup >= n:
+        print(f"error: --warmup {warmup} must be less than -n {n}", file=sys.stderr)
+        return 1
+
+    all_ids = _read_tester_ids(tester_path)
+    run_id: str | None = getattr(args, "run_id", None)
+
+    if getattr(args, "list_tests", False):
+        out: dict = {
+            "status": "pass",
+            "passed": all_ids,
+            "failed": [],
+            "runtime_ns": {"mean": 0.0, "std": 0.0},
+        }
+        if args.memory:
+            out["memory_kb"] = {"mean": 0.0, "std": 0.0}
+        print(json.dumps(out))
+        return 0
+
+    if run_id is not None and run_id not in all_ids:
+        return _error_exit()
+
+    sol_path = Path(args.solution_path)
+    fd, results_file = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    bin_path: str | None = None
+    try:
+        if args.lang in _COMPILE:
+            fd_bin, bin_path = tempfile.mkstemp()
+            os.close(fd_bin)
+            rc = _COMPILE[args.lang](tester_path, sol_path, Path(bin_path))
+            if rc != 0:
+                return _error_exit()
+            cmd_base: list[str] = [bin_path]
+        else:
+            cmd_base = _SUBPROC[args.lang](tester_path, sol_path)
+
+        env_base = {**os.environ, "_BCG_RESULTS_FILE": results_file}
+        if args.tol is not None:
+            env_base["_BCG_TOL"] = str(args.tol)
+        if run_id is not None:
+            env_base["_BCG_RUN_ID"] = run_id
+        timeout_ms: int | None = getattr(args, "timeout_ms", None)
+        if timeout_ms is not None:
+            env_base["_BCG_TIMEOUT_MS"] = str(timeout_ms)
+        total_timeout_ms: int | None = getattr(args, "total_timeout_ms", None)
+
+        last_passed: list[str] = []
+        last_failed: list[str] = []
+
+        for i in range(warmup):
+            passed_w, failed_w, _, _ = _run_one_trial(
+                cmd_base, env_base, results_file, all_ids, run_id, total_timeout_ms, False
+            )
+            last_passed, last_failed = passed_w, failed_w
+
+        duration_samples: list[float] = []
+        memory_samples: list[float] = []
+
+        for i in range(n):
+            passed_t, failed_t, dur_ns, mem_kb = _run_one_trial(
+                cmd_base, env_base, results_file, all_ids, run_id, total_timeout_ms, args.memory
+            )
+            last_passed, last_failed = passed_t, failed_t
+            duration_samples.append(float(dur_ns))
+            if args.memory and mem_kb is not None:
+                memory_samples.append(mem_kb)
+
+        if not last_passed and not last_failed:
+            return _error_exit()
+
+        status = "fail" if last_failed else "pass"
+        out = {
+            "status": status,
+            "passed": last_passed,
+            "failed": last_failed,
+            "runtime_ns": _stats(duration_samples),
+        }
+        if args.memory:
+            out["memory_kb"] = _stats(memory_samples) if memory_samples else {"mean": 0.0, "std": 0.0}
+
+        print(json.dumps(out))
+        return 0 if status == "pass" else 1
+    finally:
+        try:
+            os.unlink(results_file)
+        except OSError:
+            pass
+        if bin_path is not None:
+            try:
+                os.unlink(bin_path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2559,12 +2748,27 @@ def main() -> int:
     tst.add_argument("--timeout-ms", dest="timeout_ms", type=int, default=None)
     tst.add_argument("--total-timeout-ms", dest="total_timeout_ms", type=int, default=None)
 
+    prf = sub.add_parser("profile")
+    prf.add_argument("tests_dir")
+    prf.add_argument("solution_path")
+    prf.add_argument("--lang", required=True)
+    prf.add_argument("--tol", type=float, default=None)
+    prf.add_argument("--list-tests", dest="list_tests", action="store_true", default=False)
+    prf.add_argument("--run", dest="run_id", type=str, default=None)
+    prf.add_argument("--timeout-ms", dest="timeout_ms", type=int, default=None)
+    prf.add_argument("--total-timeout-ms", dest="total_timeout_ms", type=int, default=None)
+    prf.add_argument("-n", dest="n", type=int, default=1)
+    prf.add_argument("--warmup", dest="warmup", type=int, default=0)
+    prf.add_argument("--memory", action="store_true", default=False)
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         return 1
     if args.command == "generate":
         return cmd_generate(args)
+    if args.command == "profile":
+        return cmd_profile(args)
     return cmd_test(args)
 
 

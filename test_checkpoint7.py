@@ -405,3 +405,154 @@ def test_rust_async_entrypoint(workspace):
     out = _run_test(sol, tests_dir, "rust")
     assert out["status"] == "pass"
     assert out["passed"] == ["tests.py:1"]
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 8: profile command
+# ---------------------------------------------------------------------------
+
+def _run_profile(tests_dir: Path, solution: Path, lang: str, extra: list[str] | None = None):
+    cmd = [*BCG, "profile", str(tests_dir), str(solution), "--lang", lang, *(extra or [])]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result
+
+
+def _profile_json(tests_dir: Path, solution: Path, lang: str, extra: list[str] | None = None) -> dict:
+    return json.loads(_run_profile(tests_dir, solution, lang, extra).stdout.strip())
+
+
+def _setup_python(workspace, tests_src: str, sol_src: str):
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "tests.py").write_text(tests_src)
+    sol = workspace / "solution.py"
+    sol.write_text(sol_src)
+    rc = subprocess.run(
+        [*BCG, "generate", str(tests_dir), "--entrypoint", "solve", "--lang", "python"],
+        capture_output=True, text=True,
+    )
+    assert rc.returncode == 0, rc.stderr
+    return tests_dir, sol
+
+
+def test_profile_missing_tester_returns_error_json(workspace):
+    """profile errors with the standard error JSON when tester file is missing."""
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir()
+    sol = workspace / "solution.py"
+    sol.write_text("def solve(x): return x\n")
+
+    result = _run_profile(tests_dir, sol, "python")
+    assert result.returncode == 2
+    out = json.loads(result.stdout.strip())
+    assert out == {"status": "error", "passed": [], "failed": []}
+
+
+def test_profile_basic_n1(workspace):
+    """profile with default -n 1 returns runtime_ns with std=0.0."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(2) == 4\n", "def solve(x): return x*x\n")
+
+    out = _profile_json(tests_dir, sol, "python")
+    assert out["status"] == "pass"
+    assert out["passed"] == ["tests.py:1"]
+    assert out["failed"] == []
+    assert "runtime_ns" in out
+    assert out["runtime_ns"]["mean"] >= 0
+    assert out["runtime_ns"]["std"] == 0.0
+
+
+def test_profile_n3_produces_stats(workspace):
+    """profile -n 3 produces runtime_ns stats over three samples."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(2) == 4\n", "def solve(x): return x*x\n")
+
+    out = _profile_json(tests_dir, sol, "python", ["-n", "3"])
+    assert out["status"] == "pass"
+    assert "runtime_ns" in out
+    assert out["runtime_ns"]["mean"] >= 0
+    assert out["runtime_ns"]["std"] >= 0
+
+
+def test_profile_warmup_equal_n_rejected(workspace):
+    """--warmup equal to n must be rejected before any trial runs."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(1) == 1\n", "def solve(x): return x\n")
+
+    result = _run_profile(tests_dir, sol, "python", ["-n", "3", "--warmup", "3"])
+    assert result.returncode != 0
+    assert "warmup" in result.stderr.lower() or "3" in result.stderr
+
+
+def test_profile_warmup_greater_than_n_rejected(workspace):
+    """--warmup greater than n must also be rejected."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(1) == 1\n", "def solve(x): return x\n")
+
+    result = _run_profile(tests_dir, sol, "python", ["-n", "2", "--warmup", "5"])
+    assert result.returncode != 0
+
+
+def test_profile_memory_flag_adds_memory_kb(workspace):
+    """--memory adds memory_kb to output with mean and std keys."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(2) == 4\n", "def solve(x): return x*x\n")
+
+    out = _profile_json(tests_dir, sol, "python", ["--memory"])
+    assert "memory_kb" in out
+    assert "mean" in out["memory_kb"]
+    assert "std" in out["memory_kb"]
+    assert out["memory_kb"]["mean"] >= 0
+    assert out["memory_kb"]["std"] >= 0
+
+
+def test_profile_no_memory_flag_no_memory_kb(workspace):
+    """Without --memory, memory_kb must not appear in output."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(2) == 4\n", "def solve(x): return x*x\n")
+
+    out = _profile_json(tests_dir, sol, "python")
+    assert "memory_kb" not in out
+
+
+def test_profile_list_tests_returns_all_ids_zero_runtime(workspace):
+    """--list-tests returns all IDs with runtime_ns mean/std both 0.0."""
+    tests_dir, sol = _setup_python(
+        workspace,
+        "assert solve(1) == 1\nassert solve(2) == 4\n",
+        "def solve(x): return x*x\n",
+    )
+
+    out = _profile_json(tests_dir, sol, "python", ["--list-tests"])
+    assert out["status"] == "pass"
+    assert set(out["passed"]) == {"tests.py:1", "tests.py:2"}
+    assert out["failed"] == []
+    assert out["runtime_ns"] == {"mean": 0.0, "std": 0.0}
+
+
+def test_profile_run_filters_to_single_test(workspace):
+    """--run <id> causes only that test to appear in passed/failed."""
+    tests_dir, sol = _setup_python(
+        workspace,
+        "assert solve(1) == 1\nassert solve(2) == 4\n",
+        "def solve(x): return x*x\n",
+    )
+
+    out = _profile_json(tests_dir, sol, "python", ["--run", "tests.py:1"])
+    assert out["status"] == "pass"
+    assert out["passed"] == ["tests.py:1"]
+    assert out["failed"] == []
+
+
+def test_profile_failing_test_status_fail(workspace):
+    """A failing test makes status=fail and exit code 1."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(2) == 99\n", "def solve(x): return x*x\n")
+
+    result = _run_profile(tests_dir, sol, "python")
+    assert result.returncode == 1
+    out = json.loads(result.stdout.strip())
+    assert out["status"] == "fail"
+    assert "tests.py:1" in out["failed"]
+
+
+def test_profile_warmup_valid(workspace):
+    """--warmup k < n is accepted and produces valid output."""
+    tests_dir, sol = _setup_python(workspace, "assert solve(3) == 9\n", "def solve(x): return x*x\n")
+
+    out = _profile_json(tests_dir, sol, "python", ["-n", "3", "--warmup", "2"])
+    assert out["status"] == "pass"
+    assert "runtime_ns" in out
