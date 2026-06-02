@@ -1,0 +1,123 @@
+{
+  "ast_grep": {
+    "category_counts": {},
+    "category_weighted": {},
+    "counts": {},
+    "rules_checked": 355,
+    "violation_lines": 0,
+    "violations": 0,
+    "weighted": 0
+  },
+  "classes": {
+    "attribute_counts_mean": 13.0,
+    "attribute_counts_sum": 13,
+    "count": 1,
+    "method_counts_mean": 0.0,
+    "method_counts_sum": 0
+  },
+  "complexity": {
+    "cc_max": 26,
+    "cc_ratings": {
+      "A": 17,
+      "B": 3,
+      "C": 7,
+      "D": 3,
+      "E": 0,
+      "F": 0
+    },
+    "cc_sum": 218,
+    "mi_min": 6.3304349829018784,
+    "mi_ratings": {
+      "A": 0,
+      "B": 0,
+      "C": 1
+    },
+    "mi_sum": 6.3304349829018784,
+    "num_complex": 10
+  },
+  "file_count": 1,
+  "functions": {
+    "cc_concentration": 0.4278565471226022,
+    "cc_extreme_count": 0,
+    "cc_high_count": 10,
+    "cc_max": 26,
+    "cc_mean": 9.909090909090908,
+    "cc_normalized": 0.027991871776065037,
+    "cc_std": 7.77608722093139,
+    "cc_sum": 218,
+    "cc_top20": 0.4908256880733945,
+    "count": 22,
+    "depth_max": 4,
+    "extreme_cc_mean": 0.0,
+    "high_cc_mean": 17.2,
+    "lines_mean": 44.45454545454545,
+    "lines_sum": 978
+  },
+  "graph": {
+    "cyclic_dependency_mass": 0.1686746987951807,
+    "dependency_entropy": 0.3114378587126884,
+    "edge_count": 30,
+    "node_count": 21,
+    "propagation_cost": 0.1738095238095238
+  },
+  "lines": {
+    "comments": 48,
+    "loc": 935,
+    "multi_comment": 6,
+    "single_comment": 52,
+    "total_lines": 1115
+  },
+  "lint": {
+    "counts": {
+      "ANN401": 4,
+      "BLE001": 3,
+      "C901": 3,
+      "DOC201": 9,
+      "DOC501": 2,
+      "EM102": 3,
+      "ERA001": 6,
+      "F401": 1,
+      "PLR0911": 4,
+      "PLR0912": 1,
+      "PLR0916": 2,
+      "PLR2004": 4,
+      "PLW1514": 1,
+      "PTH108": 1,
+      "PTH123": 1,
+      "S404": 1,
+      "S603": 1,
+      "SIM105": 1,
+      "SIM114": 2,
+      "TRY003": 3
+    },
+    "errors": 53,
+    "fixable": 5
+  },
+  "redundancy": {
+    "clone_lines": 355,
+    "clone_ratio_sum": 0.35401069518716577,
+    "cloned_sloc_lines": 165,
+    "files_with_clones": 1
+  },
+  "source_files": [],
+  "symbols": {
+    "classes": 1,
+    "expressions": 917,
+    "expressions_top_level": 10,
+    "functions": 22,
+    "globals": 7,
+    "imports": 11,
+    "max_imports": 11,
+    "methods": 0,
+    "statements": 162,
+    "total": 30,
+    "type_aliases": 0,
+    "variables": 7
+  },
+  "verbosity_flagged_sloc_lines": 165,
+  "waste": {
+    "single_use_functions": 16,
+    "trivial_wrappers": 0,
+    "unused_variables": 6
+  }
+}

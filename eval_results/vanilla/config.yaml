@@ -1,0 +1,8 @@
+problems:
+  - test_translator
+model:
+  name: claude-sonnet-4-6
+thinking: high
+prompt_path: external
+agent:
+  type: external

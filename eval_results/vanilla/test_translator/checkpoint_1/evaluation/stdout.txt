@@ -1,0 +1,1113 @@
+
+
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.0.3, pluggy-1.6.0 -- /tmp/uv-cache/archive-v0/J4dU86nqjpTEy3p3/bin/python
+cachedir: .pytest_cache
+metadata: {'Python': '3.12.13', 'Platform': 'Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41', 'Packages': {'pytest': '9.0.3', 'pluggy': '1.6.0'}, 'Plugins': {'json-ctrf': '0.5.0', 'metadata': '3.1.1', 'timeout': '2.4.0', 'json-report': '1.5.0'}}
+rootdir: /workspace
+configfile: pytest.ini
+plugins: json-ctrf-0.5.0, metadata-3.1.1, timeout-2.4.0, json-report-1.5.0
+timeout: 60.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 102 items
+
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[01_basic_equality-python] PASSED [  0%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[01_basic_equality-javascript] PASSED [  1%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[01_basic_equality-typescript] PASSED [  2%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[02_inequality-python] PASSED [  3%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[02_inequality-javascript] PASSED [  4%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[02_inequality-typescript] PASSED [  5%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[03_truthy_falsy-python] PASSED [  6%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[03_truthy_falsy-javascript] PASSED [  7%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[03_truthy_falsy-typescript] PASSED [  8%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[04_exceptions-python] PASSED [  9%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[04_exceptions-javascript] PASSED [ 10%]
+.evaluation_tests/test_checkpoint_1.py::test_core_pass[04_exceptions-typescript] PASSED [ 11%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[09_failing_tests-python] PASSED [ 12%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[09_failing_tests-javascript] PASSED [ 13%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[09_failing_tests-typescript] PASSED [ 14%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[13_negative_tests-python] PASSED [ 15%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[13_negative_tests-javascript] PASSED [ 16%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[13_negative_tests-typescript] PASSED [ 17%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[14_deep_nested_failures-python] PASSED [ 18%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[14_deep_nested_failures-javascript] PASSED [ 19%]
+.evaluation_tests/test_checkpoint_1.py::test_core_fail[14_deep_nested_failures-typescript] PASSED [ 20%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[05_nested_functions-python] PASSED [ 21%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[05_nested_functions-javascript] PASSED [ 22%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[05_nested_functions-typescript] PASSED [ 23%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[06_value_types-python] PASSED [ 24%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[06_value_types-javascript] PASSED [ 25%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[06_value_types-typescript] PASSED [ 26%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[07_stdout_stderr-python] PASSED [ 27%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[07_stdout_stderr-javascript] FAILED [ 28%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[07_stdout_stderr-typescript] FAILED [ 29%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[08_multiple_same_line-python] PASSED [ 30%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[08_multiple_same_line-javascript] PASSED [ 31%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[08_multiple_same_line-typescript] PASSED [ 32%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[11_non_entrypoint_excluded-python] PASSED [ 33%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[11_non_entrypoint_excluded-javascript] PASSED [ 34%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[11_non_entrypoint_excluded-typescript] PASSED [ 35%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[12_deep_nested_containers-python] PASSED [ 36%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[12_deep_nested_containers-javascript] PASSED [ 37%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[12_deep_nested_containers-typescript] PASSED [ 38%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[19_parenthesized_expressions-python] PASSED [ 39%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[19_parenthesized_expressions-javascript] PASSED [ 40%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[19_parenthesized_expressions-typescript] PASSED [ 41%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[20_keyword_arguments-python] FAILED [ 42%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[20_keyword_arguments-javascript] FAILED [ 43%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[20_keyword_arguments-typescript] FAILED [ 44%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[23_class_method_entrypoint-python] PASSED [ 45%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[23_class_method_entrypoint-javascript] PASSED [ 46%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[23_class_method_entrypoint-typescript] PASSED [ 47%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[24_float_edge_cases-python] FAILED [ 48%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[24_float_edge_cases-javascript] FAILED [ 49%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[24_float_edge_cases-typescript] FAILED [ 50%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[25_string_edge_cases-python] PASSED [ 50%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[25_string_edge_cases-javascript] PASSED [ 51%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[25_string_edge_cases-typescript] PASSED [ 52%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[26_large_integers-python] PASSED [ 53%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[26_large_integers-javascript] PASSED [ 54%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[26_large_integers-typescript] PASSED [ 55%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[27_stdout_special_chars-python] PASSED [ 56%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[27_stdout_special_chars-javascript] PASSED [ 57%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[27_stdout_special_chars-typescript] PASSED [ 58%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[28_empty_containers-python] PASSED [ 59%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[28_empty_containers-javascript] PASSED [ 60%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[28_empty_containers-typescript] PASSED [ 61%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[29_dict_ordering-python] PASSED [ 62%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[29_dict_ordering-javascript] PASSED [ 63%]
+.evaluation_tests/test_checkpoint_1.py::test_func_cases[29_dict_ordering-typescript] PASSED [ 64%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[10_error_cases-python] PASSED [ 65%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[10_error_cases-javascript] PASSED [ 66%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[10_error_cases-typescript] PASSED [ 67%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[15_malformed_syntax-python] PASSED [ 68%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[15_malformed_syntax-javascript] PASSED [ 69%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[15_malformed_syntax-typescript] PASSED [ 70%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[16_undefined_function-python] FAILED [ 71%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[16_undefined_function-javascript] FAILED [ 72%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[16_undefined_function-typescript] FAILED [ 73%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[17_empty_tests-python] FAILED [ 74%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[17_empty_tests-javascript] FAILED [ 75%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[17_empty_tests-typescript] FAILED [ 76%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[18_no_matching_entrypoint-python] FAILED [ 77%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[18_no_matching_entrypoint-javascript] FAILED [ 78%]
+.evaluation_tests/test_checkpoint_1.py::test_error_cases[18_no_matching_entrypoint-typescript] FAILED [ 79%]
+.evaluation_tests/test_checkpoint_1.py::test_invalid_lang_flag[ruby] PASSED [ 80%]
+.evaluation_tests/test_checkpoint_1.py::test_invalid_lang_flag[go] PASSED [ 81%]
+.evaluation_tests/test_checkpoint_1.py::test_invalid_lang_flag[rust] PASSED [ 82%]
+.evaluation_tests/test_checkpoint_1.py::test_invalid_lang_flag[java] PASSED [ 83%]
+.evaluation_tests/test_checkpoint_1.py::test_invalid_lang_flag[cpp] PASSED [ 84%]
+.evaluation_tests/test_checkpoint_1.py::test_invalid_lang_flag[] PASSED  [ 85%]
+.evaluation_tests/test_checkpoint_1.py::test_missing_tester_file[python] PASSED [ 86%]
+.evaluation_tests/test_checkpoint_1.py::test_missing_tester_file[javascript] PASSED [ 87%]
+.evaluation_tests/test_checkpoint_1.py::test_missing_tester_file[typescript] PASSED [ 88%]
+.evaluation_tests/test_checkpoint_1.py::test_generate_failure_no_tester_created[python] PASSED [ 89%]
+.evaluation_tests/test_checkpoint_1.py::test_generate_failure_no_tester_created[javascript] PASSED [ 90%]
+.evaluation_tests/test_checkpoint_1.py::test_generate_failure_no_tester_created[typescript] PASSED [ 91%]
+.evaluation_tests/test_checkpoint_1.py::test_id_format_basic[01_basic_equality-python] PASSED [ 92%]
+.evaluation_tests/test_checkpoint_1.py::test_id_format_basic[01_basic_equality-javascript] PASSED [ 93%]
+.evaluation_tests/test_checkpoint_1.py::test_id_format_basic[01_basic_equality-typescript] PASSED [ 94%]
+.evaluation_tests/test_checkpoint_1.py::test_id_format_basic[02_inequality-python] PASSED [ 95%]
+.evaluation_tests/test_checkpoint_1.py::test_id_format_basic[02_inequality-javascript] PASSED [ 96%]
+.evaluation_tests/test_checkpoint_1.py::test_id_format_basic[02_inequality-typescript] PASSED [ 97%]
+.evaluation_tests/test_checkpoint_1.py::test_multiple_same_line_id_format[python] PASSED [ 98%]
+.evaluation_tests/test_checkpoint_1.py::test_multiple_same_line_id_format[javascript] PASSED [ 99%]
+.evaluation_tests/test_checkpoint_1.py::test_multiple_same_line_id_format[typescript] PASSED [100%]
+
+=================================== FAILURES ===================================
+_________________ test_func_cases[07_stdout_stderr-javascript] _________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'greet', 'id': '07_stdout_stderr', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/07_stdout_stderr')}
+lang = 'javascript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_07_stdout_stde1')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+        assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+>       assert "parse_failed" not in result, (
+            f"JSON parse failed: stdout={result.get('stdout')}"
+        )
+E       AssertionError: JSON parse failed: stdout=undefined
+E         {"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}
+E         
+E       assert 'parse_failed' not in {'parse_failed': True, 'stdout': 'undefined\n{"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}\n', 'stderr': '', 'returncode': 0}
+
+.evaluation_tests/test_checkpoint_1.py:192: AssertionError
+_________________ test_func_cases[07_stdout_stderr-typescript] _________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'greet', 'id': '07_stdout_stderr', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/07_stdout_stderr')}
+lang = 'typescript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_07_stdout_stde2')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+        assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+>       assert "parse_failed" not in result, (
+            f"JSON parse failed: stdout={result.get('stdout')}"
+        )
+E       AssertionError: JSON parse failed: stdout=undefined
+E         {"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}
+E         
+E       assert 'parse_failed' not in {'parse_failed': True, 'stdout': 'undefined\n{"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}\n', 'stderr': '', 'returncode': 0}
+
+.evaluation_tests/test_checkpoint_1.py:192: AssertionError
+_________________ test_func_cases[20_keyword_arguments-python] _________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'add', 'id': '20_keyword_arguments', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/20_keyword_arguments')}
+lang = 'python'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_20_keyword_arg0')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+        assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+        assert "parse_failed" not in result, (
+            f"JSON parse failed: stdout={result.get('stdout')}"
+        )
+>       assert result["status"] == "pass", (
+            f"Expected pass, got {result['status']}: failed={result.get('failed')}"
+        )
+E       AssertionError: Expected pass, got fail: failed=['tests.py:2', 'tests.py:3', 'tests.py:4', 'tests.py:5']
+E       assert 'fail' == 'pass'
+E         
+E         - pass
+E         + fail
+
+.evaluation_tests/test_checkpoint_1.py:195: AssertionError
+_______________ test_func_cases[20_keyword_arguments-javascript] _______________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'add', 'id': '20_keyword_arguments', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/20_keyword_arguments')}
+lang = 'javascript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_20_keyword_arg1')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+        assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+        assert "parse_failed" not in result, (
+            f"JSON parse failed: stdout={result.get('stdout')}"
+        )
+>       assert result["status"] == "pass", (
+            f"Expected pass, got {result['status']}: failed={result.get('failed')}"
+        )
+E       AssertionError: Expected pass, got fail: failed=['tests.py:2', 'tests.py:3', 'tests.py:4', 'tests.py:5']
+E       assert 'fail' == 'pass'
+E         
+E         - pass
+E         + fail
+
+.evaluation_tests/test_checkpoint_1.py:195: AssertionError
+_______________ test_func_cases[20_keyword_arguments-typescript] _______________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'add', 'id': '20_keyword_arguments', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/20_keyword_arguments')}
+lang = 'typescript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_20_keyword_arg2')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+        assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+        assert "parse_failed" not in result, (
+            f"JSON parse failed: stdout={result.get('stdout')}"
+        )
+>       assert result["status"] == "pass", (
+            f"Expected pass, got {result['status']}: failed={result.get('failed')}"
+        )
+E       AssertionError: Expected pass, got fail: failed=['tests.py:2', 'tests.py:3', 'tests.py:4', 'tests.py:5']
+E       assert 'fail' == 'pass'
+E         
+E         - pass
+E         + fail
+
+.evaluation_tests/test_checkpoint_1.py:195: AssertionError
+_________________ test_func_cases[24_float_edge_cases-python] __________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'identity', 'id': '24_float_edge_cases', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/24_float_edge_cases')}
+lang = 'python'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_24_float_edge_0')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+>       assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+E       AssertionError: generate failed: error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])
+E         
+E       assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': "error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])\n", 'generate_returncode': 1}
+
+.evaluation_tests/test_checkpoint_1.py:189: AssertionError
+_______________ test_func_cases[24_float_edge_cases-javascript] ________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'identity', 'id': '24_float_edge_cases', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/24_float_edge_cases')}
+lang = 'javascript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_24_float_edge_1')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+>       assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+E       AssertionError: generate failed: error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])
+E         
+E       assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': "error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])\n", 'generate_returncode': 1}
+
+.evaluation_tests/test_checkpoint_1.py:189: AssertionError
+_______________ test_func_cases[24_float_edge_cases-typescript] ________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'identity', 'id': '24_float_edge_cases', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/func/24_float_edge_cases')}
+lang = 'typescript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_func_cases_24_float_edge_2')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", FUNC_CASES, ids=[c["id"] for c in FUNC_CASES])
+    def test_func_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Functionality tests - optional features."""
+        result = run_generate_and_test(entrypoint_argv, case, lang, tmp_path)
+    
+>       assert "generate_failed" not in result, (
+            f"generate failed: {result.get('generate_stderr', result.get('error'))}"
+        )
+E       AssertionError: generate failed: error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])
+E         
+E       assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': "error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])\n", 'generate_returncode': 1}
+
+.evaluation_tests/test_checkpoint_1.py:189: AssertionError
+________________ test_error_cases[16_undefined_function-python] ________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'target', 'id': '16_undefined_function', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/16_undefined_function')}
+lang = 'python'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_16_undefined_0')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got fail
+E           assert 'fail' == 'error'
+E             
+E             - error
+E             + fail
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+______________ test_error_cases[16_undefined_function-javascript] ______________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'target', 'id': '16_undefined_function', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/16_undefined_function')}
+lang = 'javascript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_16_undefined_1')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got fail
+E           assert 'fail' == 'error'
+E             
+E             - error
+E             + fail
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+______________ test_error_cases[16_undefined_function-typescript] ______________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'target', 'id': '16_undefined_function', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/16_undefined_function')}
+lang = 'typescript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_16_undefined_2')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got fail
+E           assert 'fail' == 'error'
+E             
+E             - error
+E             + fail
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+___________________ test_error_cases[17_empty_tests-python] ____________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'noop', 'id': '17_empty_tests', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/17_empty_tests')}
+lang = 'python'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_17_empty_test0')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got pass
+E           assert 'pass' == 'error'
+E             
+E             - error
+E             + pass
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+_________________ test_error_cases[17_empty_tests-javascript] __________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'noop', 'id': '17_empty_tests', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/17_empty_tests')}
+lang = 'javascript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_17_empty_test1')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got pass
+E           assert 'pass' == 'error'
+E             
+E             - error
+E             + pass
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+_________________ test_error_cases[17_empty_tests-typescript] __________________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'noop', 'id': '17_empty_tests', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/17_empty_tests')}
+lang = 'typescript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_17_empty_test2')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got pass
+E           assert 'pass' == 'error'
+E             
+E             - error
+E             + pass
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+______________ test_error_cases[18_no_matching_entrypoint-python] ______________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'target', 'id': '18_no_matching_entrypoint', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/18_no_matching_entrypoint')}
+lang = 'python'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_18_no_matchin0')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got pass
+E           assert 'pass' == 'error'
+E             
+E             - error
+E             + pass
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+____________ test_error_cases[18_no_matching_entrypoint-javascript] ____________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'target', 'id': '18_no_matching_entrypoint', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/18_no_matching_entrypoint')}
+lang = 'javascript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_18_no_matchin1')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got pass
+E           assert 'pass' == 'error'
+E             
+E             - error
+E             + pass
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+____________ test_error_cases[18_no_matching_entrypoint-typescript] ____________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'entrypoint': 'target', 'id': '18_no_matching_entrypoint', 'path': PosixPath('/workspace/.evaluation_tests/data/checkpoint_1/errors/18_no_matching_entrypoint')}
+lang = 'typescript'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_error_cases_18_no_matchin2')
+
+    @pytest.mark.error
+    @pytest.mark.parametrize("lang", LANGUAGES)
+    @pytest.mark.parametrize("case", ERROR_CASES, ids=[c["id"] for c in ERROR_CASES])
+    def test_error_cases(
+        entrypoint_argv: list[str],
+        case: dict,
+        lang: str,
+        tmp_path: Path,
+    ) -> None:
+        """Error handling tests - should produce error status."""
+        # Copy case dir to tmp_path
+        case_copy = tmp_path / "case"
+        shutil.copytree(case["path"], case_copy)
+    
+        entrypoint = case["entrypoint"]
+    
+        # Run generate - may fail for some error cases
+        gen_result = subprocess.run(
+            entrypoint_argv + [
+                "generate", str(case_copy),
+                "--entrypoint", entrypoint,
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # If generate failed with non-zero exit, that's acceptable for error cases
+        if gen_result.returncode != 0:
+            return
+    
+        # If generate succeeded, run test and expect error status
+        ext = LANG_EXT[lang]
+        solution_file = case_copy / f"solution.{ext}"
+    
+        # For error cases, solution might not exist - use a dummy path
+        if not solution_file.exists():
+            solution_file = case_copy / "solution.py"  # fallback
+    
+        test_result = subprocess.run(
+            entrypoint_argv + [
+                "test", str(solution_file), str(case_copy),
+                "--lang", lang,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    
+        # Should get error status or non-zero exit
+        if test_result.returncode == 2:
+            # Expected error exit code
+            return
+    
+        try:
+            result = json.loads(test_result.stdout.strip())
+>           assert result["status"] == "error", (
+                f"Expected error status, got {result['status']}"
+            )
+E           AssertionError: Expected error status, got pass
+E           assert 'pass' == 'error'
+E             
+E             - error
+E             + pass
+
+.evaluation_tests/test_checkpoint_1.py:258: AssertionError
+--------------------------------- JSON report ----------------------------------
+report saved to: .scbench/pytest-report.json
+=========================== short test summary info ============================
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[07_stdout_stderr-javascript] - AssertionError: JSON parse failed: stdout=undefined
+  {"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}
+  
+assert 'parse_failed' not in {'parse_failed': True, 'stdout': 'undefined\n{"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}\n', 'stderr': '', 'returncode': 0}
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[07_stdout_stderr-typescript] - AssertionError: JSON parse failed: stdout=undefined
+  {"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}
+  
+assert 'parse_failed' not in {'parse_failed': True, 'stdout': 'undefined\n{"status": "pass", "passed": ["tests.py:3", "tests.py:6", "tests.py:9"], "failed": []}\n', 'stderr': '', 'returncode': 0}
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[20_keyword_arguments-python] - AssertionError: Expected pass, got fail: failed=['tests.py:2', 'tests.py:3', 'tests.py:4', 'tests.py:5']
+assert 'fail' == 'pass'
+  
+  - pass
+  + fail
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[20_keyword_arguments-javascript] - AssertionError: Expected pass, got fail: failed=['tests.py:2', 'tests.py:3', 'tests.py:4', 'tests.py:5']
+assert 'fail' == 'pass'
+  
+  - pass
+  + fail
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[20_keyword_arguments-typescript] - AssertionError: Expected pass, got fail: failed=['tests.py:2', 'tests.py:3', 'tests.py:4', 'tests.py:5']
+assert 'fail' == 'pass'
+  
+  - pass
+  + fail
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[24_float_edge_cases-python] - AssertionError: generate failed: error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])
+  
+assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': "error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])\n", 'generate_returncode': 1}
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[24_float_edge_cases-javascript] - AssertionError: generate failed: error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])
+  
+assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': "error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])\n", 'generate_returncode': 1}
+FAILED .evaluation_tests/test_checkpoint_1.py::test_func_cases[24_float_edge_cases-typescript] - AssertionError: generate failed: error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])
+  
+assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': "error: failed to parse tests.py: Unsupported value in tests.py: Call(func=Name(id='float', ctx=Load()), args=[Constant(value='inf')], keywords=[])\n", 'generate_returncode': 1}
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[16_undefined_function-python] - AssertionError: Expected error status, got fail
+assert 'fail' == 'error'
+  
+  - error
+  + fail
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[16_undefined_function-javascript] - AssertionError: Expected error status, got fail
+assert 'fail' == 'error'
+  
+  - error
+  + fail
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[16_undefined_function-typescript] - AssertionError: Expected error status, got fail
+assert 'fail' == 'error'
+  
+  - error
+  + fail
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[17_empty_tests-python] - AssertionError: Expected error status, got pass
+assert 'pass' == 'error'
+  
+  - error
+  + pass
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[17_empty_tests-javascript] - AssertionError: Expected error status, got pass
+assert 'pass' == 'error'
+  
+  - error
+  + pass
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[17_empty_tests-typescript] - AssertionError: Expected error status, got pass
+assert 'pass' == 'error'
+  
+  - error
+  + pass
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[18_no_matching_entrypoint-python] - AssertionError: Expected error status, got pass
+assert 'pass' == 'error'
+  
+  - error
+  + pass
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[18_no_matching_entrypoint-javascript] - AssertionError: Expected error status, got pass
+assert 'pass' == 'error'
+  
+  - error
+  + pass
+FAILED .evaluation_tests/test_checkpoint_1.py::test_error_cases[18_no_matching_entrypoint-typescript] - AssertionError: Expected error status, got pass
+assert 'pass' == 'error'
+  
+  - error
+  + pass
+=================== 17 failed, 85 passed in 81.84s (0:01:21) ===================
