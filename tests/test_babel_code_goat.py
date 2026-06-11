@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "babel_code_goat.py"
+sys.path.insert(0, str(ROOT))
+
+import babel_code_goat as bcg  # noqa: E402
+
+
+def write(path: Path, content: str) -> None:
+    path.write_text(textwrap.dedent(content).lstrip("\n"), encoding="utf-8")
+
+
+class BabelCodeGoatTests(unittest.TestCase):
+    def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            text=True,
+            capture_output=True,
+        )
+
+    def json_stdout(self, proc: subprocess.CompletedProcess[str]) -> dict[str, object]:
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines, [proc.stdout.rstrip("\n")])
+        return json.loads(lines[0])
+
+    def make_generated_case(self, lang: str, solution_name: str = "solution.py") -> tuple[Path, Path]:
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp)
+        write(
+            temp / "tests.py",
+            """
+            assert solve(2) == 3
+            """,
+        )
+        solution = temp / solution_name
+        return temp, solution
+
+    def generate(self, tests_dir: Path, lang: str) -> subprocess.CompletedProcess[str]:
+        return self.run_cli(
+            "generate",
+            str(tests_dir),
+            "--entrypoint",
+            "solve",
+            "--lang",
+            lang,
+        )
+
+    def test_generate_language_validation_and_tester_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+
+            expected = {
+                "python": "tester.py",
+                "javascript": "tester.js",
+                "typescript": "tester.ts",
+            }
+            for lang, filename in expected.items():
+                with self.subTest(lang=lang):
+                    proc = self.generate(tests_dir, lang)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    tester = tests_dir / filename
+                    self.assertTrue(tester.exists())
+                    metadata = bcg.read_tester_metadata(tester)
+                    self.assertEqual(metadata["entrypoint"], "solve")
+                    self.assertEqual(metadata["lang"], lang)
+
+            sentinels = {
+                tests_dir / "tester.py": "py sentinel",
+                tests_dir / "tester.js": "js sentinel",
+                tests_dir / "tester.ts": "ts sentinel",
+            }
+            for path, content in sentinels.items():
+                path.write_text(content, encoding="utf-8")
+            proc = self.generate(tests_dir, "ruby")
+            self.assertNotEqual(proc.returncode, 0)
+            for path, content in sentinels.items():
+                self.assertEqual(path.read_text(encoding="utf-8"), content)
+
+    def test_generate_preserves_existing_tester_on_discovery_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "tests.py", "import os\n")
+            tester = tests_dir / "tester.py"
+            tester.write_text("sentinel", encoding="utf-8")
+
+            proc = self.generate(tests_dir, "python")
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(tester.read_text(encoding="utf-8"), "sentinel")
+
+    def test_missing_tester_errors_and_does_not_create_files(self) -> None:
+        filenames = {
+            "python": "tester.py",
+            "javascript": "tester.js",
+            "typescript": "tester.ts",
+        }
+        for lang, filename in filenames.items():
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+                solution = tests_dir / f"solution.{filename.rsplit('.', 1)[1]}"
+                solution.write_text("", encoding="utf-8")
+
+                proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", lang)
+
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+                self.assertFalse((tests_dir / filename).exists())
+
+    def test_discovery_supports_allowed_constructs_and_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                def outer():
+                    assert solve(1) == 2; assert solve(2) != 5
+                    def inner():
+                        # expect_stdout: "hi\\n"
+                        # expect_stderr: "err\\n"
+                        assert solve("io")
+                try:
+                    solve("boom")
+                    assert False
+                except Exception:
+                    pass
+                assert not solve(0)
+                assert solve({"x": [1, (2,)]}) == {"x": [1, (2,)]}
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(
+                [case.id for case in cases[:2]],
+                ["tests.py:2#0", "tests.py:2#1"],
+            )
+            self.assertEqual(cases[2].expect_stdout, "hi\n")
+            self.assertEqual(cases[2].expect_stderr, "err\n")
+            self.assertEqual([case.kind for case in cases], ["eq", "ne", "truthy", "raises", "not", "eq"])
+            self.assertEqual(cases[-1].args, [{"x": [1, (2,)]}])
+
+    def test_discovery_rejects_unsupported_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "tests.py", 'assert solve({1: "bad"}) == 1\n')
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
+    def test_python_pass_fail_error_output_and_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve(1) == 2
+                assert solve(2) == 99
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                def solve(value):
+                    return value + 1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(set(result), {"status", "passed", "failed"})
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(len(result["passed"]), 1)
+            self.assertEqual(len(result["failed"]), 1)
+
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            write(tests_dir / "tests.py", "import os\n")
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+    def test_python_output_expectations_and_callable_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                # expect_stdout: "hi\\n"
+                assert solve("out") == 1
+                # expect_stderr: "err\\n"
+                assert solve("err") == 2
+                assert solve(2) == 3
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                import sys
+
+                class Solution:
+                    @staticmethod
+                    def solve(value):
+                        if value == "out":
+                            print("hi")
+                            return 1
+                        if value == "err":
+                            print("err", file=sys.stderr)
+                            return 2
+                        return value + 1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    def test_python_instance_method_resolution(self) -> None:
+        tests_dir, solution = self.make_generated_case("python")
+        write(
+            solution,
+            """
+            class Solution:
+                def solve(self, value):
+                    return value + 1
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
+    def test_javascript_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("javascript", "solution.js")
+        write(
+            solution,
+            """
+            function solve(value) {
+              return value + 1;
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "javascript").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "javascript")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
+    def test_typescript_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("typescript", "solution.ts")
+        write(
+            solution,
+            """
+            class Solution {
+              static solve(value: number): number {
+                return value + 1;
+              }
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "typescript").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+
+if __name__ == "__main__":
+    unittest.main()
