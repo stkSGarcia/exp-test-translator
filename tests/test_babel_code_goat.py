@@ -204,6 +204,52 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(cases[3].message_match, "regex")
             self.assertEqual(cases[3].message_pattern, "bad")
 
+    def test_discovery_supports_single_call_expression_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                assert 3 == solve(1, 2)
+                assert solve(1, 2) in [1, 2, 3]
+                assert sorted(solve([3, 1, 2])) == [1, 2, 3]
+                assert solve("abc").upper() == "ABC"
+                assert len(solve([1, 2, 3])[1:]) == 2
+                assert solve(3) + 1 > 3
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(len(cases), 6)
+            self.assertEqual(cases[0].kind, "eq")
+            self.assertEqual(cases[0].args, [1, 2])
+            self.assertEqual(cases[0].expected, 3)
+            self.assertEqual(cases[1].kind, "truthy")
+            self.assertEqual(cases[1].actual_expr["op"], "compare")
+            self.assertEqual(cases[1].actual_expr["operator"], "in")
+            self.assertEqual(cases[2].actual_expr["op"], "call")
+            self.assertEqual(cases[2].actual_expr["name"], "sorted")
+            self.assertEqual(cases[3].actual_expr["op"], "method")
+            self.assertEqual(cases[3].actual_expr["name"], "upper")
+            self.assertEqual(cases[4].actual_expr["op"], "call")
+            self.assertEqual(cases[5].actual_expr["op"], "compare")
+
+    def test_discovery_rejects_multi_call_and_unsupported_helper_expressions(self) -> None:
+        sources = [
+            "assert solve(1) == solve(2)\n",
+            "assert solve(1) + solve(2) == 3\n",
+            "assert helper(solve(1)) == 2\n",
+            "assert solve(helper(1)) == 2\n",
+        ]
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", source)
+
+                with self.assertRaises(bcg.DiscoveryError):
+                    bcg.discover_tests(tests_dir, "solve")
+
     def test_discovery_rejects_unsupported_literals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -434,6 +480,54 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(len(result["passed"]), 2)
             self.assertEqual(len(result["failed"]), 1)
 
+    def test_python_single_call_expression_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            calls = tests_dir / "calls.txt"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert sorted(solve("sort")) == [1, 2, 3]
+                assert solve("member") in ["x", "y"]
+                assert solve("string").upper() == "ABC"
+                assert solve("index")[1] == "b"
+                assert len(solve("slice")[1:]) == 2
+                assert solve("arith") + 2 == 5
+                assert solve("gt") > 4
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                f"""
+                CALLS = {str(calls)!r}
+
+                def solve(value):
+                    with open(CALLS, "a", encoding="utf-8") as handle:
+                        handle.write(value + "\\n")
+                    if value == "sort":
+                        return [3, 1, 2]
+                    if value == "member":
+                        return "x"
+                    if value == "string":
+                        return "abc"
+                    if value == "index":
+                        return ["a", "b", "c"]
+                    if value == "slice":
+                        return [1, 2, 3]
+                    if value == "arith":
+                        return 3
+                    return 5
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 7)
+
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
         tests_dir, solution = self.make_generated_case("javascript", "solution.js")
@@ -500,6 +594,40 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
+    @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
+    def test_javascript_single_call_expression_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                assert sorted(solve("sort")) == [1, 2, 3]
+                assert solve("member") in ["x", "y"]
+                assert solve("string").upper() == "ABC"
+                """,
+            )
+            solution = tests_dir / "solution.js"
+            write(
+                solution,
+                """
+                function solve(value) {
+                  if (value === "sort") {
+                    return [3, 1, 2];
+                  }
+                  if (value === "member") {
+                    return "x";
+                  }
+                  return "abc";
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "javascript").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "javascript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
     @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
     def test_typescript_solution_execution(self) -> None:
         tests_dir, solution = self.make_generated_case("typescript", "solution.ts")
@@ -519,6 +647,42 @@ class BabelCodeGoatTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
+    def test_typescript_single_call_expression_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                assert sorted(solve("sort")) == [1, 2, 3]
+                assert solve("member") in ["x", "y"]
+                assert solve("string").upper() == "ABC"
+                """,
+            )
+            solution = tests_dir / "solution.ts"
+            write(
+                solution,
+                """
+                class Solution {
+                  static solve(value: string): any {
+                    if (value === "sort") {
+                      return [3, 1, 2];
+                    }
+                    if (value === "member") {
+                      return "x";
+                    }
+                    return "abc";
+                  }
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "typescript").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
     def test_typescript_rich_comparison_execution(self) -> None:

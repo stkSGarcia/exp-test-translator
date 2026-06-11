@@ -20,7 +20,7 @@ import tempfile
 import textwrap
 from collections import Counter, defaultdict, deque
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,60 @@ HELPER_MODULES = {"math", "re", "collections", "decimal"}
 COLLECTION_CONSTRUCTORS = {"Counter", "deque", "defaultdict"}
 DECIMAL_CONSTRUCTORS = {"Decimal"}
 DEFAULTDICT_FACTORIES = {"None", "bool", "dict", "float", "int", "list", "set", "str", "tuple"}
+PRIMITIVE_FUNCTIONS = {
+    "abs",
+    "bool",
+    "float",
+    "frozenset",
+    "int",
+    "len",
+    "list",
+    "max",
+    "min",
+    "set",
+    "sorted",
+    "str",
+    "sum",
+    "tuple",
+}
+STRING_METHODS = {
+    "count",
+    "endswith",
+    "find",
+    "join",
+    "lower",
+    "lstrip",
+    "replace",
+    "rstrip",
+    "split",
+    "startswith",
+    "strip",
+    "upper",
+}
+BINARY_OPERATORS = {
+    ast.Add: "add",
+    ast.Sub: "sub",
+    ast.Mult: "mult",
+    ast.Div: "truediv",
+    ast.FloorDiv: "floordiv",
+    ast.Mod: "mod",
+    ast.Pow: "pow",
+}
+UNARY_OPERATORS = {
+    ast.UAdd: "uadd",
+    ast.USub: "usub",
+    ast.Not: "not",
+}
+COMPARE_OPERATORS = {
+    ast.Eq: "eq",
+    ast.NotEq: "ne",
+    ast.Lt: "lt",
+    ast.LtE: "lte",
+    ast.Gt: "gt",
+    ast.GtE: "gte",
+    ast.In: "in",
+    ast.NotIn: "not_in",
+}
 
 
 class DiscoveryError(Exception):
@@ -51,11 +105,16 @@ class MetadataError(Exception):
     """Raised when generated tester metadata is absent or invalid."""
 
 
+def result_expr() -> dict[str, Any]:
+    return {"op": "result"}
+
+
 @dataclass(frozen=True)
 class PendingTest:
     line: int
     kind: str
     args: list[Any]
+    actual_expr: dict[str, Any] = field(default_factory=result_expr)
     expected: Any = None
     comparison: str = "standard"
     abs_tol: Any = None
@@ -73,6 +132,7 @@ class TestCase:
     line: int
     kind: str
     args: list[Any]
+    actual_expr: dict[str, Any] = field(default_factory=result_expr)
     expected: Any = None
     comparison: str = "standard"
     abs_tol: Any = None
@@ -326,32 +386,55 @@ class TestDiscoverer:
         if isinstance(test, ast.Compare):
             if self.visit_absdiff_assert(stmt, test):
                 return
-            if len(test.ops) != 1 or len(test.comparators) != 1:
-                raise DiscoveryError(f"unsupported comparison at line {stmt.lineno}")
-            args = self.parse_entrypoint_call(test.left, stmt.lineno)
-            expected = self.parse_value(test.comparators[0])
-            if isinstance(test.ops[0], ast.Eq):
-                self.add_test(stmt.lineno, "eq", args, expected)
-                return
-            if isinstance(test.ops[0], ast.NotEq):
-                self.add_test(stmt.lineno, "ne", args, expected)
-                return
-            raise DiscoveryError(f"unsupported comparison operator at line {stmt.lineno}")
+            self.visit_comparison_assert(stmt, test)
+            return
 
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            args = self.parse_entrypoint_call(test.operand, stmt.lineno)
-            self.add_test(stmt.lineno, "not", args)
+            args, actual_expr = self.parse_actual_expression(test.operand, stmt.lineno)
+            self.add_test(stmt.lineno, "not", args, actual_expr=actual_expr)
             return
 
         if isinstance(test, ast.Call):
             if self.call_name(test.func) == "math.isclose":
                 self.visit_isclose_assert(stmt, test)
                 return
-            args = self.parse_entrypoint_call(test, stmt.lineno)
-            self.add_test(stmt.lineno, "truthy", args)
+        args, actual_expr = self.parse_actual_expression(test, stmt.lineno)
+        self.add_test(stmt.lineno, "truthy", args, actual_expr=actual_expr)
+
+    def visit_comparison_assert(self, stmt: ast.Assert, test: ast.Compare) -> None:
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            raise DiscoveryError(f"unsupported comparison at line {stmt.lineno}")
+        operator = test.ops[0]
+        if type(operator) not in COMPARE_OPERATORS:
+            raise DiscoveryError(f"unsupported comparison operator at line {stmt.lineno}")
+
+        left_calls = self.count_entrypoint_calls(test.left)
+        right = test.comparators[0]
+        right_calls = self.count_entrypoint_calls(right)
+        total_calls = left_calls + right_calls
+        if total_calls != 1:
+            raise DiscoveryError(
+                f"assertion must call {self.entrypoint} exactly once at line {stmt.lineno}"
+            )
+
+        if isinstance(operator, (ast.Eq, ast.NotEq)):
+            if left_calls == 1:
+                args, actual_expr = self.parse_actual_expression(test.left, stmt.lineno)
+                expected = self.parse_value(right)
+            else:
+                args, actual_expr = self.parse_actual_expression(right, stmt.lineno)
+                expected = self.parse_value(test.left)
+            self.add_test(
+                stmt.lineno,
+                "eq" if isinstance(operator, ast.Eq) else "ne",
+                args,
+                expected,
+                actual_expr=actual_expr,
+            )
             return
 
-        raise DiscoveryError(f"unsupported assertion at line {stmt.lineno}")
+        args, actual_expr = self.parse_actual_expression(test, stmt.lineno)
+        self.add_test(stmt.lineno, "truthy", args, actual_expr=actual_expr)
 
     def visit_isclose_assert(self, stmt: ast.Assert, call: ast.Call) -> None:
         if len(call.args) != 2:
@@ -525,6 +608,204 @@ class TestDiscoverer:
             return right_args, self.parse_value(left)
         raise DiscoveryError(f"expected one operand to call {self.entrypoint} at line {line_no}")
 
+    def count_entrypoint_calls(self, node: ast.AST) -> int:
+        return sum(
+            1
+            for child in ast.walk(node)
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == self.entrypoint
+            )
+        )
+
+    def parse_actual_expression(
+        self,
+        node: ast.AST,
+        line_no: int,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        if self.count_entrypoint_calls(node) != 1:
+            raise DiscoveryError(
+                f"assertion must call {self.entrypoint} exactly once at line {line_no}"
+            )
+        entrypoint_args: list[list[Any]] = []
+        expr = self.parse_expression(node, entrypoint_args)
+        if len(entrypoint_args) != 1:
+            raise DiscoveryError(
+                f"assertion must call {self.entrypoint} exactly once at line {line_no}"
+            )
+        return entrypoint_args[0], expr
+
+    def parse_expression(
+        self,
+        node: ast.AST,
+        entrypoint_args: list[list[Any]],
+    ) -> dict[str, Any]:
+        line_no = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant):
+            if is_supported_scalar(node.value):
+                return {"op": "value", "value": node.value}
+            raise DiscoveryError(f"unsupported literal value at line {line_no}")
+        if isinstance(node, ast.List):
+            return {
+                "op": "list",
+                "items": [self.parse_expression(item, entrypoint_args) for item in node.elts],
+            }
+        if isinstance(node, ast.Tuple):
+            return {
+                "op": "tuple",
+                "items": [self.parse_expression(item, entrypoint_args) for item in node.elts],
+            }
+        if isinstance(node, ast.Set):
+            return {
+                "op": "set",
+                "items": [self.parse_expression(item, entrypoint_args) for item in node.elts],
+            }
+        if isinstance(node, ast.Dict):
+            entries: list[list[dict[str, Any]]] = []
+            for key_node, value_node in zip(node.keys, node.values):
+                if key_node is None:
+                    raise DiscoveryError(f"dictionary unpacking is unsupported at line {line_no}")
+                entries.append(
+                    [
+                        self.parse_expression(key_node, entrypoint_args),
+                        self.parse_expression(value_node, entrypoint_args),
+                    ]
+                )
+            return {"op": "dict", "entries": entries}
+        if isinstance(node, ast.UnaryOp) and type(node.op) in UNARY_OPERATORS:
+            return {
+                "op": "unary",
+                "operator": UNARY_OPERATORS[type(node.op)],
+                "operand": self.parse_expression(node.operand, entrypoint_args),
+            }
+        if isinstance(node, ast.BinOp) and type(node.op) in BINARY_OPERATORS:
+            return {
+                "op": "binary",
+                "operator": BINARY_OPERATORS[type(node.op)],
+                "left": self.parse_expression(node.left, entrypoint_args),
+                "right": self.parse_expression(node.right, entrypoint_args),
+            }
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or len(node.comparators) != 1:
+                raise DiscoveryError(f"unsupported comparison at line {line_no}")
+            operator = node.ops[0]
+            if type(operator) not in COMPARE_OPERATORS:
+                raise DiscoveryError(f"unsupported comparison operator at line {line_no}")
+            return {
+                "op": "compare",
+                "operator": COMPARE_OPERATORS[type(operator)],
+                "left": self.parse_expression(node.left, entrypoint_args),
+                "right": self.parse_expression(node.comparators[0], entrypoint_args),
+            }
+        if isinstance(node, ast.Subscript):
+            return self.parse_subscript_expression(node, entrypoint_args)
+        if isinstance(node, ast.Call):
+            return self.parse_call_expression(node, entrypoint_args)
+        raise DiscoveryError(f"unsupported expression at line {line_no}")
+
+    def parse_call_expression(
+        self,
+        node: ast.Call,
+        entrypoint_args: list[list[Any]],
+    ) -> dict[str, Any]:
+        line_no = getattr(node, "lineno", 0)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == self.entrypoint
+        ):
+            if node.keywords:
+                raise DiscoveryError(f"keyword arguments are unsupported at line {line_no}")
+            if entrypoint_args:
+                raise DiscoveryError(
+                    f"assertion must call {self.entrypoint} exactly once at line {line_no}"
+                )
+            entrypoint_args.append([self.parse_value(arg) for arg in node.args])
+            return result_expr()
+
+        if isinstance(node.func, ast.Name) and node.func.id in PRIMITIVE_FUNCTIONS:
+            if node.keywords:
+                raise DiscoveryError(f"primitive call keywords are unsupported at line {line_no}")
+            self.validate_primitive_call(node.func.id, len(node.args), line_no)
+            return {
+                "op": "call",
+                "name": node.func.id,
+                "args": [self.parse_expression(arg, entrypoint_args) for arg in node.args],
+            }
+
+        if isinstance(node.func, ast.Attribute) and node.func.attr in STRING_METHODS:
+            if node.keywords:
+                raise DiscoveryError(f"method call keywords are unsupported at line {line_no}")
+            self.validate_string_method_call(node.func.attr, len(node.args), line_no)
+            return {
+                "op": "method",
+                "name": node.func.attr,
+                "receiver": self.parse_expression(node.func.value, entrypoint_args),
+                "args": [self.parse_expression(arg, entrypoint_args) for arg in node.args],
+            }
+
+        raise DiscoveryError(f"unsupported function call at line {line_no}")
+
+    def validate_primitive_call(self, name: str, argc: int, line_no: int) -> None:
+        single_arg = {
+            "abs",
+            "bool",
+            "float",
+            "frozenset",
+            "int",
+            "len",
+            "list",
+            "set",
+            "sorted",
+            "str",
+            "sum",
+            "tuple",
+        }
+        if name in single_arg and argc != 1:
+            raise DiscoveryError(f"{name} requires one argument at line {line_no}")
+        if name in {"min", "max"} and argc < 1:
+            raise DiscoveryError(f"{name} requires at least one argument at line {line_no}")
+
+    def validate_string_method_call(self, name: str, argc: int, line_no: int) -> None:
+        if name in {"upper", "lower"} and argc != 0:
+            raise DiscoveryError(f"{name} takes no arguments at line {line_no}")
+        if name in {"strip", "lstrip", "rstrip"} and argc not in {0, 1}:
+            raise DiscoveryError(f"unsupported {name} arguments at line {line_no}")
+        if name in {"startswith", "endswith", "count", "find"} and argc != 1:
+            raise DiscoveryError(f"{name} requires one argument at line {line_no}")
+        if name == "replace" and argc != 2:
+            raise DiscoveryError(f"replace requires two arguments at line {line_no}")
+        if name == "split" and argc not in {0, 1, 2}:
+            raise DiscoveryError(f"unsupported split arguments at line {line_no}")
+        if name == "join" and argc != 1:
+            raise DiscoveryError(f"join requires one argument at line {line_no}")
+
+    def parse_subscript_expression(
+        self,
+        node: ast.Subscript,
+        entrypoint_args: list[list[Any]],
+    ) -> dict[str, Any]:
+        value = self.parse_expression(node.value, entrypoint_args)
+        if isinstance(node.slice, ast.Slice):
+            return {
+                "op": "slice",
+                "value": value,
+                "lower": self.parse_expression(node.slice.lower, entrypoint_args)
+                if node.slice.lower is not None
+                else None,
+                "upper": self.parse_expression(node.slice.upper, entrypoint_args)
+                if node.slice.upper is not None
+                else None,
+                "step": self.parse_expression(node.slice.step, entrypoint_args)
+                if node.slice.step is not None
+                else None,
+            }
+        return {
+            "op": "subscript",
+            "value": value,
+            "index": self.parse_expression(node.slice, entrypoint_args),
+        }
+
     def parse_value(self, node: ast.AST) -> Any:
         line_no = getattr(node, "lineno", 0)
         if isinstance(node, ast.Constant):
@@ -655,6 +936,7 @@ class TestDiscoverer:
         args: list[Any],
         expected: Any = None,
         *,
+        actual_expr: dict[str, Any] | None = None,
         comparison: str = "standard",
         abs_tol: Any = None,
         rel_tol: Any = None,
@@ -668,6 +950,7 @@ class TestDiscoverer:
                 line=line_no,
                 kind=kind,
                 args=args,
+                actual_expr=result_expr() if actual_expr is None else actual_expr,
                 expected=expected,
                 comparison=comparison,
                 abs_tol=abs_tol,
@@ -720,6 +1003,7 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
                 line=test.line,
                 kind=test.kind,
                 args=test.args,
+                actual_expr=test.actual_expr,
                 expected=test.expected,
                 comparison=test.comparison,
                 abs_tol=test.abs_tol,
@@ -804,12 +1088,79 @@ def encode_optional_value(value: Any) -> dict[str, Any] | None:
     return None if value is None else encode_value(value)
 
 
+def encode_expr(expr: dict[str, Any]) -> dict[str, Any]:
+    op = expr["op"]
+    if op == "value":
+        return {"op": "value", "value": encode_value(expr["value"])}
+    if op == "result":
+        return {"op": "result"}
+    if op in {"list", "tuple", "set"}:
+        return {"op": op, "items": [encode_expr(item) for item in expr["items"]]}
+    if op == "dict":
+        return {
+            "op": "dict",
+            "entries": [
+                [encode_expr(key), encode_expr(value)]
+                for key, value in expr["entries"]
+            ],
+        }
+    if op == "unary":
+        return {
+            "op": "unary",
+            "operator": expr["operator"],
+            "operand": encode_expr(expr["operand"]),
+        }
+    if op == "binary":
+        return {
+            "op": "binary",
+            "operator": expr["operator"],
+            "left": encode_expr(expr["left"]),
+            "right": encode_expr(expr["right"]),
+        }
+    if op == "compare":
+        return {
+            "op": "compare",
+            "operator": expr["operator"],
+            "left": encode_expr(expr["left"]),
+            "right": encode_expr(expr["right"]),
+        }
+    if op == "call":
+        return {
+            "op": "call",
+            "name": expr["name"],
+            "args": [encode_expr(arg) for arg in expr["args"]],
+        }
+    if op == "method":
+        return {
+            "op": "method",
+            "name": expr["name"],
+            "receiver": encode_expr(expr["receiver"]),
+            "args": [encode_expr(arg) for arg in expr["args"]],
+        }
+    if op == "subscript":
+        return {
+            "op": "subscript",
+            "value": encode_expr(expr["value"]),
+            "index": encode_expr(expr["index"]),
+        }
+    if op == "slice":
+        return {
+            "op": "slice",
+            "value": encode_expr(expr["value"]),
+            "lower": encode_expr(expr["lower"]) if expr["lower"] is not None else None,
+            "upper": encode_expr(expr["upper"]) if expr["upper"] is not None else None,
+            "step": encode_expr(expr["step"]) if expr["step"] is not None else None,
+        }
+    raise DiscoveryError(f"unsupported expression operation: {op}")
+
+
 def case_to_json(case: TestCase, default_abs_tol: float | None = None) -> dict[str, Any]:
     return {
         "id": case.id,
         "kind": case.kind,
         "comparison": case.comparison,
         "args": [encode_value(arg) for arg in case.args],
+        "actual_expr": encode_expr(case.actual_expr),
         "expected": encode_optional_value(case.expected),
         "abs_tol": encode_optional_value(case.abs_tol),
         "rel_tol": encode_optional_value(case.rel_tol),
@@ -915,6 +1266,42 @@ def _decode_value(tag):
     raise ValueError("unsupported value tag")
 
 
+def _decode_expr(expr):
+    op = expr["op"]
+    if op == "value":
+        return {"op": "value", "value": _decode_value(expr["value"])}
+    if op == "result":
+        return {"op": "result"}
+    if op in {"list", "tuple", "set"}:
+        return {"op": op, "items": [_decode_expr(item) for item in expr["items"]]}
+    if op == "dict":
+        return {"op": "dict", "entries": [[_decode_expr(key), _decode_expr(value)] for key, value in expr["entries"]]}
+    if op == "unary":
+        return {"op": "unary", "operator": expr["operator"], "operand": _decode_expr(expr["operand"])}
+    if op in {"binary", "compare"}:
+        return {"op": op, "operator": expr["operator"], "left": _decode_expr(expr["left"]), "right": _decode_expr(expr["right"])}
+    if op == "call":
+        return {"op": "call", "name": expr["name"], "args": [_decode_expr(arg) for arg in expr["args"]]}
+    if op == "method":
+        return {
+            "op": "method",
+            "name": expr["name"],
+            "receiver": _decode_expr(expr["receiver"]),
+            "args": [_decode_expr(arg) for arg in expr["args"]],
+        }
+    if op == "subscript":
+        return {"op": "subscript", "value": _decode_expr(expr["value"]), "index": _decode_expr(expr["index"])}
+    if op == "slice":
+        return {
+            "op": "slice",
+            "value": _decode_expr(expr["value"]),
+            "lower": _decode_expr(expr["lower"]) if expr["lower"] is not None else None,
+            "upper": _decode_expr(expr["upper"]) if expr["upper"] is not None else None,
+            "step": _decode_expr(expr["step"]) if expr["step"] is not None else None,
+        }
+    raise ValueError("unsupported expression operation")
+
+
 def _defaultdict_factory(name):
     if name is None:
         return None
@@ -933,6 +1320,7 @@ def _defaultdict_factory(name):
 def _decode_case(case):
     decoded = dict(case)
     decoded["args"] = [_decode_value(item) for item in case["args"]]
+    decoded["actual_expr"] = _decode_expr(case.get("actual_expr") or {"op": "result"})
     decoded["expected"] = _decode_value(case["expected"])
     decoded["abs_tol"] = _decode_value(case["abs_tol"])
     decoded["rel_tol"] = _decode_value(case["rel_tol"])
@@ -1030,6 +1418,152 @@ def _deep_equal(left, right, abs_tol=None, rel_tol=None):
     return left == right
 
 
+def _contains(container, item):
+    try:
+        return item in container
+    except Exception:
+        return False
+
+
+def _eval_call(name, args):
+    if name == "abs":
+        return abs(args[0])
+    if name == "bool":
+        return bool(args[0])
+    if name == "float":
+        return float(args[0])
+    if name == "frozenset":
+        return frozenset(args[0])
+    if name == "int":
+        return int(args[0])
+    if name == "len":
+        return len(args[0])
+    if name == "list":
+        return list(args[0])
+    if name == "max":
+        return max(*args) if len(args) > 1 else max(args[0])
+    if name == "min":
+        return min(*args) if len(args) > 1 else min(args[0])
+    if name == "set":
+        return set(args[0])
+    if name == "sorted":
+        return sorted(args[0])
+    if name == "str":
+        return str(args[0])
+    if name == "sum":
+        return sum(args[0])
+    if name == "tuple":
+        return tuple(args[0])
+    raise ValueError("unsupported primitive call")
+
+
+def _eval_method(name, receiver, args):
+    if not isinstance(receiver, str):
+        raise ValueError("string method receiver must be a string")
+    if name == "upper":
+        return receiver.upper()
+    if name == "lower":
+        return receiver.lower()
+    if name == "strip":
+        return receiver.strip(*args)
+    if name == "lstrip":
+        return receiver.lstrip(*args)
+    if name == "rstrip":
+        return receiver.rstrip(*args)
+    if name == "startswith":
+        return receiver.startswith(args[0])
+    if name == "endswith":
+        return receiver.endswith(args[0])
+    if name == "replace":
+        return receiver.replace(args[0], args[1])
+    if name == "split":
+        return receiver.split(*args)
+    if name == "join":
+        return receiver.join(args[0])
+    if name == "count":
+        return receiver.count(args[0])
+    if name == "find":
+        return receiver.find(args[0])
+    raise ValueError("unsupported string method")
+
+
+def _eval_expr(expr, result):
+    op = expr["op"]
+    if op == "result":
+        return result
+    if op == "value":
+        return expr["value"]
+    if op == "list":
+        return [_eval_expr(item, result) for item in expr["items"]]
+    if op == "tuple":
+        return tuple(_eval_expr(item, result) for item in expr["items"])
+    if op == "set":
+        return set(_eval_expr(item, result) for item in expr["items"])
+    if op == "dict":
+        return {_eval_expr(key, result): _eval_expr(value, result) for key, value in expr["entries"]}
+    if op == "unary":
+        operand = _eval_expr(expr["operand"], result)
+        if expr["operator"] == "uadd":
+            return +operand
+        if expr["operator"] == "usub":
+            return -operand
+        if expr["operator"] == "not":
+            return not operand
+    if op == "binary":
+        left = _eval_expr(expr["left"], result)
+        right = _eval_expr(expr["right"], result)
+        operator = expr["operator"]
+        if operator == "add":
+            return left + right
+        if operator == "sub":
+            return left - right
+        if operator == "mult":
+            return left * right
+        if operator == "truediv":
+            return left / right
+        if operator == "floordiv":
+            return left // right
+        if operator == "mod":
+            return left % right
+        if operator == "pow":
+            return left ** right
+    if op == "compare":
+        left = _eval_expr(expr["left"], result)
+        right = _eval_expr(expr["right"], result)
+        operator = expr["operator"]
+        if operator == "eq":
+            return _deep_equal(left, right)
+        if operator == "ne":
+            return not _deep_equal(left, right)
+        if operator == "lt":
+            return left < right
+        if operator == "lte":
+            return left <= right
+        if operator == "gt":
+            return left > right
+        if operator == "gte":
+            return left >= right
+        if operator == "in":
+            return _contains(right, left)
+        if operator == "not_in":
+            return not _contains(right, left)
+    if op == "call":
+        return _eval_call(expr["name"], [_eval_expr(arg, result) for arg in expr["args"]])
+    if op == "method":
+        receiver = _eval_expr(expr["receiver"], result)
+        args = [_eval_expr(arg, result) for arg in expr["args"]]
+        return _eval_method(expr["name"], receiver, args)
+    if op == "subscript":
+        return _eval_expr(expr["value"], result)[_eval_expr(expr["index"], result)]
+    if op == "slice":
+        value = _eval_expr(expr["value"], result)
+        lower = _eval_expr(expr["lower"], result) if expr["lower"] is not None else None
+        upper = _eval_expr(expr["upper"], result) if expr["upper"] is not None else None
+        step = _eval_expr(expr["step"], result) if expr["step"] is not None else None
+        return value[slice(lower, upper, step)]
+    raise ValueError("unsupported expression operation")
+
+
 def _effective_abs_tol(case):
     return case["abs_tol"] if case["abs_tol"] is not None else case["default_abs_tol"]
 
@@ -1067,28 +1601,32 @@ def _matches(case, value, raised):
         return _exception_matches(case, raised)
     if raised is not None:
         return False
+    try:
+        actual = _eval_expr(case["actual_expr"], value)
+    except Exception:
+        return False
     if kind == "eq":
-        return _deep_equal(value, case["expected"], _effective_abs_tol(case), case["rel_tol"])
+        return _deep_equal(actual, case["expected"], _effective_abs_tol(case), case["rel_tol"])
     if kind == "ne":
-        return not _deep_equal(value, case["expected"], _effective_abs_tol(case), case["rel_tol"])
+        return not _deep_equal(actual, case["expected"], _effective_abs_tol(case), case["rel_tol"])
     if kind == "isclose":
-        return _numeric_close(value, case["expected"], case["abs_tol"], case["rel_tol"])
+        return _numeric_close(actual, case["expected"], case["abs_tol"], case["rel_tol"])
     if kind == "absdiff":
-        if not _is_numeric(value) or not _is_numeric(case["expected"]):
+        if not _is_numeric(actual) or not _is_numeric(case["expected"]):
             return False
-        if isinstance(value, Decimal) or isinstance(case["expected"], Decimal) or isinstance(case["abs_tol"], Decimal):
-            diff = abs(_to_decimal(value) - _to_decimal(case["expected"]))
+        if isinstance(actual, Decimal) or isinstance(case["expected"], Decimal) or isinstance(case["abs_tol"], Decimal):
+            diff = abs(_to_decimal(actual) - _to_decimal(case["expected"]))
             tolerance = _to_decimal(case["abs_tol"])
         else:
-            diff = abs(value - case["expected"])
+            diff = abs(actual - case["expected"])
             tolerance = case["abs_tol"]
         if case["comparison"] == "abs_lt":
             return diff < tolerance
         return diff <= tolerance
     if kind == "truthy":
-        return bool(value)
+        return bool(actual)
     if kind == "not":
-        return not bool(value)
+        return not bool(actual)
     return False
 
 
@@ -1303,10 +1841,51 @@ function decodeValue(tag) {
   throw new Error("unsupported value tag");
 }
 
+function decodeExpr(expr) {
+  if (expr.op === "value") {
+    return {...expr, value: decodeValue(expr.value)};
+  }
+  if (expr.op === "result") {
+    return {op: "result"};
+  }
+  if (expr.op === "list" || expr.op === "tuple" || expr.op === "set") {
+    return {...expr, items: expr.items.map((item) => decodeExpr(item))};
+  }
+  if (expr.op === "dict") {
+    return {...expr, entries: expr.entries.map(([key, value]) => [decodeExpr(key), decodeExpr(value)])};
+  }
+  if (expr.op === "unary") {
+    return {...expr, operand: decodeExpr(expr.operand)};
+  }
+  if (expr.op === "binary" || expr.op === "compare") {
+    return {...expr, left: decodeExpr(expr.left), right: decodeExpr(expr.right)};
+  }
+  if (expr.op === "call") {
+    return {...expr, args: expr.args.map((arg) => decodeExpr(arg))};
+  }
+  if (expr.op === "method") {
+    return {...expr, receiver: decodeExpr(expr.receiver), args: expr.args.map((arg) => decodeExpr(arg))};
+  }
+  if (expr.op === "subscript") {
+    return {...expr, value: decodeExpr(expr.value), index: decodeExpr(expr.index)};
+  }
+  if (expr.op === "slice") {
+    return {
+      ...expr,
+      value: decodeExpr(expr.value),
+      lower: expr.lower === null ? null : decodeExpr(expr.lower),
+      upper: expr.upper === null ? null : decodeExpr(expr.upper),
+      step: expr.step === null ? null : decodeExpr(expr.step),
+    };
+  }
+  throw new Error("unsupported expression operation");
+}
+
 function decodeCase(testCase) {
   return {
     ...testCase,
     args: testCase.args.map((item) => decodeValue(item)),
+    actual_expr: decodeExpr(testCase.actual_expr || {op: "result"}),
     expected: decodeValue(testCase.expected),
     abs_tol: decodeValue(testCase.abs_tol),
     rel_tol: decodeValue(testCase.rel_tol),
@@ -1441,6 +2020,408 @@ function pyTruthy(value) {
   return true;
 }
 
+function contains(container, item) {
+  if (typeof container === "string") {
+    return typeof item === "string" && container.includes(item);
+  }
+  if (Array.isArray(container)) {
+    return container.some((value) => deepEqual(value, item));
+  }
+  if (isSet(container)) {
+    return [...container.values()].some((value) => deepEqual(value, item));
+  }
+  if (isMap(container)) {
+    return [...container.keys()].some((key) => deepEqual(key, item));
+  }
+  if (isPlainObject(container)) {
+    return typeof item === "string" && Object.prototype.hasOwnProperty.call(container, item);
+  }
+  return false;
+}
+
+function lengthOf(value) {
+  if (typeof value === "string" || Array.isArray(value)) {
+    return value.length;
+  }
+  if (isSet(value) || isMap(value)) {
+    return value.size;
+  }
+  if (isPlainObject(value)) {
+    return Object.keys(value).length;
+  }
+  throw new Error("unsupported len target");
+}
+
+function iterableArray(value) {
+  if (typeof value === "string") {
+    return [...value];
+  }
+  if (Array.isArray(value)) {
+    return [...value];
+  }
+  if (isSet(value)) {
+    return [...value.values()];
+  }
+  if (isMap(value)) {
+    return [...value.keys()];
+  }
+  if (isPlainObject(value)) {
+    return Object.keys(value);
+  }
+  throw new Error("unsupported iterable target");
+}
+
+function comparePrimitive(left, right) {
+  if (typeof left === "number" && typeof right === "number") {
+    return left - right;
+  }
+  return String(left).localeCompare(String(right));
+}
+
+function repeatArray(items, count) {
+  const times = Math.trunc(Number(count));
+  if (!Number.isFinite(times) || times < 0) {
+    throw new Error("invalid repeat count");
+  }
+  const result = [];
+  for (let index = 0; index < times; index += 1) {
+    result.push(...items);
+  }
+  return result;
+}
+
+function binaryValue(operator, left, right) {
+  if (operator === "add") {
+    if (Array.isArray(left) && Array.isArray(right)) {
+      return left.concat(right);
+    }
+    return left + right;
+  }
+  if (operator === "sub") {
+    return left - right;
+  }
+  if (operator === "mult") {
+    if (Array.isArray(left) && typeof right === "number") {
+      return repeatArray(left, right);
+    }
+    if (typeof left === "number" && Array.isArray(right)) {
+      return repeatArray(right, left);
+    }
+    if (typeof left === "string" && typeof right === "number") {
+      return left.repeat(Math.trunc(right));
+    }
+    if (typeof left === "number" && typeof right === "string") {
+      return right.repeat(Math.trunc(left));
+    }
+    return left * right;
+  }
+  if (operator === "truediv") {
+    return left / right;
+  }
+  if (operator === "floordiv") {
+    return Math.floor(left / right);
+  }
+  if (operator === "mod") {
+    return left % right;
+  }
+  if (operator === "pow") {
+    return left ** right;
+  }
+  throw new Error("unsupported binary operator");
+}
+
+function callValue(name, args) {
+  if (name === "abs") {
+    return Math.abs(args[0]);
+  }
+  if (name === "bool") {
+    return pyTruthy(args[0]);
+  }
+  if (name === "float") {
+    const value = Number(args[0]);
+    if (Number.isNaN(value)) {
+      throw new Error("invalid float value");
+    }
+    return value;
+  }
+  if (name === "frozenset" || name === "set") {
+    return new Set(iterableArray(args[0]));
+  }
+  if (name === "int") {
+    const value = Number(args[0]);
+    if (Number.isNaN(value)) {
+      throw new Error("invalid int value");
+    }
+    return Math.trunc(value);
+  }
+  if (name === "len") {
+    return lengthOf(args[0]);
+  }
+  if (name === "list" || name === "tuple") {
+    return iterableArray(args[0]);
+  }
+  if (name === "max" || name === "min") {
+    const values = args.length === 1 ? iterableArray(args[0]) : args;
+    if (values.length === 0) {
+      throw new Error("empty sequence");
+    }
+    return values.reduce((best, item) => (
+      name === "max"
+        ? (comparePrimitive(item, best) > 0 ? item : best)
+        : (comparePrimitive(item, best) < 0 ? item : best)
+    ));
+  }
+  if (name === "sorted") {
+    return iterableArray(args[0]).sort(comparePrimitive);
+  }
+  if (name === "str") {
+    return String(args[0]);
+  }
+  if (name === "sum") {
+    return iterableArray(args[0]).reduce((total, item) => total + item, 0);
+  }
+  throw new Error("unsupported primitive call");
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripChars(value, chars, side) {
+  if (chars === undefined) {
+    if (side === "left") {
+      return value.replace(/^\s+/, "");
+    }
+    if (side === "right") {
+      return value.replace(/\s+$/, "");
+    }
+    return value.trim();
+  }
+  const pattern = `[${escapeRegex(chars)}]`;
+  if (side === "left") {
+    return value.replace(new RegExp(`^${pattern}+`), "");
+  }
+  if (side === "right") {
+    return value.replace(new RegExp(`${pattern}+$`), "");
+  }
+  return value.replace(new RegExp(`^${pattern}+|${pattern}+$`, "g"), "");
+}
+
+function splitMax(value, separator, maxSplit) {
+  if (maxSplit === undefined) {
+    return value.split(separator);
+  }
+  const limit = Math.trunc(Number(maxSplit));
+  if (limit < 0) {
+    return value.split(separator);
+  }
+  const parts = value.split(separator);
+  if (parts.length <= limit + 1) {
+    return parts;
+  }
+  return parts.slice(0, limit).concat(parts.slice(limit).join(separator));
+}
+
+function countSubstring(value, needle) {
+  if (needle === "") {
+    return value.length + 1;
+  }
+  let count = 0;
+  let index = 0;
+  while (true) {
+    const found = value.indexOf(needle, index);
+    if (found === -1) {
+      return count;
+    }
+    count += 1;
+    index = found + needle.length;
+  }
+}
+
+function methodValue(name, receiver, args) {
+  if (typeof receiver !== "string") {
+    throw new Error("string method receiver must be a string");
+  }
+  if (name === "upper") {
+    return receiver.toUpperCase();
+  }
+  if (name === "lower") {
+    return receiver.toLowerCase();
+  }
+  if (name === "strip") {
+    return stripChars(receiver, args[0], "both");
+  }
+  if (name === "lstrip") {
+    return stripChars(receiver, args[0], "left");
+  }
+  if (name === "rstrip") {
+    return stripChars(receiver, args[0], "right");
+  }
+  if (name === "startswith") {
+    return receiver.startsWith(args[0]);
+  }
+  if (name === "endswith") {
+    return receiver.endsWith(args[0]);
+  }
+  if (name === "replace") {
+    return receiver.split(args[0]).join(args[1]);
+  }
+  if (name === "split") {
+    if (args.length === 0) {
+      const trimmed = receiver.trim();
+      return trimmed === "" ? [] : trimmed.split(/\s+/);
+    }
+    return splitMax(receiver, args[0], args[1]);
+  }
+  if (name === "join") {
+    return iterableArray(args[0]).join(receiver);
+  }
+  if (name === "count") {
+    return countSubstring(receiver, args[0]);
+  }
+  if (name === "find") {
+    return receiver.indexOf(args[0]);
+  }
+  throw new Error("unsupported string method");
+}
+
+function subscriptValue(value, index) {
+  if (Array.isArray(value) || typeof value === "string") {
+    const numeric = Math.trunc(Number(index));
+    const resolved = numeric < 0 ? value.length + numeric : numeric;
+    return value[resolved];
+  }
+  if (isMap(value)) {
+    for (const [key, item] of value.entries()) {
+      if (deepEqual(key, index)) {
+        return item;
+      }
+    }
+    return undefined;
+  }
+  if (isPlainObject(value)) {
+    return value[index];
+  }
+  throw new Error("unsupported subscript target");
+}
+
+function sliceValue(value, lower, upper, step) {
+  const sequence = typeof value === "string" ? [...value] : iterableArray(value);
+  const actualStep = step === null ? 1 : Math.trunc(Number(step));
+  if (actualStep === 0) {
+    throw new Error("slice step cannot be zero");
+  }
+  if (actualStep === 1) {
+    const sliced = sequence.slice(lower === null ? undefined : lower, upper === null ? undefined : upper);
+    return typeof value === "string" ? sliced.join("") : sliced;
+  }
+  const result = [];
+  const length = sequence.length;
+  let start = lower === null ? (actualStep > 0 ? 0 : length - 1) : (lower < 0 ? length + lower : lower);
+  const stop = upper === null ? (actualStep > 0 ? length : -1) : (upper < 0 ? length + upper : upper);
+  if (actualStep > 0) {
+    for (let index = start; index < stop; index += actualStep) {
+      result.push(sequence[index]);
+    }
+  } else {
+    for (let index = start; index > stop; index += actualStep) {
+      result.push(sequence[index]);
+    }
+  }
+  return typeof value === "string" ? result.join("") : result;
+}
+
+function evalExpr(expr, result) {
+  if (expr.op === "result") {
+    return result;
+  }
+  if (expr.op === "value") {
+    return expr.value;
+  }
+  if (expr.op === "list" || expr.op === "tuple") {
+    return expr.items.map((item) => evalExpr(item, result));
+  }
+  if (expr.op === "set") {
+    return new Set(expr.items.map((item) => evalExpr(item, result)));
+  }
+  if (expr.op === "dict") {
+    const entries = expr.entries.map(([key, value]) => [evalExpr(key, result), evalExpr(value, result)]);
+    if (entries.every(([key]) => typeof key === "string")) {
+      const object = {};
+      for (const [key, value] of entries) {
+        object[key] = value;
+      }
+      return object;
+    }
+    return new Map(entries);
+  }
+  if (expr.op === "unary") {
+    const operand = evalExpr(expr.operand, result);
+    if (expr.operator === "uadd") {
+      return +operand;
+    }
+    if (expr.operator === "usub") {
+      return -operand;
+    }
+    if (expr.operator === "not") {
+      return !pyTruthy(operand);
+    }
+  }
+  if (expr.op === "binary") {
+    return binaryValue(expr.operator, evalExpr(expr.left, result), evalExpr(expr.right, result));
+  }
+  if (expr.op === "compare") {
+    const left = evalExpr(expr.left, result);
+    const right = evalExpr(expr.right, result);
+    if (expr.operator === "eq") {
+      return deepEqual(left, right);
+    }
+    if (expr.operator === "ne") {
+      return !deepEqual(left, right);
+    }
+    if (expr.operator === "lt") {
+      return left < right;
+    }
+    if (expr.operator === "lte") {
+      return left <= right;
+    }
+    if (expr.operator === "gt") {
+      return left > right;
+    }
+    if (expr.operator === "gte") {
+      return left >= right;
+    }
+    if (expr.operator === "in") {
+      return contains(right, left);
+    }
+    if (expr.operator === "not_in") {
+      return !contains(right, left);
+    }
+  }
+  if (expr.op === "call") {
+    return callValue(expr.name, expr.args.map((arg) => evalExpr(arg, result)));
+  }
+  if (expr.op === "method") {
+    return methodValue(
+      expr.name,
+      evalExpr(expr.receiver, result),
+      expr.args.map((arg) => evalExpr(arg, result)),
+    );
+  }
+  if (expr.op === "subscript") {
+    return subscriptValue(evalExpr(expr.value, result), evalExpr(expr.index, result));
+  }
+  if (expr.op === "slice") {
+    return sliceValue(
+      evalExpr(expr.value, result),
+      expr.lower === null ? null : evalExpr(expr.lower, result),
+      expr.upper === null ? null : evalExpr(expr.upper, result),
+      expr.step === null ? null : evalExpr(expr.step, result),
+    );
+  }
+  throw new Error("unsupported expression operation");
+}
+
 function exceptionName(error) {
   if (error && typeof error === "object") {
     return error.name || (error.constructor && error.constructor.name) || "";
@@ -1489,30 +2470,36 @@ function assertionMatches(testCase, callResult) {
   if (callResult.raised) {
     return false;
   }
+  let actual;
+  try {
+    actual = evalExpr(testCase.actual_expr, callResult.value);
+  } catch (_) {
+    return false;
+  }
   if (testCase.kind === "eq") {
-    return deepEqual(callResult.value, testCase.expected, effectiveAbsTol(testCase), testCase.rel_tol);
+    return deepEqual(actual, testCase.expected, effectiveAbsTol(testCase), testCase.rel_tol);
   }
   if (testCase.kind === "ne") {
-    return !deepEqual(callResult.value, testCase.expected, effectiveAbsTol(testCase), testCase.rel_tol);
+    return !deepEqual(actual, testCase.expected, effectiveAbsTol(testCase), testCase.rel_tol);
   }
   if (testCase.kind === "isclose") {
-    return numericClose(callResult.value, testCase.expected, testCase.abs_tol, testCase.rel_tol);
+    return numericClose(actual, testCase.expected, testCase.abs_tol, testCase.rel_tol);
   }
   if (testCase.kind === "absdiff") {
-    if (!isNumeric(callResult.value) || !isNumeric(testCase.expected)) {
+    if (!isNumeric(actual) || !isNumeric(testCase.expected)) {
       return false;
     }
-    const diff = Math.abs(callResult.value - testCase.expected);
+    const diff = Math.abs(actual - testCase.expected);
     if (testCase.comparison === "abs_lt") {
       return diff < testCase.abs_tol;
     }
     return diff <= testCase.abs_tol;
   }
   if (testCase.kind === "truthy") {
-    return pyTruthy(callResult.value);
+    return pyTruthy(actual);
   }
   if (testCase.kind === "not") {
-    return !pyTruthy(callResult.value);
+    return !pyTruthy(actual);
   }
   return false;
 }
