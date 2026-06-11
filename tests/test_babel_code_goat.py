@@ -947,6 +947,206 @@ class BabelCodeGoatTests(unittest.TestCase):
                 {"status": "fail", "passed": [], "failed": ["tests.py:1", "tests.py:2"]},
             )
 
+    def test_profile_preconditions_and_invalid_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+            solution = root / "solution.py"
+            write(solution, "def solve(value):\n    return value + 1\n")
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+            self.assertFalse((tests_dir / "tester.py").exists())
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "ruby")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+            tester = tests_dir / "tester.py"
+            before = tester.read_text(encoding="utf-8")
+            invalid_args = [
+                ("-n", "0"),
+                ("-n", "nope"),
+                ("--warmup", "1"),
+                ("-n", "2", "--warmup", "2"),
+                ("--warmup", "-1"),
+                ("--timeout-ms", "0"),
+                ("--tol", "nope"),
+            ]
+            for args in invalid_args:
+                with self.subTest(args=args):
+                    proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", *args)
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+                    self.assertEqual(tester.read_text(encoding="utf-8"), before)
+
+    def test_profile_success_failure_and_memory_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve(1) == 2
+                assert solve(2) == 3
+                """,
+            )
+            solution = root / "solution.py"
+            write(solution, "def solve(value):\n    return value + 1\n")
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertEqual(set(result), {"status", "passed", "failed", "runtime_ns"})
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["passed"], ["tests.py:1", "tests.py:2"])
+            self.assertEqual(result["failed"], [])
+            self.assertIsInstance(result["runtime_ns"]["mean"], (int, float))
+            self.assertEqual(result["runtime_ns"]["std"], 0)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--memory")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertIn("memory_kb", result)
+            self.assertIsInstance(result["memory_kb"]["mean"], (int, float))
+            self.assertIsInstance(result["memory_kb"]["std"], (int, float))
+
+            write(solution, "def solve(value):\n    return value\n")
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python")
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["passed"], [])
+            self.assertEqual(result["failed"], ["tests.py:1", "tests.py:2"])
+            self.assertIsInstance(result["runtime_ns"]["mean"], (int, float))
+
+    def test_profile_aggregation_excludes_warmups_from_stats(self) -> None:
+        cases = [bcg.TestCase(id="tests.py:1", line=1, source_path="tests.py", kind="eq")]
+        trial_results = iter(
+            [
+                bcg.ProfileTrialResult(passed=[], failed=["tests.py:1"], memory_kb=10),
+                bcg.ProfileTrialResult(passed=["tests.py:1"], failed=[], memory_kb=20),
+                bcg.ProfileTrialResult(passed=["tests.py:1"], failed=[], memory_kb=30),
+            ]
+        )
+        clock_values = iter([0, 100, 1000, 1300, 2000, 2500])
+
+        def fake_trial_executor(*_args: object) -> bcg.ProfileTrialResult:
+            return next(trial_results)
+
+        result = bcg.aggregate_profile_results(
+            Path("solution.py"),
+            "python",
+            "solve",
+            cases,
+            None,
+            bcg.TestExecutionOptions(),
+            bcg.ProfileExecutionOptions(trials=3, warmup=1, memory=True),
+            trial_executor=fake_trial_executor,
+            clock_ns=lambda: next(clock_values),
+        )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["passed"], [])
+        self.assertEqual(result["failed"], ["tests.py:1"])
+        self.assertEqual(result["runtime_ns"], {"mean": 400, "std": 100.0})
+        self.assertEqual(result["memory_kb"], {"mean": 25, "std": 5.0})
+
+    def test_profile_list_run_timeout_and_tolerance_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve(1) == 2
+                assert solve(2) == 4
+                """,
+            )
+            solution = root / "solution.py"
+            write(solution, "raise RuntimeError('solution should not load')\n")
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--list-tests")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                self.json_stdout(proc),
+                {"status": "pass", "passed": ["tests.py:1", "tests.py:2"], "failed": []},
+            )
+
+            write(solution, "def solve(value):\n    return value + 1\n")
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--run", "tests.py:2")
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["passed"], [])
+            self.assertEqual(result["failed"], ["tests.py:2"])
+            self.assertIn("runtime_ns", result)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--run", "tests.py:99")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve("fast") == "fast"
+                assert solve("slow") == "slow"
+                assert solve("later") == "later"
+                """,
+            )
+            write(
+                solution,
+                """
+                import time
+
+                def solve(value):
+                    if value == "slow":
+                        time.sleep(0.6)
+                    return value
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--timeout-ms", "300")
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["passed"], ["tests.py:1", "tests.py:3"])
+            self.assertEqual(result["failed"], ["tests.py:2"])
+            self.assertIsInstance(result["runtime_ns"]["mean"], (int, float))
+
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve("slow") == "slow"
+                assert solve("later") == "later"
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "--total-timeout-ms",
+                "100",
+            )
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["passed"], [])
+            self.assertEqual(result["failed"], ["tests.py:1", "tests.py:2"])
+
+            write(tests_dir / "tests.py", "assert solve(1) == 1.005\n")
+            write(solution, "def solve(value):\n    return 1.0\n")
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--tol", "0.01")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
     def test_python_async_entrypoint_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
