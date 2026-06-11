@@ -9,6 +9,7 @@ import inspect
 import io
 import json
 import keyword
+import math
 import os
 import re
 import runpy
@@ -17,9 +18,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,12 @@ METADATA_MARKER = "BABEL_CODE_GOAT_METADATA:"
 METADATA_VERSION = 1
 ERROR_RESULT = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"#\s*(expect_stdout|expect_stderr):\s*(.+)\s*$")
+MATH_ISCLOSE_REL_TOL = 1e-09
+MATH_ISCLOSE_ABS_TOL = 0.0
+HELPER_MODULES = {"math", "re", "collections", "decimal"}
+COLLECTION_CONSTRUCTORS = {"Counter", "deque", "defaultdict"}
+DECIMAL_CONSTRUCTORS = {"Decimal"}
+DEFAULTDICT_FACTORIES = {"None", "bool", "dict", "float", "int", "list", "set", "str", "tuple"}
 
 
 class DiscoveryError(Exception):
@@ -49,6 +57,12 @@ class PendingTest:
     kind: str
     args: list[Any]
     expected: Any = None
+    comparison: str = "standard"
+    abs_tol: Any = None
+    rel_tol: Any = None
+    exception_type: str | None = None
+    message_match: str | None = None
+    message_pattern: str | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
 
@@ -60,6 +74,12 @@ class TestCase:
     kind: str
     args: list[Any]
     expected: Any = None
+    comparison: str = "standard"
+    abs_tol: Any = None
+    rel_tol: Any = None
+    exception_type: str | None = None
+    message_match: str | None = None
+    message_pattern: str | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
 
@@ -90,6 +110,18 @@ def status_exit_code(status: str) -> int:
 
 def error_result() -> dict[str, Any]:
     return {"status": "error", "passed": [], "failed": []}
+
+
+def parse_default_tolerance(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise DiscoveryError("invalid tolerance") from exc
+    if value < 0 or not math.isfinite(value):
+        raise DiscoveryError("invalid tolerance")
+    return value
 
 
 def render_tester(lang: str, entrypoint: str) -> str:
@@ -149,31 +181,64 @@ def read_tester_metadata(path: Path) -> dict[str, Any]:
     raise MetadataError("metadata marker not found")
 
 
-def validate_value(value: Any) -> Any:
+def is_supported_scalar(value: Any) -> bool:
     if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float, str)) and not isinstance(value, bool):
-        return value
-    if isinstance(value, list):
-        return [validate_value(item) for item in value]
+        return True
+    return isinstance(value, (int, float, str, Decimal)) and not isinstance(value, bool)
+
+
+def is_hashable_supported(value: Any) -> bool:
+    if is_supported_scalar(value):
+        return True
     if isinstance(value, tuple):
-        return tuple(validate_value(item) for item in value)
-    if isinstance(value, dict):
-        validated: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise DiscoveryError("dictionary keys must be strings")
-            validated[key] = validate_value(item)
-        return validated
-    raise DiscoveryError(f"unsupported literal value: {value!r}")
+        return all(is_hashable_supported(item) for item in value)
+    if isinstance(value, frozenset):
+        return all(is_hashable_supported(item) for item in value)
+    return False
 
 
-def parse_literal(node: ast.AST) -> Any:
-    try:
-        value = ast.literal_eval(node)
-    except (ValueError, TypeError, SyntaxError) as exc:
-        raise DiscoveryError("unsupported non-literal value") from exc
-    return validate_value(value)
+def require_hashable_key(value: Any, line_no: int) -> Any:
+    if not is_hashable_supported(value):
+        raise DiscoveryError(f"unsupported dictionary key at line {line_no}")
+    return value
+
+
+def parse_decimal_value(value: Any, line_no: int) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool) or value is None:
+        raise DiscoveryError(f"unsupported Decimal value at line {line_no}")
+    if isinstance(value, (int, float, str)):
+        try:
+            return Decimal(str(value))
+        except InvalidOperation as exc:
+            raise DiscoveryError(f"invalid Decimal value at line {line_no}") from exc
+    raise DiscoveryError(f"unsupported Decimal value at line {line_no}")
+
+
+def as_iterable_items(value: Any, line_no: int, constructor: str) -> list[Any]:
+    if isinstance(value, (list, tuple, set, frozenset, deque)):
+        return list(value)
+    if isinstance(value, str):
+        return list(value)
+    raise DiscoveryError(f"{constructor} requires a supported iterable at line {line_no}")
+
+
+def default_factory_from_name(name: str, line_no: int) -> Any:
+    if name not in DEFAULTDICT_FACTORIES:
+        raise DiscoveryError(f"unsupported defaultdict factory at line {line_no}")
+    if name == "None":
+        return None
+    return {
+        "bool": bool,
+        "dict": dict,
+        "float": float,
+        "int": int,
+        "list": list,
+        "set": set,
+        "str": str,
+        "tuple": tuple,
+    }[name]
 
 
 def parse_expectation_value(raw: str, line_no: int) -> str:
@@ -190,16 +255,22 @@ class TestDiscoverer:
     def __init__(self, entrypoint: str, source_lines: list[str]) -> None:
         self.entrypoint = entrypoint
         self.source_lines = source_lines
+        self.module_aliases: dict[str, str] = {}
+        self.constructor_aliases: dict[str, str] = {}
         self.pending: list[PendingTest] = []
 
     def discover(self, tree: ast.Module) -> list[TestCase]:
+        self.collect_imports(tree.body)
         self.visit_body(tree.body)
         return assign_test_ids(self.pending)
 
     def visit_body(self, body: list[ast.stmt]) -> None:
+        self.collect_imports(body)
         for stmt in body:
             if isinstance(stmt, ast.FunctionDef):
                 self.visit_function(stmt)
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                continue
             elif isinstance(stmt, ast.Assert):
                 self.visit_assert(stmt)
             elif isinstance(stmt, ast.Try):
@@ -212,7 +283,40 @@ class TestDiscoverer:
     def visit_function(self, stmt: ast.FunctionDef) -> None:
         if stmt.decorator_list:
             raise DiscoveryError(f"decorators are unsupported at line {stmt.lineno}")
-        self.visit_body(stmt.body)
+        module_aliases = self.module_aliases.copy()
+        constructor_aliases = self.constructor_aliases.copy()
+        try:
+            self.visit_body(stmt.body)
+        finally:
+            self.module_aliases = module_aliases
+            self.constructor_aliases = constructor_aliases
+
+    def collect_imports(self, body: list[ast.stmt]) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.Import):
+                self.visit_import(stmt)
+            elif isinstance(stmt, ast.ImportFrom):
+                self.visit_import_from(stmt)
+
+    def visit_import(self, stmt: ast.Import) -> None:
+        for alias in stmt.names:
+            if alias.name not in HELPER_MODULES:
+                raise DiscoveryError(f"unsupported import at line {stmt.lineno}")
+            self.module_aliases[alias.asname or alias.name] = alias.name
+
+    def visit_import_from(self, stmt: ast.ImportFrom) -> None:
+        if stmt.level != 0:
+            raise DiscoveryError(f"unsupported import at line {stmt.lineno}")
+        if stmt.module == "collections":
+            allowed = COLLECTION_CONSTRUCTORS
+        elif stmt.module == "decimal":
+            allowed = DECIMAL_CONSTRUCTORS
+        else:
+            raise DiscoveryError(f"unsupported import at line {stmt.lineno}")
+        for alias in stmt.names:
+            if alias.name == "*" or alias.name not in allowed:
+                raise DiscoveryError(f"unsupported import at line {stmt.lineno}")
+            self.constructor_aliases[alias.asname or alias.name] = alias.name
 
     def visit_assert(self, stmt: ast.Assert) -> None:
         if stmt.msg is not None:
@@ -220,10 +324,12 @@ class TestDiscoverer:
 
         test = stmt.test
         if isinstance(test, ast.Compare):
+            if self.visit_absdiff_assert(stmt, test):
+                return
             if len(test.ops) != 1 or len(test.comparators) != 1:
                 raise DiscoveryError(f"unsupported comparison at line {stmt.lineno}")
             args = self.parse_entrypoint_call(test.left, stmt.lineno)
-            expected = parse_literal(test.comparators[0])
+            expected = self.parse_value(test.comparators[0])
             if isinstance(test.ops[0], ast.Eq):
                 self.add_test(stmt.lineno, "eq", args, expected)
                 return
@@ -238,11 +344,73 @@ class TestDiscoverer:
             return
 
         if isinstance(test, ast.Call):
+            if self.call_name(test.func) == "math.isclose":
+                self.visit_isclose_assert(stmt, test)
+                return
             args = self.parse_entrypoint_call(test, stmt.lineno)
             self.add_test(stmt.lineno, "truthy", args)
             return
 
         raise DiscoveryError(f"unsupported assertion at line {stmt.lineno}")
+
+    def visit_isclose_assert(self, stmt: ast.Assert, call: ast.Call) -> None:
+        if len(call.args) != 2:
+            raise DiscoveryError(f"math.isclose requires two operands at line {stmt.lineno}")
+        args, expected = self.parse_entrypoint_expected_pair(call.args[0], call.args[1], stmt.lineno)
+        abs_tol: Any = MATH_ISCLOSE_ABS_TOL
+        rel_tol: Any = MATH_ISCLOSE_REL_TOL
+        seen: set[str] = set()
+        for keyword_arg in call.keywords:
+            if keyword_arg.arg not in {"abs_tol", "rel_tol"} or keyword_arg.arg in seen:
+                raise DiscoveryError(f"unsupported math.isclose keyword at line {stmt.lineno}")
+            seen.add(keyword_arg.arg)
+            value = self.parse_numeric_value(keyword_arg.value)
+            if value < 0:
+                raise DiscoveryError(f"negative tolerance at line {stmt.lineno}")
+            if keyword_arg.arg == "abs_tol":
+                abs_tol = value
+            else:
+                rel_tol = value
+        self.add_test(
+            stmt.lineno,
+            "isclose",
+            args,
+            expected,
+            comparison="isclose",
+            abs_tol=abs_tol,
+            rel_tol=rel_tol,
+        )
+
+    def visit_absdiff_assert(self, stmt: ast.Assert, test: ast.Compare) -> bool:
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            return False
+        operator = test.ops[0]
+        if not isinstance(operator, (ast.Lt, ast.LtE)):
+            return False
+        if not (
+            isinstance(test.left, ast.Call)
+            and isinstance(test.left.func, ast.Name)
+            and test.left.func.id == "abs"
+            and len(test.left.args) == 1
+            and not test.left.keywords
+            and isinstance(test.left.args[0], ast.BinOp)
+            and isinstance(test.left.args[0].op, ast.Sub)
+        ):
+            return False
+        difference = test.left.args[0]
+        args, expected = self.parse_entrypoint_expected_pair(difference.left, difference.right, stmt.lineno)
+        abs_tol = self.parse_numeric_value(test.comparators[0])
+        if abs_tol < 0:
+            raise DiscoveryError(f"negative tolerance at line {stmt.lineno}")
+        self.add_test(
+            stmt.lineno,
+            "absdiff",
+            args,
+            expected,
+            comparison="abs_le" if isinstance(operator, ast.LtE) else "abs_lt",
+            abs_tol=abs_tol,
+        )
+        return True
 
     def visit_raise_expectation(self, stmt: ast.Try) -> None:
         if stmt.orelse or stmt.finalbody:
@@ -268,25 +436,217 @@ class TestDiscoverer:
         if len(stmt.handlers) != 1:
             raise DiscoveryError(f"raise expectation needs one handler at line {stmt.lineno}")
         handler = stmt.handlers[0]
-        if not (
-            isinstance(handler.type, ast.Name)
-            and handler.type.id == "Exception"
-            and handler.name is None
-            and len(handler.body) == 1
-            and isinstance(handler.body[0], ast.Pass)
-        ):
-            raise DiscoveryError(f"raise expectation must catch Exception and pass at line {stmt.lineno}")
+        if not isinstance(handler.type, ast.Name):
+            raise DiscoveryError(f"unsupported exception handler at line {stmt.lineno}")
 
-        self.add_test(stmt.lineno, "raises", args)
+        if handler.type.id == "Exception" and handler.name is None:
+            if len(handler.body) != 1 or not isinstance(handler.body[0], ast.Pass):
+                raise DiscoveryError(f"raise expectation must catch Exception and pass at line {stmt.lineno}")
+            self.add_test(stmt.lineno, "raises", args)
+            return
+
+        message_match, message_pattern = self.parse_exception_message_match(handler, stmt.lineno)
+        self.add_test(
+            stmt.lineno,
+            "raises",
+            args,
+            comparison="exception",
+            exception_type=handler.type.id,
+            message_match=message_match,
+            message_pattern=message_pattern,
+        )
+
+    def parse_exception_message_match(
+        self,
+        handler: ast.ExceptHandler,
+        line_no: int,
+    ) -> tuple[str | None, str | None]:
+        if len(handler.body) == 1 and isinstance(handler.body[0], ast.Pass):
+            return None, None
+        if handler.name is None:
+            raise DiscoveryError(f"exception message checks require a bound name at line {line_no}")
+        if len(handler.body) != 1 or not isinstance(handler.body[0], ast.Assert):
+            raise DiscoveryError(f"unsupported exception handler body at line {line_no}")
+        assertion = handler.body[0]
+        if assertion.msg is not None:
+            raise DiscoveryError(f"assert messages are unsupported at line {assertion.lineno}")
+        test = assertion.test
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.In)
+            and len(test.comparators) == 1
+            and isinstance(test.left, ast.Constant)
+            and isinstance(test.left.value, str)
+            and self.is_str_call_for_name(test.comparators[0], handler.name)
+        ):
+            return "contains", test.left.value
+        if (
+            isinstance(test, ast.Call)
+            and self.call_name(test.func) == "re.search"
+            and len(test.args) == 2
+            and not test.keywords
+            and self.is_str_call_for_name(test.args[1], handler.name)
+        ):
+            pattern = self.parse_value(test.args[0])
+            if not isinstance(pattern, str):
+                raise DiscoveryError(f"regex pattern must be a string at line {assertion.lineno}")
+            return "regex", pattern
+        raise DiscoveryError(f"unsupported exception message check at line {line_no}")
 
     def parse_entrypoint_call(self, node: ast.AST, line_no: int) -> list[Any]:
-        if not isinstance(node, ast.Call):
-            raise DiscoveryError(f"expected entrypoint call at line {line_no}")
-        if not isinstance(node.func, ast.Name) or node.func.id != self.entrypoint:
+        args = self.maybe_parse_entrypoint_call(node, line_no)
+        if args is None:
             raise DiscoveryError(f"expected call to {self.entrypoint} at line {line_no}")
+        return args
+
+    def maybe_parse_entrypoint_call(self, node: ast.AST, line_no: int) -> list[Any] | None:
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == self.entrypoint
+        ):
+            return None
         if node.keywords:
             raise DiscoveryError(f"keyword arguments are unsupported at line {line_no}")
-        return [parse_literal(arg) for arg in node.args]
+        return [self.parse_value(arg) for arg in node.args]
+
+    def parse_entrypoint_expected_pair(
+        self,
+        left: ast.AST,
+        right: ast.AST,
+        line_no: int,
+    ) -> tuple[list[Any], Any]:
+        left_args = self.maybe_parse_entrypoint_call(left, line_no)
+        if left_args is not None:
+            return left_args, self.parse_value(right)
+        right_args = self.maybe_parse_entrypoint_call(right, line_no)
+        if right_args is not None:
+            return right_args, self.parse_value(left)
+        raise DiscoveryError(f"expected one operand to call {self.entrypoint} at line {line_no}")
+
+    def parse_value(self, node: ast.AST) -> Any:
+        line_no = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant):
+            if is_supported_scalar(node.value):
+                return node.value
+            raise DiscoveryError(f"unsupported literal value at line {line_no}")
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = self.parse_value(node.operand)
+            if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+                raise DiscoveryError(f"unsupported unary value at line {line_no}")
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.List):
+            return [self.parse_value(item) for item in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(self.parse_value(item) for item in node.elts)
+        if isinstance(node, ast.Set):
+            return set(require_hashable_key(self.parse_value(item), line_no) for item in node.elts)
+        if isinstance(node, ast.Dict):
+            result: dict[Any, Any] = {}
+            for key_node, value_node in zip(node.keys, node.values):
+                if key_node is None:
+                    raise DiscoveryError(f"dictionary unpacking is unsupported at line {line_no}")
+                key = require_hashable_key(self.parse_value(key_node), line_no)
+                result[key] = self.parse_value(value_node)
+            return result
+        if isinstance(node, ast.Call):
+            return self.parse_constructor_call(node)
+        raise DiscoveryError(f"unsupported value expression at line {line_no}")
+
+    def parse_numeric_value(self, node: ast.AST) -> Any:
+        value = self.parse_value(node)
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise DiscoveryError(f"expected numeric value at line {getattr(node, 'lineno', '?')}")
+        return value
+
+    def parse_constructor_call(self, node: ast.Call) -> Any:
+        line_no = getattr(node, "lineno", 0)
+        name = self.call_name(node.func)
+        if name is None:
+            raise DiscoveryError(f"unsupported constructor at line {line_no}")
+        if node.keywords:
+            raise DiscoveryError(f"constructor keywords are unsupported at line {line_no}")
+
+        if name in {"set", "frozenset"}:
+            if len(node.args) > 1:
+                raise DiscoveryError(f"{name} accepts at most one argument at line {line_no}")
+            items = [] if not node.args else as_iterable_items(self.parse_value(node.args[0]), line_no, name)
+            values = [require_hashable_key(item, line_no) for item in items]
+            return set(values) if name == "set" else frozenset(values)
+
+        if name == "Counter":
+            if len(node.args) > 1:
+                raise DiscoveryError(f"Counter accepts at most one argument at line {line_no}")
+            if not node.args:
+                return Counter()
+            seed = self.parse_value(node.args[0])
+            if isinstance(seed, (dict, defaultdict, Counter)):
+                return Counter(dict(seed))
+            return Counter(as_iterable_items(seed, line_no, "Counter"))
+
+        if name == "deque":
+            if len(node.args) > 1:
+                raise DiscoveryError(f"deque accepts at most one argument at line {line_no}")
+            items = [] if not node.args else as_iterable_items(self.parse_value(node.args[0]), line_no, "deque")
+            return deque(items)
+
+        if name == "defaultdict":
+            if len(node.args) > 2:
+                raise DiscoveryError(f"defaultdict accepts at most two arguments at line {line_no}")
+            factory = None
+            mapping: dict[Any, Any] = {}
+            if node.args:
+                factory = self.parse_defaultdict_factory(node.args[0])
+            if len(node.args) == 2:
+                seed = self.parse_value(node.args[1])
+                if not isinstance(seed, (dict, defaultdict, Counter)):
+                    raise DiscoveryError(f"defaultdict mapping must be a dictionary at line {line_no}")
+                mapping = dict(seed)
+            return defaultdict(factory, mapping)
+
+        if name == "Decimal":
+            if len(node.args) != 1:
+                raise DiscoveryError(f"Decimal requires one argument at line {line_no}")
+            return parse_decimal_value(self.parse_value(node.args[0]), line_no)
+
+        raise DiscoveryError(f"unsupported constructor at line {line_no}")
+
+    def parse_defaultdict_factory(self, node: ast.AST) -> Any:
+        line_no = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant) and node.value is None:
+            return None
+        if isinstance(node, ast.Name):
+            return default_factory_from_name(node.id, line_no)
+        raise DiscoveryError(f"unsupported defaultdict factory at line {line_no}")
+
+    def call_name(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            if node.id in {"set", "frozenset"}:
+                return node.id
+            return self.constructor_aliases.get(node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            module = self.module_aliases.get(node.value.id)
+            if module == "collections" and node.attr in COLLECTION_CONSTRUCTORS:
+                return node.attr
+            if module == "decimal" and node.attr in DECIMAL_CONSTRUCTORS:
+                return node.attr
+            if module == "math" and node.attr == "isclose":
+                return "math.isclose"
+            if module == "re" and node.attr == "search":
+                return "re.search"
+        return None
+
+    def is_str_call_for_name(self, node: ast.AST, name: str) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "str"
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == name
+        )
 
     def add_test(
         self,
@@ -294,6 +654,13 @@ class TestDiscoverer:
         kind: str,
         args: list[Any],
         expected: Any = None,
+        *,
+        comparison: str = "standard",
+        abs_tol: Any = None,
+        rel_tol: Any = None,
+        exception_type: str | None = None,
+        message_match: str | None = None,
+        message_pattern: str | None = None,
     ) -> None:
         expectations = self.expectations_for(line_no)
         self.pending.append(
@@ -302,6 +669,12 @@ class TestDiscoverer:
                 kind=kind,
                 args=args,
                 expected=expected,
+                comparison=comparison,
+                abs_tol=abs_tol,
+                rel_tol=rel_tol,
+                exception_type=exception_type,
+                message_match=message_match,
+                message_pattern=message_pattern,
                 expect_stdout=expectations.get("expect_stdout"),
                 expect_stderr=expectations.get("expect_stderr"),
             )
@@ -348,6 +721,12 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
                 kind=test.kind,
                 args=test.args,
                 expected=test.expected,
+                comparison=test.comparison,
+                abs_tol=test.abs_tol,
+                rel_tol=test.rel_tol,
+                exception_type=test.exception_type,
+                message_match=test.message_match,
+                message_pattern=test.message_pattern,
                 expect_stdout=test.expect_stdout,
                 expect_stderr=test.expect_stderr,
             )
@@ -367,38 +746,92 @@ def discover_tests(tests_dir: Path | str, entrypoint: str) -> list[TestCase]:
     return TestDiscoverer(entrypoint, source.splitlines()).discover(tree)
 
 
-def make_jsonable(value: Any) -> Any:
-    if isinstance(value, tuple):
-        return [make_jsonable(item) for item in value]
+def tag_sort_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def default_factory_name(factory: Any) -> str | None:
+    if factory is None:
+        return None
+    name = getattr(factory, "__name__", None)
+    if isinstance(name, str) and name in DEFAULTDICT_FACTORIES and name != "None":
+        return name
+    return None
+
+
+def encode_value(value: Any) -> dict[str, Any]:
+    if value is None or isinstance(value, bool):
+        return {"type": "scalar", "value": value}
+    if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+        return {"type": "scalar", "value": value}
+    if isinstance(value, Decimal):
+        return {"type": "decimal", "value": str(value)}
     if isinstance(value, list):
-        return [make_jsonable(item) for item in value]
+        return {"type": "list", "items": [encode_value(item) for item in value]}
+    if isinstance(value, tuple):
+        return {"type": "tuple", "items": [encode_value(item) for item in value]}
+    if isinstance(value, defaultdict):
+        entries = [[encode_value(key), encode_value(item)] for key, item in value.items()]
+        return {
+            "type": "defaultdict",
+            "factory": default_factory_name(value.default_factory),
+            "entries": sorted(entries, key=lambda entry: tag_sort_key(entry[0])),
+        }
+    if isinstance(value, Counter):
+        entries = [[encode_value(key), encode_value(count)] for key, count in value.items()]
+        return {
+            "type": "counter",
+            "entries": sorted(entries, key=lambda entry: tag_sort_key(entry[0])),
+        }
     if isinstance(value, dict):
-        return {key: make_jsonable(item) for key, item in value.items()}
-    return value
+        entries = [[encode_value(key), encode_value(item)] for key, item in value.items()]
+        return {
+            "type": "dict",
+            "entries": sorted(entries, key=lambda entry: tag_sort_key(entry[0])),
+        }
+    if isinstance(value, deque):
+        return {"type": "deque", "items": [encode_value(item) for item in value]}
+    if isinstance(value, frozenset):
+        items = [encode_value(item) for item in value]
+        return {"type": "frozenset", "items": sorted(items, key=tag_sort_key)}
+    if isinstance(value, set):
+        items = [encode_value(item) for item in value]
+        return {"type": "set", "items": sorted(items, key=tag_sort_key)}
+    raise DiscoveryError(f"unsupported value for execution: {value!r}")
 
 
-def case_to_json(case: TestCase) -> dict[str, Any]:
+def encode_optional_value(value: Any) -> dict[str, Any] | None:
+    return None if value is None else encode_value(value)
+
+
+def case_to_json(case: TestCase, default_abs_tol: float | None = None) -> dict[str, Any]:
     return {
         "id": case.id,
         "kind": case.kind,
-        "args": make_jsonable(case.args),
-        "expected": make_jsonable(case.expected),
+        "comparison": case.comparison,
+        "args": [encode_value(arg) for arg in case.args],
+        "expected": encode_optional_value(case.expected),
+        "abs_tol": encode_optional_value(case.abs_tol),
+        "rel_tol": encode_optional_value(case.rel_tol),
+        "default_abs_tol": encode_optional_value(default_abs_tol),
+        "exception_type": case.exception_type,
+        "message_match": case.message_match,
+        "message_pattern": case.message_pattern,
         "expect_stdout": case.expect_stdout,
         "expect_stderr": case.expect_stderr,
     }
 
 
-def run_python_case(solution_path: Path, entrypoint: str, case: TestCase) -> bool:
+def run_python_case(
+    solution_path: Path,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+) -> bool:
     payload = {
         "solution_path": str(solution_path),
         "entrypoint": entrypoint,
-        "case": {
-            "kind": case.kind,
-            "args": case.args,
-            "expected": case.expected,
-            "expect_stdout": case.expect_stdout,
-            "expect_stderr": case.expect_stderr,
-        },
+        "case": case_to_json(case, default_abs_tol),
     }
     harness = PYTHON_CASE_RUNNER + "\nPAYLOAD = " + repr(payload) + "\nrun(PAYLOAD)\n"
     try:
@@ -414,11 +847,16 @@ def run_python_case(solution_path: Path, entrypoint: str, case: TestCase) -> boo
 
 
 PYTHON_CASE_RUNNER = r'''
+import builtins
 import inspect
 import io
 import json
+import math
+import re
 import runpy
+from collections import Counter, defaultdict, deque
 from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
 
 
 def _resolve_callable(namespace, entrypoint):
@@ -450,16 +888,203 @@ def _resolve_callable(namespace, entrypoint):
     raise LookupError("entrypoint not found")
 
 
+def _decode_value(tag):
+    if tag is None:
+        return None
+    kind = tag["type"]
+    if kind == "scalar":
+        return tag["value"]
+    if kind == "decimal":
+        return Decimal(tag["value"])
+    if kind == "list":
+        return [_decode_value(item) for item in tag["items"]]
+    if kind == "tuple":
+        return tuple(_decode_value(item) for item in tag["items"])
+    if kind == "dict":
+        return {_decode_value(key): _decode_value(value) for key, value in tag["entries"]}
+    if kind == "defaultdict":
+        return defaultdict(_defaultdict_factory(tag.get("factory")), {_decode_value(key): _decode_value(value) for key, value in tag["entries"]})
+    if kind == "counter":
+        return Counter({_decode_value(key): _decode_value(value) for key, value in tag["entries"]})
+    if kind == "deque":
+        return deque(_decode_value(item) for item in tag["items"])
+    if kind == "set":
+        return set(_decode_value(item) for item in tag["items"])
+    if kind == "frozenset":
+        return frozenset(_decode_value(item) for item in tag["items"])
+    raise ValueError("unsupported value tag")
+
+
+def _defaultdict_factory(name):
+    if name is None:
+        return None
+    return {
+        "bool": bool,
+        "dict": dict,
+        "float": float,
+        "int": int,
+        "list": list,
+        "set": set,
+        "str": str,
+        "tuple": tuple,
+    }.get(name)
+
+
+def _decode_case(case):
+    decoded = dict(case)
+    decoded["args"] = [_decode_value(item) for item in case["args"]]
+    decoded["expected"] = _decode_value(case["expected"])
+    decoded["abs_tol"] = _decode_value(case["abs_tol"])
+    decoded["rel_tol"] = _decode_value(case["rel_tol"])
+    decoded["default_abs_tol"] = _decode_value(case["default_abs_tol"])
+    return decoded
+
+
+def _is_numeric(value):
+    return not isinstance(value, bool) and isinstance(value, (int, float, Decimal))
+
+
+def _uses_tolerance(left, right):
+    return _is_numeric(left) and _is_numeric(right) and (
+        isinstance(left, (float, Decimal)) or isinstance(right, (float, Decimal))
+    )
+
+
+def _to_decimal(value):
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _numeric_close(left, right, abs_tol=None, rel_tol=None):
+    if not _is_numeric(left) or not _is_numeric(right):
+        return False
+    abs_tol = 0 if abs_tol is None else abs_tol
+    rel_tol = 0 if rel_tol is None else rel_tol
+    if any(isinstance(value, Decimal) for value in (left, right, abs_tol, rel_tol)):
+        left_d = _to_decimal(left)
+        right_d = _to_decimal(right)
+        abs_d = _to_decimal(abs_tol)
+        rel_d = _to_decimal(rel_tol)
+        diff = abs(left_d - right_d)
+        limit = max(abs_d, rel_d * max(abs(left_d), abs(right_d)))
+        return diff <= limit
+    return math.isclose(float(left), float(right), abs_tol=float(abs_tol), rel_tol=float(rel_tol))
+
+
+def _sequence_equal(left, right, abs_tol=None, rel_tol=None):
+    if type(left) is not type(right) or len(left) != len(right):
+        return False
+    return all(_deep_equal(item, right[index], abs_tol, rel_tol) for index, item in enumerate(left))
+
+
+def _unordered_equal(left_items, right_items, abs_tol=None, rel_tol=None):
+    unmatched = list(right_items)
+    for left_item in left_items:
+        for index, right_item in enumerate(unmatched):
+            if _deep_equal(left_item, right_item, abs_tol, rel_tol):
+                unmatched.pop(index)
+                break
+        else:
+            return False
+    return not unmatched
+
+
+def _mapping_entries(mapping):
+    return list(mapping.items())
+
+
+def _mapping_equal(left, right, abs_tol=None, rel_tol=None):
+    left_entries = _mapping_entries(left)
+    right_entries = _mapping_entries(right)
+    if len(left_entries) != len(right_entries):
+        return False
+    unmatched = list(right_entries)
+    for left_key, left_value in left_entries:
+        for index, (right_key, right_value) in enumerate(unmatched):
+            if _deep_equal(left_key, right_key, abs_tol, rel_tol) and _deep_equal(left_value, right_value, abs_tol, rel_tol):
+                unmatched.pop(index)
+                break
+        else:
+            return False
+    return not unmatched
+
+
+def _deep_equal(left, right, abs_tol=None, rel_tol=None):
+    if _uses_tolerance(left, right) and (abs_tol is not None or rel_tol is not None):
+        return _numeric_close(left, right, abs_tol, rel_tol)
+    if _is_numeric(left) and _is_numeric(right):
+        return left == right
+    if isinstance(left, (dict, defaultdict, Counter)) or isinstance(right, (dict, defaultdict, Counter)):
+        if not isinstance(left, (dict, defaultdict, Counter)) or not isinstance(right, (dict, defaultdict, Counter)):
+            return False
+        return _mapping_equal(left, right, abs_tol, rel_tol)
+    if isinstance(left, (list, tuple, deque)) or isinstance(right, (list, tuple, deque)):
+        if not isinstance(left, (list, tuple, deque)) or not isinstance(right, (list, tuple, deque)):
+            return False
+        return _sequence_equal(left, right, abs_tol, rel_tol)
+    if isinstance(left, (set, frozenset)) or isinstance(right, (set, frozenset)):
+        if not isinstance(left, (set, frozenset)) or not isinstance(right, (set, frozenset)):
+            return False
+        if len(left) != len(right):
+            return False
+        return _unordered_equal(left, right, abs_tol, rel_tol)
+    return left == right
+
+
+def _effective_abs_tol(case):
+    return case["abs_tol"] if case["abs_tol"] is not None else case["default_abs_tol"]
+
+
+def _message_matches(case, raised):
+    mode = case.get("message_match")
+    if mode is None:
+        return True
+    message = str(raised)
+    pattern = case.get("message_pattern") or ""
+    if mode == "contains":
+        return pattern in message
+    if mode == "regex":
+        try:
+            return re.search(pattern, message) is not None
+        except re.error:
+            return False
+    return False
+
+
+def _exception_matches(case, raised):
+    if raised is None or not isinstance(raised, Exception):
+        return False
+    expected_type = case.get("exception_type")
+    if expected_type is not None:
+        exception_cls = getattr(builtins, expected_type, None)
+        if not isinstance(exception_cls, type) or not isinstance(raised, exception_cls):
+            return False
+    return _message_matches(case, raised)
+
+
 def _matches(case, value, raised):
     kind = case["kind"]
     if kind == "raises":
-        return raised is not None and isinstance(raised, Exception)
+        return _exception_matches(case, raised)
     if raised is not None:
         return False
     if kind == "eq":
-        return value == case["expected"]
+        return _deep_equal(value, case["expected"], _effective_abs_tol(case), case["rel_tol"])
     if kind == "ne":
-        return value != case["expected"]
+        return not _deep_equal(value, case["expected"], _effective_abs_tol(case), case["rel_tol"])
+    if kind == "isclose":
+        return _numeric_close(value, case["expected"], case["abs_tol"], case["rel_tol"])
+    if kind == "absdiff":
+        if not _is_numeric(value) or not _is_numeric(case["expected"]):
+            return False
+        if isinstance(value, Decimal) or isinstance(case["expected"], Decimal) or isinstance(case["abs_tol"], Decimal):
+            diff = abs(_to_decimal(value) - _to_decimal(case["expected"]))
+            tolerance = _to_decimal(case["abs_tol"])
+        else:
+            diff = abs(value - case["expected"])
+            tolerance = case["abs_tol"]
+        if case["comparison"] == "abs_lt":
+            return diff < tolerance
+        return diff <= tolerance
     if kind == "truthy":
         return bool(value)
     if kind == "not":
@@ -468,7 +1093,7 @@ def _matches(case, value, raised):
 
 
 def run(payload):
-    case = payload["case"]
+    case = _decode_case(payload["case"])
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             namespace = runpy.run_path(payload["solution_path"])
@@ -645,7 +1270,130 @@ function resolveCallable(solutionModule, context, entrypoint) {
   throw new Error("entrypoint not found");
 }
 
-function deepEqual(left, right) {
+function decodeValue(tag) {
+  if (tag === null) {
+    return null;
+  }
+  if (tag.type === "scalar") {
+    return tag.value;
+  }
+  if (tag.type === "decimal") {
+    return Number(tag.value);
+  }
+  if (tag.type === "list" || tag.type === "tuple" || tag.type === "deque") {
+    return tag.items.map((item) => decodeValue(item));
+  }
+  if (tag.type === "set" || tag.type === "frozenset") {
+    return new Set(tag.items.map((item) => decodeValue(item)));
+  }
+  if (tag.type === "counter") {
+    return new Map(tag.entries.map(([key, value]) => [decodeValue(key), decodeValue(value)]));
+  }
+  if (tag.type === "dict" || tag.type === "defaultdict") {
+    const entries = tag.entries.map(([key, value]) => [decodeValue(key), decodeValue(value)]);
+    if (entries.every(([key]) => typeof key === "string")) {
+      const object = {};
+      for (const [key, value] of entries) {
+        object[key] = value;
+      }
+      return object;
+    }
+    return new Map(entries);
+  }
+  throw new Error("unsupported value tag");
+}
+
+function decodeCase(testCase) {
+  return {
+    ...testCase,
+    args: testCase.args.map((item) => decodeValue(item)),
+    expected: decodeValue(testCase.expected),
+    abs_tol: decodeValue(testCase.abs_tol),
+    rel_tol: decodeValue(testCase.rel_tol),
+    default_abs_tol: decodeValue(testCase.default_abs_tol),
+  };
+}
+
+function isMap(value) {
+  return value instanceof Map || Object.prototype.toString.call(value) === "[object Map]";
+}
+
+function isSet(value) {
+  return value instanceof Set || Object.prototype.toString.call(value) === "[object Set]";
+}
+
+function isPlainObject(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !isMap(value) &&
+    !isSet(value)
+  );
+}
+
+function isMapping(value) {
+  return isMap(value) || isPlainObject(value);
+}
+
+function mappingEntries(value) {
+  if (isMap(value)) {
+    return [...value.entries()];
+  }
+  return Object.keys(value).map((key) => [key, value[key]]);
+}
+
+function isNumeric(value) {
+  return typeof value === "number" && !Number.isNaN(value);
+}
+
+function numericClose(left, right, absTol, relTol) {
+  if (!isNumeric(left) || !isNumeric(right)) {
+    return false;
+  }
+  const absolute = absTol === null ? 0 : Number(absTol);
+  const relative = relTol === null ? 0 : Number(relTol);
+  const diff = Math.abs(left - right);
+  const limit = Math.max(absolute, relative * Math.max(Math.abs(left), Math.abs(right)));
+  return diff <= limit;
+}
+
+function unorderedEqual(leftItems, rightItems, absTol, relTol) {
+  const unmatched = [...rightItems];
+  for (const leftItem of leftItems) {
+    const index = unmatched.findIndex((rightItem) => deepEqual(leftItem, rightItem, absTol, relTol));
+    if (index === -1) {
+      return false;
+    }
+    unmatched.splice(index, 1);
+  }
+  return unmatched.length === 0;
+}
+
+function mappingEqual(left, right, absTol, relTol) {
+  const leftEntries = mappingEntries(left);
+  const rightEntries = mappingEntries(right);
+  if (leftEntries.length !== rightEntries.length) {
+    return false;
+  }
+  const unmatched = [...rightEntries];
+  for (const [leftKey, leftValue] of leftEntries) {
+    const index = unmatched.findIndex(([rightKey, rightValue]) => (
+      deepEqual(leftKey, rightKey, absTol, relTol) &&
+      deepEqual(leftValue, rightValue, absTol, relTol)
+    ));
+    if (index === -1) {
+      return false;
+    }
+    unmatched.splice(index, 1);
+  }
+  return unmatched.length === 0;
+}
+
+function deepEqual(left, right, absTol = null, relTol = null) {
+  if (isNumeric(left) && isNumeric(right) && (absTol !== null || relTol !== null)) {
+    return numericClose(left, right, absTol, relTol);
+  }
   if (Object.is(left, right)) {
     return true;
   }
@@ -653,22 +1401,25 @@ function deepEqual(left, right) {
     if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
       return false;
     }
-    return left.every((item, index) => deepEqual(item, right[index]));
+    return left.every((item, index) => deepEqual(item, right[index], absTol, relTol));
   }
-  if (
-    left !== null &&
-    right !== null &&
-    typeof left === "object" &&
-    typeof right === "object"
-  ) {
-    const leftKeys = Object.keys(left).sort();
-    const rightKeys = Object.keys(right).sort();
-    if (!deepEqual(leftKeys, rightKeys)) {
+  if (isSet(left) || isSet(right)) {
+    if (!isSet(left) || !isSet(right) || left.size !== right.size) {
       return false;
     }
-    return leftKeys.every((key) => deepEqual(left[key], right[key]));
+    return unorderedEqual(left.values(), right.values(), absTol, relTol);
+  }
+  if (isMapping(left) || isMapping(right)) {
+    if (!isMapping(left) || !isMapping(right)) {
+      return false;
+    }
+    return mappingEqual(left, right, absTol, relTol);
   }
   return false;
+}
+
+function effectiveAbsTol(testCase) {
+  return testCase.abs_tol !== null ? testCase.abs_tol : testCase.default_abs_tol;
 }
 
 function pyTruthy(value) {
@@ -681,24 +1432,81 @@ function pyTruthy(value) {
   if (typeof value === "string" || Array.isArray(value)) {
     return value.length > 0;
   }
+  if (isMap(value) || isSet(value)) {
+    return value.size > 0;
+  }
   if (typeof value === "object") {
     return Object.keys(value).length > 0;
   }
   return true;
 }
 
+function exceptionName(error) {
+  if (error && typeof error === "object") {
+    return error.name || (error.constructor && error.constructor.name) || "";
+  }
+  return "";
+}
+
+function exceptionMessage(error) {
+  if (error && typeof error === "object" && "message" in error) {
+    return String(error.message);
+  }
+  return String(error);
+}
+
+function exceptionMatches(testCase, error) {
+  if (!error) {
+    return false;
+  }
+  if (testCase.exception_type !== null) {
+    const names = new Set([exceptionName(error), error && error.constructor ? error.constructor.name : ""]);
+    if (!names.has(testCase.exception_type)) {
+      return false;
+    }
+  }
+  if (testCase.message_match === null) {
+    return true;
+  }
+  const message = exceptionMessage(error);
+  if (testCase.message_match === "contains") {
+    return message.includes(testCase.message_pattern || "");
+  }
+  if (testCase.message_match === "regex") {
+    try {
+      return new RegExp(testCase.message_pattern || "").test(message);
+    } catch (_) {
+      return false;
+    }
+  }
+  return false;
+}
+
 function assertionMatches(testCase, callResult) {
   if (testCase.kind === "raises") {
-    return callResult.raised;
+    return callResult.raised && exceptionMatches(testCase, callResult.error);
   }
   if (callResult.raised) {
     return false;
   }
   if (testCase.kind === "eq") {
-    return deepEqual(callResult.value, testCase.expected);
+    return deepEqual(callResult.value, testCase.expected, effectiveAbsTol(testCase), testCase.rel_tol);
   }
   if (testCase.kind === "ne") {
-    return !deepEqual(callResult.value, testCase.expected);
+    return !deepEqual(callResult.value, testCase.expected, effectiveAbsTol(testCase), testCase.rel_tol);
+  }
+  if (testCase.kind === "isclose") {
+    return numericClose(callResult.value, testCase.expected, testCase.abs_tol, testCase.rel_tol);
+  }
+  if (testCase.kind === "absdiff") {
+    if (!isNumeric(callResult.value) || !isNumeric(testCase.expected)) {
+      return false;
+    }
+    const diff = Math.abs(callResult.value - testCase.expected);
+    if (testCase.comparison === "abs_lt") {
+      return diff < testCase.abs_tol;
+    }
+    return diff <= testCase.abs_tol;
   }
   if (testCase.kind === "truthy") {
     return pyTruthy(callResult.value);
@@ -714,7 +1522,7 @@ function assertionMatches(testCase, callResult) {
     const solutionPath = process.env.BCG_SOLUTION_PATH;
     const entrypoint = process.env.BCG_ENTRYPOINT;
     const language = process.env.BCG_LANG;
-    const testCase = JSON.parse(process.env.BCG_CASE);
+    const testCase = decodeCase(JSON.parse(process.env.BCG_CASE));
     let source = fs.readFileSync(solutionPath, "utf8");
     if (language === "typescript") {
       source = stripTypeScript(source);
@@ -765,7 +1573,13 @@ function assertionMatches(testCase, callResult) {
 '''
 
 
-def run_node_case(solution_path: Path, entrypoint: str, lang: str, case: TestCase) -> bool:
+def run_node_case(
+    solution_path: Path,
+    entrypoint: str,
+    lang: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+) -> bool:
     node_path = shutil.which("node")
     if node_path is None:
         return False
@@ -775,7 +1589,7 @@ def run_node_case(solution_path: Path, entrypoint: str, lang: str, case: TestCas
             "BCG_SOLUTION_PATH": str(solution_path),
             "BCG_ENTRYPOINT": entrypoint,
             "BCG_LANG": lang,
-            "BCG_CASE": json_line(case_to_json(case)),
+            "BCG_CASE": json_line(case_to_json(case, default_abs_tol)),
         }
     )
     try:
@@ -805,11 +1619,17 @@ def parse_subprocess_result(proc: subprocess.CompletedProcess[str]) -> bool:
     return data.get("passed") is True
 
 
-def execute_case(solution_path: Path, lang: str, entrypoint: str, case: TestCase) -> bool:
+def execute_case(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+) -> bool:
     if lang == "python":
-        return run_python_case(solution_path, entrypoint, case)
+        return run_python_case(solution_path, entrypoint, case, default_abs_tol)
     if lang in {"javascript", "typescript"}:
-        return run_node_case(solution_path, entrypoint, lang, case)
+        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol)
     return False
 
 
@@ -818,11 +1638,12 @@ def aggregate_results(
     lang: str,
     entrypoint: str,
     cases: list[TestCase],
+    default_abs_tol: float | None = None,
 ) -> dict[str, Any]:
     passed: list[str] = []
     failed: list[str] = []
     for case in cases:
-        if execute_case(solution_path, lang, entrypoint, case):
+        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol):
             passed.append(case.id)
         else:
             failed.append(case.id)
@@ -864,6 +1685,11 @@ def command_test(args: argparse.Namespace) -> int:
     if not is_supported_lang(lang):
         print_json_result(error_result())
         return 2
+    try:
+        default_abs_tol = parse_default_tolerance(args.tol)
+    except DiscoveryError:
+        print_json_result(error_result())
+        return 2
 
     tests_dir = Path(args.tests_dir)
     tester_path = tests_dir / tester_filename(lang)
@@ -887,7 +1713,7 @@ def command_test(args: argparse.Namespace) -> int:
         print_json_result(error_result())
         return 2
 
-    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases)
+    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases, default_abs_tol)
     print_json_result(result)
     return status_exit_code(result["status"])
 
@@ -906,6 +1732,7 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("solution_path")
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
+    test.add_argument("--tol")
     test.set_defaults(func=command_test)
 
     return parser

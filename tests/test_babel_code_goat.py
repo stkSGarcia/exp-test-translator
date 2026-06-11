@@ -7,6 +7,8 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from collections import Counter, defaultdict, deque
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -152,10 +154,60 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual([case.kind for case in cases], ["eq", "ne", "truthy", "raises", "not", "eq"])
             self.assertEqual(cases[-1].args, [{"x": [1, (2,)]}])
 
+    def test_discovery_supports_rich_values_and_tolerance_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                import math
+                import re
+                import collections as c
+                import decimal
+                from collections import Counter, deque, defaultdict
+                from decimal import Decimal
+
+                assert solve({1: Decimal("1.0"), (2,): frozenset([3])}) == {
+                    "set": set([2, 1]),
+                    "frozen": frozenset([4, 3]),
+                    "counter": Counter(["a", "a", "b"]),
+                    "deque": deque([1, 2]),
+                    "default": defaultdict(int, {"x": 1}),
+                    "decimal": decimal.Decimal("2.50"),
+                    "alias": c.Counter({"z": 2}),
+                }
+                assert math.isclose(solve(1), Decimal("1.01"), abs_tol=Decimal("0.02"))
+                assert abs(Decimal("1.00") - solve(2)) <= Decimal("0.01")
+                try:
+                    solve(0)
+                    assert False
+                except ValueError as e:
+                    assert re.search(r"bad", str(e))
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(cases[0].args, [{1: Decimal("1.0"), (2,): frozenset([3])}])
+            self.assertEqual(cases[0].expected["set"], {1, 2})
+            self.assertEqual(cases[0].expected["frozen"], frozenset([3, 4]))
+            self.assertEqual(cases[0].expected["counter"], Counter({"a": 2, "b": 1}))
+            self.assertEqual(cases[0].expected["deque"], deque([1, 2]))
+            self.assertEqual(cases[0].expected["default"], defaultdict(int, {"x": 1}))
+            self.assertEqual(cases[0].expected["decimal"], Decimal("2.50"))
+            self.assertEqual(cases[0].expected["alias"], Counter({"z": 2}))
+            self.assertEqual(cases[1].kind, "isclose")
+            self.assertEqual(cases[1].abs_tol, Decimal("0.02"))
+            self.assertEqual(cases[2].comparison, "abs_le")
+            self.assertEqual(cases[2].abs_tol, Decimal("0.01"))
+            self.assertEqual(cases[3].exception_type, "ValueError")
+            self.assertEqual(cases[3].message_match, "regex")
+            self.assertEqual(cases[3].message_pattern, "bad")
+
     def test_discovery_rejects_unsupported_literals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
-            write(tests_dir / "tests.py", 'assert solve({1: "bad"}) == 1\n')
+            write(tests_dir / "tests.py", 'assert solve({[1]: "bad"}) == 1\n')
 
             with self.assertRaises(bcg.DiscoveryError):
                 bcg.discover_tests(tests_dir, "solve")
@@ -254,6 +306,134 @@ class BabelCodeGoatTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
+    def test_python_default_tolerance_and_invalid_tolerance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                from collections import defaultdict
+
+                assert solve("nested") == [1.0, {"x": 2.005}]
+                assert solve(defaultdict(int, {"x": 1})) == 0
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                from collections import defaultdict
+
+                def solve(value):
+                    if isinstance(value, defaultdict):
+                        return value["missing"]
+                    return [1.0, {"x": 2.0}]
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(self.json_stdout(proc)["status"], "fail")
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--tol", "0.01")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--tol", "nope")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+    def test_python_per_assert_tolerance_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                import math
+                from decimal import Decimal
+
+                assert math.isclose(solve("close"), 1.0, abs_tol=0.01)
+                assert abs(solve("lt") - 1.0) < 0.01
+                assert abs(Decimal("1.00") - solve("le")) <= Decimal("0.01")
+                assert math.isclose(solve("override"), 1.0, abs_tol=0.01)
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                from decimal import Decimal
+
+                def solve(value):
+                    if value == "close":
+                        return 1.005
+                    if value == "lt":
+                        return 1.005
+                    if value == "le":
+                        return Decimal("1.01")
+                    return 1.1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--tol", "0.5")
+
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(len(result["passed"]), 3)
+            self.assertEqual(len(result["failed"]), 1)
+
+    def test_python_typed_exception_expectations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                import re
+
+                try:
+                    solve("substring")
+                    assert False
+                except ValueError as e:
+                    assert "bad" in str(e)
+
+                try:
+                    solve("regex")
+                    assert False
+                except ValueError as e:
+                    assert re.search(r"b.d", str(e))
+
+                try:
+                    solve("wrong")
+                    assert False
+                except ValueError as e:
+                    assert "bad" in str(e)
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                def solve(value):
+                    if value == "substring":
+                        raise ValueError("bad input")
+                    if value == "regex":
+                        raise ValueError("bud input")
+                    raise TypeError("bad input")
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(len(result["passed"]), 2)
+            self.assertEqual(len(result["failed"]), 1)
+
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
         tests_dir, solution = self.make_generated_case("javascript", "solution.js")
@@ -271,6 +451,54 @@ class BabelCodeGoatTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
+    def test_javascript_rich_comparison_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                import math
+                import re
+
+                assert solve("map") == {1: "one"}
+                assert math.isclose(solve("tol"), 1.0, abs_tol=0.01)
+                try:
+                    solve("boom")
+                    assert False
+                except ValueError as e:
+                    assert "bad" in str(e)
+                """,
+            )
+            solution = tests_dir / "solution.js"
+            write(
+                solution,
+                """
+                class ValueError extends Error {
+                  constructor(message) {
+                    super(message);
+                    this.name = "ValueError";
+                  }
+                }
+
+                function solve(value) {
+                  if (value === "map") {
+                    return new Map([[1, "one"]]);
+                  }
+                  if (value === "tol") {
+                    return 1.005;
+                  }
+                  throw new ValueError("bad input");
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "javascript").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "javascript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
     def test_typescript_solution_execution(self) -> None:
@@ -291,6 +519,56 @@ class BabelCodeGoatTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
+    def test_typescript_rich_comparison_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                import math
+                import re
+
+                assert solve("map") == {1: "one"}
+                assert math.isclose(solve("tol"), 1.0, abs_tol=0.01)
+                try:
+                    solve("boom")
+                    assert False
+                except ValueError as e:
+                    assert re.search(r"bad", str(e))
+                """,
+            )
+            solution = tests_dir / "solution.ts"
+            write(
+                solution,
+                """
+                class ValueError extends Error {
+                  constructor(message: string) {
+                    super(message);
+                    this.name = "ValueError";
+                  }
+                }
+
+                class Solution {
+                  static solve(value: string): any {
+                    if (value === "map") {
+                      return new Map([[1, "one"]]);
+                    }
+                    if (value === "tol") {
+                      return 1.005;
+                    }
+                    throw new ValueError("bad input");
+                  }
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "typescript").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
 
 if __name__ == "__main__":
