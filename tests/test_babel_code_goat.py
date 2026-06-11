@@ -258,6 +258,79 @@ class BabelCodeGoatTests(unittest.TestCase):
             with self.assertRaises(bcg.DiscoveryError):
                 bcg.discover_tests(tests_dir, "solve")
 
+    def test_discovery_supports_loop_parameterization_and_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                cases = [((1, 2), 3), ((2, 3), 5)]
+                for args, exp in cases:
+                    assert solve(*args) == exp
+                enum_cases = [(1, 2, 3), (4, 5, 9)]
+                for _, (a, b, exp) in enumerate(enum_cases):
+                    assert solve(a, b) == exp
+                index_cases = [(1, 2, 3), (4, 5, 9)]
+                for i in range(len(index_cases)):
+                    a, b, exp = index_cases[i]
+                    assert solve(a, b) == exp
+                while_cases = [(1, 2), (3, 4)]
+                i = 0
+                while i < len(while_cases):
+                    a, b = while_cases[i]
+                    assert solve(a, b) == a + b
+                    i += 1
+                outer_cases = [[1, 2], [3]]
+                for case in outer_cases:
+                    for x in case:
+                        assert solve(x, 0) == x
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(
+                [case.id for case in cases],
+                [
+                    "tests.py:2",
+                    "tests.py:3:0",
+                    "tests.py:3:1",
+                    "tests.py:5",
+                    "tests.py:6:0",
+                    "tests.py:6:1",
+                    "tests.py:8",
+                    "tests.py:10:0",
+                    "tests.py:10:1",
+                    "tests.py:13",
+                    "tests.py:15:0",
+                    "tests.py:15:1",
+                    "tests.py:18",
+                    "tests.py:19:0",
+                    "tests.py:20:0:0",
+                    "tests.py:20:0:1",
+                    "tests.py:19:1",
+                    "tests.py:20:1:0",
+                ],
+            )
+            self.assertTrue(all(case.loop_pass for case in cases if case.kind == "loop"))
+            self.assertEqual(cases[1].args, [1, 2])
+            self.assertEqual(cases[1].expected, 3)
+            self.assertEqual(cases[10].expected, 3)
+
+    def test_discovery_rejects_multi_call_assertions_inside_loops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                for a, b in [(1, 2)]:
+                    assert solve(a) == solve(b)
+                """,
+            )
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
     def test_python_pass_fail_error_output_and_exit_codes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -296,6 +369,31 @@ class BabelCodeGoatTests(unittest.TestCase):
             proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
             self.assertEqual(proc.returncode, 2)
             self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+    def test_python_zero_iteration_loop_fails_without_body_assertions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                for x in []:
+                    assert solve(x, x) == 0
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                def solve(a, b):
+                    return a + b
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(proc.stdout, '{"status":"fail","passed":[],"failed":["tests.py:1"]}\n')
 
     def test_python_output_expectations_and_callable_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -528,6 +626,35 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
             self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 7)
 
+    def test_python_loop_execution_reports_loop_and_iteration_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                cases = [(1, 2), (2, 3), (3, 7)]
+                for value, expected in cases:
+                    assert solve(value) == expected
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                def solve(value):
+                    return value + 1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["passed"], ["tests.py:2", "tests.py:3:0", "tests.py:3:1"])
+            self.assertEqual(result["failed"], ["tests.py:3:2"])
+
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
         tests_dir, solution = self.make_generated_case("javascript", "solution.js")
@@ -628,6 +755,34 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
+    @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
+    def test_javascript_loop_discovered_assertions_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                cases = [("a", "A"), ("b", "B")]
+                for value, expected in cases:
+                    assert solve(value) == expected
+                """,
+            )
+            solution = tests_dir / "solution.js"
+            write(
+                solution,
+                """
+                function solve(value) {
+                  return value.toUpperCase();
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "javascript").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "javascript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
     @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
     def test_typescript_solution_execution(self) -> None:
         tests_dir, solution = self.make_generated_case("typescript", "solution.ts")
@@ -673,6 +828,36 @@ class BabelCodeGoatTests(unittest.TestCase):
                       return "x";
                     }
                     return "abc";
+                  }
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "typescript").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
+    def test_typescript_loop_discovered_assertions_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                cases = [(1, 2), (2, 4)]
+                for value, expected in cases:
+                    assert solve(value) == expected
+                """,
+            )
+            solution = tests_dir / "solution.ts"
+            write(
+                solution,
+                """
+                class Solution {
+                  static solve(value: number): number {
+                    return value * 2;
                   }
                 }
                 """,

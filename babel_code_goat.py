@@ -37,6 +37,7 @@ ERROR_RESULT = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"#\s*(expect_stdout|expect_stderr):\s*(.+)\s*$")
 MATH_ISCLOSE_REL_TOL = 1e-09
 MATH_ISCLOSE_ABS_TOL = 0.0
+LOOP_ITERATION_LIMIT = 10000
 HELPER_MODULES = {"math", "re", "collections", "decimal"}
 COLLECTION_CONSTRUCTORS = {"Counter", "deque", "defaultdict"}
 DECIMAL_CONSTRUCTORS = {"Decimal"}
@@ -105,6 +106,10 @@ class MetadataError(Exception):
     """Raised when generated tester metadata is absent or invalid."""
 
 
+class LoopEvaluationError(Exception):
+    """Raised when a loop cannot be evaluated as a supported parameterization."""
+
+
 def result_expr() -> dict[str, Any]:
     return {"op": "result"}
 
@@ -113,10 +118,12 @@ def result_expr() -> dict[str, Any]:
 class PendingTest:
     line: int
     kind: str
-    args: list[Any]
+    args: list[Any] = field(default_factory=list)
+    iteration_path: tuple[int, ...] = ()
     actual_expr: dict[str, Any] = field(default_factory=result_expr)
     expected: Any = None
     comparison: str = "standard"
+    loop_pass: bool | None = None
     abs_tol: Any = None
     rel_tol: Any = None
     exception_type: str | None = None
@@ -131,10 +138,12 @@ class TestCase:
     id: str
     line: int
     kind: str
-    args: list[Any]
+    args: list[Any] = field(default_factory=list)
+    iteration_path: tuple[int, ...] = ()
     actual_expr: dict[str, Any] = field(default_factory=result_expr)
     expected: Any = None
     comparison: str = "standard"
+    loop_pass: bool | None = None
     abs_tol: Any = None
     rel_tol: Any = None
     exception_type: str | None = None
@@ -247,6 +256,25 @@ def is_supported_scalar(value: Any) -> bool:
     return isinstance(value, (int, float, str, Decimal)) and not isinstance(value, bool)
 
 
+def is_supported_value(value: Any) -> bool:
+    if is_supported_scalar(value):
+        return True
+    if isinstance(value, list):
+        return all(is_supported_value(item) for item in value)
+    if isinstance(value, tuple):
+        return all(is_supported_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return all(is_hashable_supported(item) for item in value)
+    if isinstance(value, (dict, defaultdict, Counter)):
+        return all(
+            is_hashable_supported(key) and is_supported_value(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, deque):
+        return all(is_supported_value(item) for item in value)
+    return False
+
+
 def is_hashable_supported(value: Any) -> bool:
     if is_supported_scalar(value):
         return True
@@ -317,6 +345,8 @@ class TestDiscoverer:
         self.source_lines = source_lines
         self.module_aliases: dict[str, str] = {}
         self.constructor_aliases: dict[str, str] = {}
+        self.env: dict[str, Any] = {}
+        self.active_path: tuple[int, ...] = ()
         self.pending: list[PendingTest] = []
 
     def discover(self, tree: ast.Module) -> list[TestCase]:
@@ -335,6 +365,14 @@ class TestDiscoverer:
                 self.visit_assert(stmt)
             elif isinstance(stmt, ast.Try):
                 self.visit_raise_expectation(stmt)
+            elif isinstance(stmt, ast.Assign):
+                self.visit_assign(stmt)
+            elif isinstance(stmt, ast.AugAssign):
+                self.visit_aug_assign(stmt)
+            elif isinstance(stmt, ast.For):
+                self.visit_for_loop(stmt)
+            elif isinstance(stmt, ast.While):
+                self.visit_while_loop(stmt)
             else:
                 raise DiscoveryError(
                     f"unsupported statement at line {getattr(stmt, 'lineno', '?')}"
@@ -345,11 +383,54 @@ class TestDiscoverer:
             raise DiscoveryError(f"decorators are unsupported at line {stmt.lineno}")
         module_aliases = self.module_aliases.copy()
         constructor_aliases = self.constructor_aliases.copy()
+        env = self.env.copy()
         try:
             self.visit_body(stmt.body)
         finally:
             self.module_aliases = module_aliases
             self.constructor_aliases = constructor_aliases
+            self.env = env
+
+    def visit_assign(self, stmt: ast.Assign) -> None:
+        if len(stmt.targets) != 1:
+            raise DiscoveryError(f"multiple assignment targets are unsupported at line {stmt.lineno}")
+        value = self.parse_value(stmt.value)
+        self.bind_target(stmt.targets[0], value, stmt.lineno)
+
+    def visit_aug_assign(self, stmt: ast.AugAssign) -> None:
+        if not isinstance(stmt.target, ast.Name):
+            raise DiscoveryError(f"unsupported assignment target at line {stmt.lineno}")
+        if stmt.target.id not in self.env:
+            raise DiscoveryError(f"unknown assignment target at line {stmt.lineno}")
+        left = self.env[stmt.target.id]
+        right = self.parse_value(stmt.value)
+        try:
+            if isinstance(stmt.op, ast.Add):
+                value = left + right
+            elif isinstance(stmt.op, ast.Sub):
+                value = left - right
+            else:
+                raise DiscoveryError(f"unsupported augmented assignment at line {stmt.lineno}")
+        except TypeError as exc:
+            raise DiscoveryError(f"unsupported augmented assignment at line {stmt.lineno}") from exc
+        if not is_supported_value(value):
+            raise DiscoveryError(f"unsupported assignment value at line {stmt.lineno}")
+        self.env[stmt.target.id] = value
+
+    def bind_target(self, target: ast.AST, value: Any, line_no: int) -> None:
+        if isinstance(target, ast.Name):
+            if target.id == self.entrypoint:
+                raise DiscoveryError(f"assignment to entrypoint is unsupported at line {line_no}")
+            self.env[target.id] = value
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            items = as_iterable_items(value, line_no, "assignment")
+            if len(items) != len(target.elts):
+                raise DiscoveryError(f"assignment unpacking mismatch at line {line_no}")
+            for child, item in zip(target.elts, items):
+                self.bind_target(child, item, line_no)
+            return
+        raise DiscoveryError(f"unsupported assignment target at line {line_no}")
 
     def collect_imports(self, body: list[ast.stmt]) -> None:
         for stmt in body:
@@ -377,6 +458,143 @@ class TestDiscoverer:
             if alias.name == "*" or alias.name not in allowed:
                 raise DiscoveryError(f"unsupported import at line {stmt.lineno}")
             self.constructor_aliases[alias.asname or alias.name] = alias.name
+
+    def visit_for_loop(self, stmt: ast.For) -> None:
+        if stmt.orelse:
+            self.add_loop_test(stmt.lineno, False)
+            return
+        loop_path = self.active_path
+        before_env = self.env.copy()
+        try:
+            items = self.parse_loop_iterable(stmt.iter)
+        except (DiscoveryError, LoopEvaluationError):
+            self.add_loop_test(stmt.lineno, False)
+            return
+        if not items:
+            self.add_loop_test(stmt.lineno, False)
+            return
+
+        body_pending: list[PendingTest] = []
+        original_pending = self.pending
+        self.pending = body_pending
+        try:
+            for index, item in enumerate(items):
+                self.env = before_env.copy()
+                self.bind_target(stmt.target, item, stmt.lineno)
+                self.active_path = loop_path + (index,)
+                self.visit_body(stmt.body)
+        finally:
+            self.pending = original_pending
+            self.env = before_env
+            self.active_path = loop_path
+        self.add_loop_test(stmt.lineno, True)
+        self.pending.extend(body_pending)
+
+    def visit_while_loop(self, stmt: ast.While) -> None:
+        if stmt.orelse:
+            self.add_loop_test(stmt.lineno, False)
+            return
+        loop_path = self.active_path
+        before_env = self.env.copy()
+        body_pending: list[PendingTest] = []
+        original_pending = self.pending
+        self.pending = body_pending
+        iterations = 0
+        failed = False
+        try:
+            while True:
+                if iterations >= LOOP_ITERATION_LIMIT:
+                    failed = True
+                    break
+                try:
+                    should_iterate = self.eval_condition(stmt.test)
+                except (DiscoveryError, LoopEvaluationError):
+                    failed = True
+                    break
+                if not should_iterate:
+                    break
+                self.active_path = loop_path + (iterations,)
+                self.visit_body(stmt.body)
+                iterations += 1
+        finally:
+            self.pending = original_pending
+            self.env = before_env
+            self.active_path = loop_path
+
+        if iterations and not failed:
+            self.add_loop_test(stmt.lineno, True)
+            self.pending.extend(body_pending)
+        else:
+            self.add_loop_test(stmt.lineno, False)
+
+    def parse_loop_iterable(self, node: ast.AST) -> list[Any]:
+        line_no = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.keywords:
+                raise LoopEvaluationError("loop helper keywords are unsupported")
+            if node.func.id == "enumerate":
+                if len(node.args) != 1:
+                    raise LoopEvaluationError("enumerate requires one argument")
+                value = self.parse_value(node.args[0])
+                return list(enumerate(as_iterable_items(value, line_no, "enumerate")))
+            if node.func.id == "range":
+                values = [self.parse_integer_value(arg) for arg in node.args]
+                if len(values) not in {1, 2, 3}:
+                    raise LoopEvaluationError("range requires one to three arguments")
+                try:
+                    return list(range(*values))
+                except ValueError as exc:
+                    raise LoopEvaluationError("invalid range") from exc
+        value = self.parse_value(node)
+        return as_iterable_items(value, line_no, "for loop")
+
+    def parse_integer_value(self, node: ast.AST) -> int:
+        value = self.parse_value(node)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise LoopEvaluationError("expected integer loop value")
+        return value
+
+    def eval_condition(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.BoolOp):
+            values = [self.eval_condition(item) for item in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+            raise LoopEvaluationError("unsupported boolean operator")
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not self.eval_condition(node.operand)
+        if isinstance(node, ast.Compare):
+            left = self.parse_value(node.left)
+            for operator, comparator in zip(node.ops, node.comparators):
+                right = self.parse_value(comparator)
+                if not self.compare_values(operator, left, right):
+                    return False
+                left = right
+            return True
+        return bool(self.parse_value(node))
+
+    def compare_values(self, operator: ast.cmpop, left: Any, right: Any) -> bool:
+        try:
+            if isinstance(operator, ast.Eq):
+                return left == right
+            if isinstance(operator, ast.NotEq):
+                return left != right
+            if isinstance(operator, ast.Lt):
+                return left < right
+            if isinstance(operator, ast.LtE):
+                return left <= right
+            if isinstance(operator, ast.Gt):
+                return left > right
+            if isinstance(operator, ast.GtE):
+                return left >= right
+            if isinstance(operator, ast.In):
+                return left in right
+            if isinstance(operator, ast.NotIn):
+                return left not in right
+        except TypeError as exc:
+            raise LoopEvaluationError("unsupported comparison") from exc
+        raise LoopEvaluationError("unsupported comparison operator")
 
     def visit_assert(self, stmt: ast.Assert) -> None:
         if stmt.msg is not None:
@@ -592,7 +810,16 @@ class TestDiscoverer:
             return None
         if node.keywords:
             raise DiscoveryError(f"keyword arguments are unsupported at line {line_no}")
-        return [self.parse_value(arg) for arg in node.args]
+        return self.parse_call_args(node.args, line_no)
+
+    def parse_call_args(self, args: list[ast.expr], line_no: int) -> list[Any]:
+        parsed: list[Any] = []
+        for arg in args:
+            if isinstance(arg, ast.Starred):
+                parsed.extend(as_iterable_items(self.parse_value(arg.value), line_no, "starred argument"))
+            else:
+                parsed.append(self.parse_value(arg))
+        return parsed
 
     def parse_entrypoint_expected_pair(
         self,
@@ -646,6 +873,8 @@ class TestDiscoverer:
             if is_supported_scalar(node.value):
                 return {"op": "value", "value": node.value}
             raise DiscoveryError(f"unsupported literal value at line {line_no}")
+        if isinstance(node, ast.Name):
+            return {"op": "value", "value": self.resolve_name(node.id, line_no)}
         if isinstance(node, ast.List):
             return {
                 "op": "list",
@@ -720,7 +949,7 @@ class TestDiscoverer:
                 raise DiscoveryError(
                     f"assertion must call {self.entrypoint} exactly once at line {line_no}"
                 )
-            entrypoint_args.append([self.parse_value(arg) for arg in node.args])
+            entrypoint_args.append(self.parse_call_args(node.args, line_no))
             return result_expr()
 
         if isinstance(node.func, ast.Name) and node.func.id in PRIMITIVE_FUNCTIONS:
@@ -806,17 +1035,101 @@ class TestDiscoverer:
             "index": self.parse_expression(node.slice, entrypoint_args),
         }
 
+    def resolve_name(self, name: str, line_no: int) -> Any:
+        if name in self.env:
+            return self.env[name]
+        raise DiscoveryError(f"unknown name at line {line_no}")
+
+    def apply_binary_value(self, operator: str, left: Any, right: Any, line_no: int) -> Any:
+        try:
+            if operator == "add":
+                return left + right
+            if operator == "sub":
+                return left - right
+            if operator == "mult":
+                return left * right
+            if operator == "truediv":
+                return left / right
+            if operator == "floordiv":
+                return left // right
+            if operator == "mod":
+                return left % right
+            if operator == "pow":
+                return left ** right
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise DiscoveryError(f"unsupported value expression at line {line_no}") from exc
+        raise DiscoveryError(f"unsupported value expression at line {line_no}")
+
+    def parse_subscript_value(self, node: ast.Subscript) -> Any:
+        line_no = getattr(node, "lineno", 0)
+        value = self.parse_value(node.value)
+        try:
+            if isinstance(node.slice, ast.Slice):
+                lower = self.parse_value(node.slice.lower) if node.slice.lower is not None else None
+                upper = self.parse_value(node.slice.upper) if node.slice.upper is not None else None
+                step = self.parse_value(node.slice.step) if node.slice.step is not None else None
+                return value[slice(lower, upper, step)]
+            index = self.parse_value(node.slice)
+            return value[index]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise DiscoveryError(f"unsupported subscript at line {line_no}") from exc
+
+    def apply_primitive_value_call(self, name: str, args: list[Any], line_no: int) -> Any:
+        try:
+            if name == "abs":
+                return abs(args[0])
+            if name == "bool":
+                return bool(args[0])
+            if name == "float":
+                return float(args[0])
+            if name == "int":
+                return int(args[0])
+            if name == "len":
+                return len(args[0])
+            if name == "list":
+                return list(as_iterable_items(args[0], line_no, "list"))
+            if name == "tuple":
+                return tuple(as_iterable_items(args[0], line_no, "tuple"))
+            if name == "set":
+                return set(require_hashable_key(item, line_no) for item in as_iterable_items(args[0], line_no, "set"))
+            if name == "frozenset":
+                return frozenset(require_hashable_key(item, line_no) for item in as_iterable_items(args[0], line_no, "frozenset"))
+            if name == "sorted":
+                return sorted(as_iterable_items(args[0], line_no, "sorted"))
+            if name == "str":
+                return str(args[0])
+            if name == "sum":
+                return sum(as_iterable_items(args[0], line_no, "sum"))
+            if name == "max":
+                values = args if len(args) > 1 else as_iterable_items(args[0], line_no, "max")
+                return max(values)
+            if name == "min":
+                values = args if len(args) > 1 else as_iterable_items(args[0], line_no, "min")
+                return min(values)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise DiscoveryError(f"unsupported primitive call at line {line_no}") from exc
+        raise DiscoveryError(f"unsupported primitive call at line {line_no}")
+
     def parse_value(self, node: ast.AST) -> Any:
         line_no = getattr(node, "lineno", 0)
         if isinstance(node, ast.Constant):
             if is_supported_scalar(node.value):
                 return node.value
             raise DiscoveryError(f"unsupported literal value at line {line_no}")
+        if isinstance(node, ast.Name):
+            return self.resolve_name(node.id, line_no)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             value = self.parse_value(node.operand)
             if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
                 raise DiscoveryError(f"unsupported unary value at line {line_no}")
             return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and type(node.op) in BINARY_OPERATORS:
+            left = self.parse_value(node.left)
+            right = self.parse_value(node.right)
+            value = self.apply_binary_value(BINARY_OPERATORS[type(node.op)], left, right, line_no)
+            if not is_supported_value(value):
+                raise DiscoveryError(f"unsupported value expression at line {line_no}")
+            return value
         if isinstance(node, ast.List):
             return [self.parse_value(item) for item in node.elts]
         if isinstance(node, ast.Tuple):
@@ -831,7 +1144,17 @@ class TestDiscoverer:
                 key = require_hashable_key(self.parse_value(key_node), line_no)
                 result[key] = self.parse_value(value_node)
             return result
+        if isinstance(node, ast.Subscript):
+            return self.parse_subscript_value(node)
         if isinstance(node, ast.Call):
+            if self.call_name(node.func) is not None:
+                return self.parse_constructor_call(node)
+            if isinstance(node.func, ast.Name) and node.func.id in PRIMITIVE_FUNCTIONS:
+                if node.keywords:
+                    raise DiscoveryError(f"primitive call keywords are unsupported at line {line_no}")
+                self.validate_primitive_call(node.func.id, len(node.args), line_no)
+                args = [self.parse_value(arg) for arg in node.args]
+                return self.apply_primitive_value_call(node.func.id, args, line_no)
             return self.parse_constructor_call(node)
         raise DiscoveryError(f"unsupported value expression at line {line_no}")
 
@@ -950,6 +1273,7 @@ class TestDiscoverer:
                 line=line_no,
                 kind=kind,
                 args=args,
+                iteration_path=self.active_path,
                 actual_expr=result_expr() if actual_expr is None else actual_expr,
                 expected=expected,
                 comparison=comparison,
@@ -960,6 +1284,16 @@ class TestDiscoverer:
                 message_pattern=message_pattern,
                 expect_stdout=expectations.get("expect_stdout"),
                 expect_stderr=expectations.get("expect_stderr"),
+            )
+        )
+
+    def add_loop_test(self, line_no: int, passed: bool) -> None:
+        self.pending.append(
+            PendingTest(
+                line=line_no,
+                kind="loop",
+                iteration_path=self.active_path,
+                loop_pass=passed,
             )
         )
 
@@ -986,14 +1320,14 @@ class TestDiscoverer:
 
 
 def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
-    counts = Counter(test.line for test in pending)
-    seen: defaultdict[int, int] = defaultdict(int)
+    bases = [test_id_base(test.line, test.iteration_path) for test in pending]
+    counts = Counter(bases)
+    seen: defaultdict[str, int] = defaultdict(int)
     cases: list[TestCase] = []
-    for test in pending:
-        base = f"tests.py:{test.line}"
-        if counts[test.line] > 1:
-            index = seen[test.line]
-            seen[test.line] += 1
+    for test, base in zip(pending, bases):
+        if counts[base] > 1:
+            index = seen[base]
+            seen[base] += 1
             test_id = f"{base}#{index}"
         else:
             test_id = base
@@ -1003,9 +1337,11 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
                 line=test.line,
                 kind=test.kind,
                 args=test.args,
+                iteration_path=test.iteration_path,
                 actual_expr=test.actual_expr,
                 expected=test.expected,
                 comparison=test.comparison,
+                loop_pass=test.loop_pass,
                 abs_tol=test.abs_tol,
                 rel_tol=test.rel_tol,
                 exception_type=test.exception_type,
@@ -1016,6 +1352,11 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
             )
         )
     return cases
+
+
+def test_id_base(line_no: int, iteration_path: tuple[int, ...]) -> str:
+    suffix = "".join(f":{index}" for index in iteration_path)
+    return f"tests.py:{line_no}{suffix}"
 
 
 def discover_tests(tests_dir: Path | str, entrypoint: str) -> list[TestCase]:
@@ -2613,6 +2954,8 @@ def execute_case(
     case: TestCase,
     default_abs_tol: float | None,
 ) -> bool:
+    if case.kind == "loop":
+        return case.loop_pass is True
     if lang == "python":
         return run_python_case(solution_path, entrypoint, case, default_abs_tol)
     if lang in {"javascript", "typescript"}:
