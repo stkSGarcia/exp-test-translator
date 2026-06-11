@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections import Counter, defaultdict, deque
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
@@ -39,6 +40,8 @@ ERROR_RESULT = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"#\s*(expect_stdout|expect_stderr):\s*(.+)\s*$")
 MATH_ISCLOSE_REL_TOL = 1e-09
 MATH_ISCLOSE_ABS_TOL = 0.0
+DEFAULT_CASE_TIMEOUT_SECONDS = 10.0
+DEFAULT_COMPILE_TIMEOUT_SECONDS = 20.0
 LOOP_ITERATION_LIMIT = 10000
 HELPER_MODULES = {"math", "re", "collections", "decimal"}
 COLLECTION_CONSTRUCTORS = {"Counter", "deque", "defaultdict"}
@@ -157,6 +160,14 @@ class TestCase:
     expect_stderr: str | None = None
 
 
+@dataclass(frozen=True)
+class TestExecutionOptions:
+    list_tests: bool = False
+    run_id: str | None = None
+    timeout_seconds: float | None = None
+    total_timeout_seconds: float | None = None
+
+
 def tester_filename(lang: str) -> str:
     return SUPPORTED_LANGS[lang]
 
@@ -195,6 +206,18 @@ def parse_default_tolerance(raw: str | None) -> float | None:
     if value < 0 or not math.isfinite(value):
         raise DiscoveryError("invalid tolerance")
     return value
+
+
+def parse_timeout_ms(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DiscoveryError("invalid timeout") from exc
+    if value < 1:
+        raise DiscoveryError("invalid timeout")
+    return value / 1000.0
 
 
 def render_tester(lang: str, entrypoint: str) -> str:
@@ -1882,6 +1905,7 @@ def run_python_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     payload = {
         "solution_path": str(solution_path),
@@ -1894,7 +1918,7 @@ def run_python_case(
             [sys.executable, "-c", harness],
             text=True,
             capture_output=True,
-            timeout=10,
+            timeout=timeout_seconds or DEFAULT_CASE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1902,6 +1926,7 @@ def run_python_case(
 
 
 PYTHON_CASE_RUNNER = r'''
+import asyncio
 import builtins
 import inspect
 import io
@@ -2355,6 +2380,8 @@ def run(payload):
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
             value = function(*case["args"])
+            if inspect.isawaitable(value):
+                value = asyncio.run(value)
     except BaseException as exc:
         raised = exc
 
@@ -3287,6 +3314,7 @@ def run_node_case(
     lang: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     node_path = shutil.which("node")
     if node_path is None:
@@ -3307,7 +3335,7 @@ def run_node_case(
             text=True,
             capture_output=True,
             env=env,
-            timeout=10,
+            timeout=timeout_seconds or DEFAULT_CASE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -3549,6 +3577,7 @@ def run_compiled_source(
     suffix: str,
     compiler_names: list[str],
     command_builder: Any,
+    timeout_seconds: float | None = None,
 ) -> bool:
     compiler = first_available_tool(compiler_names)
     if compiler is None:
@@ -3563,7 +3592,7 @@ def run_compiled_source(
                 command_builder(compiler, source_path, binary_path),
                 text=True,
                 capture_output=True,
-                timeout=20,
+                timeout=timeout_seconds or DEFAULT_COMPILE_TIMEOUT_SECONDS,
             )
             if compile_proc.returncode != 0:
                 return False
@@ -3571,7 +3600,7 @@ def run_compiled_source(
                 [str(binary_path)],
                 text=True,
                 capture_output=True,
-                timeout=10,
+                timeout=timeout_seconds or DEFAULT_CASE_TIMEOUT_SECONDS,
             )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -3583,6 +3612,7 @@ CPP_CASE_HELPERS = r'''
 #include <cctype>
 #include <cmath>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -3596,6 +3626,7 @@ CPP_CASE_HELPERS = r'''
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace bcg {
@@ -3607,6 +3638,16 @@ template <typename T> constexpr bool is_optional_v = is_optional<std::decay_t<T>
 template <typename T> struct is_nullopt : std::false_type {};
 template <> struct is_nullopt<std::nullopt_t> : std::true_type {};
 template <typename T> constexpr bool is_nullopt_v = is_nullopt<std::decay_t<T>>::value;
+
+template <typename T> struct is_future : std::false_type {};
+template <typename T> struct is_future<std::future<T>> : std::true_type {};
+template <typename T> struct is_future<std::shared_future<T>> : std::true_type {};
+template <typename T> constexpr bool is_future_v = is_future<std::decay_t<T>>::value;
+
+template <typename T> struct future_result {};
+template <typename T> struct future_result<std::future<T>> { using type = T; };
+template <typename T> struct future_result<std::shared_future<T>> { using type = T; };
+template <typename T> using future_result_t = typename future_result<std::decay_t<T>>::type;
 
 template <typename T> struct is_vector : std::false_type {};
 template <typename T, typename Alloc> struct is_vector<std::vector<T, Alloc>> : std::true_type {};
@@ -3624,6 +3665,23 @@ template <typename T> constexpr bool is_map_v = is_map<std::decay_t<T>>::value;
 
 template <typename T>
 constexpr bool is_numeric_v = std::is_arithmetic_v<std::decay_t<T>> && !std::is_same_v<std::decay_t<T>, bool>;
+
+template <typename F>
+decltype(auto) invoke_to_completion(F&& func) {
+    using Result = decltype(func());
+    if constexpr (std::is_void_v<Result>) {
+        func();
+    } else if constexpr (is_future_v<Result>) {
+        auto future = func();
+        if constexpr (std::is_void_v<future_result_t<Result>>) {
+            future.get();
+        } else {
+            return future.get();
+        }
+    } else {
+        return func();
+    }
+}
 
 inline bool numeric_close(long double left, long double right, std::optional<long double> abs_tol, std::optional<long double> rel_tol) {
     long double absolute = abs_tol.value_or(0.0L);
@@ -4099,8 +4157,9 @@ def build_cpp_case_source(
     expect_stderr = case.expect_stderr
     checks = cpp_case_assertion_code(case, default_abs_tol)
     uses_result = expr_uses_result(case.actual_expr)
+    invocation = f"bcg::invoke_to_completion([&]() -> decltype(auto) {{ return {entrypoint}({call_args}); }})"
     if case.kind == "raises":
-        call_code = f"{entrypoint}({call_args});"
+        call_code = f"{invocation};"
         assertion = f'''
     if (__raised) {{
         bool __type_ok = {str(exception_type == "").lower()} || __exception_type == {cpp_string_literal(exception_type)} || {cpp_string_literal(exception_type)} == "Exception";
@@ -4108,10 +4167,10 @@ def build_cpp_case_source(
     }}
 '''
     elif uses_result:
-        call_code = f"auto __result = {entrypoint}({call_args});\n        {checks}"
+        call_code = f"auto __result = {invocation};\n        {checks}"
         assertion = ""
     else:
-        call_code = f"{entrypoint}({call_args});\n        {checks}"
+        call_code = f"{invocation};\n        {checks}"
         assertion = ""
     stdout_check = ""
     if expect_stdout is not None:
@@ -4166,6 +4225,7 @@ def run_cpp_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     source = build_cpp_case_source(solution_path, entrypoint, case, default_abs_tol)
     return run_compiled_source(
@@ -4180,6 +4240,7 @@ def run_cpp_case(
             "-o",
             str(binary_path),
         ],
+        timeout_seconds,
     )
 
 
@@ -4187,9 +4248,13 @@ RUST_CASE_HELPERS = r'''
 mod __bcg {
 use std::any::Any;
 use std::collections::{BTreeMap as StdBTreeMap, HashMap as StdHashMap, HashSet as StdHashSet};
+use std::future::Future;
 use std::hash::Hash;
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
+use std::ptr;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
@@ -4204,6 +4269,35 @@ pub fn bcg_btree_map<K: Ord, V>(items: Vec<(K, V)>) -> StdBTreeMap<K, V> {
 
 pub fn bcg_hash_set<T: Eq + Hash>(items: Vec<T>) -> StdHashSet<T> {
     items.into_iter().collect()
+}
+
+fn bcg_raw_waker_clone(_: *const ()) -> RawWaker {
+    bcg_noop_raw_waker()
+}
+
+fn bcg_raw_waker_noop(_: *const ()) {}
+
+static BCG_RAW_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    bcg_raw_waker_clone,
+    bcg_raw_waker_noop,
+    bcg_raw_waker_noop,
+    bcg_raw_waker_noop,
+);
+
+fn bcg_noop_raw_waker() -> RawWaker {
+    RawWaker::new(ptr::null(), &BCG_RAW_WAKER_VTABLE)
+}
+
+pub fn bcg_block_on<F: Future>(future: F) -> F::Output {
+    let waker = unsafe { Waker::from_raw(bcg_noop_raw_waker()) };
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match Future::poll(Pin::as_mut(&mut future), &mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 pub fn bcg_numeric_close(left: f64, right: f64, abs_tol: Option<f64>, rel_tol: Option<f64>) -> bool {
@@ -4832,11 +4926,23 @@ def rust_case_assertion_code(case: TestCase, default_abs_tol: float | None) -> s
     return "__passed = false;"
 
 
+def rust_entrypoint_is_async(solution_path: Path, entrypoint: str) -> bool:
+    try:
+        source = solution_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    escaped = re.escape(entrypoint)
+    if re.search(rf"\basync\s+fn\s+{escaped}\b", source):
+        return True
+    return re.search(rf"\bfn\s+{escaped}\b[^\{{;]*\bFuture\b", source, flags=re.DOTALL) is not None
+
+
 def build_rust_case_source(
     solution_path: Path,
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    await_entrypoint: bool = False,
 ) -> str:
     args = [
         f"let mut __arg{index} = {rust_literal(arg)};"
@@ -4847,6 +4953,9 @@ def build_rust_case_source(
         f"&mut __arg{index}" if index in mutation_indexes else f"__arg{index}.clone()"
         for index in range(len(case.args))
     )
+    call_expr = f"{entrypoint}({call_args})"
+    if await_entrypoint:
+        call_expr = f"__bcg::bcg_block_on({call_expr})"
     exception_type = case.exception_type or ""
     message_match = case.message_match or ""
     message_pattern = case.message_pattern or ""
@@ -4878,7 +4987,7 @@ include!({rust_include_literal(solution_path)});
 fn main() {{
     {chr(10).join(args)}
     let __call = __bcg::bcg_capture(|| {{
-        {entrypoint}({call_args})
+        {call_expr}
     }});
     {assertion}
     {stdout_check}{stderr_check}
@@ -4892,10 +5001,17 @@ def run_rust_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     if case_contains_deque(case):
         return False
-    source = build_rust_case_source(solution_path, entrypoint, case, default_abs_tol)
+    source = build_rust_case_source(
+        solution_path,
+        entrypoint,
+        case,
+        default_abs_tol,
+        rust_entrypoint_is_async(solution_path, entrypoint),
+    )
     return run_compiled_source(
         source,
         ".rs",
@@ -4907,6 +5023,7 @@ def run_rust_case(
             "-o",
             str(binary_path),
         ],
+        timeout_seconds,
     )
 
 
@@ -4929,18 +5046,34 @@ def execute_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     if case.kind == "loop":
         return case.loop_pass is True
     if lang == "python":
-        return run_python_case(solution_path, entrypoint, case, default_abs_tol)
+        return run_python_case(solution_path, entrypoint, case, default_abs_tol, timeout_seconds)
     if lang in {"javascript", "typescript"}:
-        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol)
+        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol, timeout_seconds)
     if lang == "cpp":
-        return run_cpp_case(solution_path, entrypoint, case, default_abs_tol)
+        return run_cpp_case(solution_path, entrypoint, case, default_abs_tol, timeout_seconds)
     if lang == "rust":
-        return run_rust_case(solution_path, entrypoint, case, default_abs_tol)
+        return run_rust_case(solution_path, entrypoint, case, default_abs_tol, timeout_seconds)
     return False
+
+
+def case_timeout_for_options(
+    options: TestExecutionOptions,
+    deadline: float | None,
+) -> float | None:
+    timeout_seconds = options.timeout_seconds
+    if deadline is None:
+        return timeout_seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return 0
+    if timeout_seconds is None:
+        return remaining
+    return min(timeout_seconds, remaining)
 
 
 def aggregate_results(
@@ -4949,11 +5082,20 @@ def aggregate_results(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None = None,
+    options: TestExecutionOptions | None = None,
 ) -> dict[str, Any]:
+    options = options or TestExecutionOptions()
+    deadline = None
+    if options.total_timeout_seconds is not None:
+        deadline = time.monotonic() + options.total_timeout_seconds
     passed: list[str] = []
     failed: list[str] = []
-    for case in cases:
-        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol):
+    for index, case in enumerate(cases):
+        timeout_seconds = case_timeout_for_options(options, deadline)
+        if timeout_seconds == 0:
+            failed.extend(remaining.id for remaining in cases[index:])
+            break
+        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol, timeout_seconds):
             passed.append(case.id)
         else:
             failed.append(case.id)
@@ -4997,6 +5139,12 @@ def command_test(args: argparse.Namespace) -> int:
         return 2
     try:
         default_abs_tol = parse_default_tolerance(args.tol)
+        options = TestExecutionOptions(
+            list_tests=args.list_tests,
+            run_id=args.run,
+            timeout_seconds=parse_timeout_ms(args.timeout_ms),
+            total_timeout_seconds=parse_timeout_ms(args.total_timeout_ms),
+        )
     except DiscoveryError:
         print_json_result(error_result())
         return 2
@@ -5023,7 +5171,18 @@ def command_test(args: argparse.Namespace) -> int:
         print_json_result(error_result())
         return 2
 
-    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases, default_abs_tol)
+    if options.list_tests:
+        print_json_result({"status": "pass", "passed": [case.id for case in cases], "failed": []})
+        return 0
+
+    if options.run_id is not None:
+        selected = [case for case in cases if case.id == options.run_id]
+        if not selected:
+            print_json_result(error_result())
+            return 2
+        cases = selected
+
+    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases, default_abs_tol, options)
     print_json_result(result)
     return status_exit_code(result["status"])
 
@@ -5043,6 +5202,10 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
     test.add_argument("--tol")
+    test.add_argument("--list-tests", action="store_true")
+    test.add_argument("--run")
+    test.add_argument("--timeout-ms")
+    test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
 
     return parser

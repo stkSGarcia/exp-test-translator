@@ -855,6 +855,121 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(result["passed"], ["tests.py:2", "tests.py:3:0", "tests.py:3:1"])
             self.assertEqual(result["failed"], ["tests.py:3:2"])
 
+    def test_test_command_list_run_and_invalid_timeout_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve(1) == 2
+                assert solve(2) == 4
+                """,
+            )
+            solution = root / "solution.py"
+            write(solution, "raise RuntimeError('solution should not load')\n")
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--list-tests")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                self.json_stdout(proc),
+                {"status": "pass", "passed": ["tests.py:1", "tests.py:2"], "failed": []},
+            )
+
+            write(
+                solution,
+                """
+                def solve(value):
+                    return value + 1
+                """,
+            )
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--run", "tests.py:2")
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(
+                self.json_stdout(proc),
+                {"status": "fail", "passed": [], "failed": ["tests.py:2"]},
+            )
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--run", "tests.py:99")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--timeout-ms", "nope")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+    def test_test_command_timeout_failure_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve("fast") == "fast"
+                assert solve("slow") == "slow"
+                assert solve("later") == "later"
+                """,
+            )
+            solution = root / "solution.py"
+            write(
+                solution,
+                """
+                import time
+
+                def solve(value):
+                    if value == "slow":
+                        time.sleep(0.6)
+                    return value
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--timeout-ms", "300")
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(
+                self.json_stdout(proc),
+                {"status": "fail", "passed": ["tests.py:1", "tests.py:3"], "failed": ["tests.py:2"]},
+            )
+
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve("slow") == "slow"
+                assert solve("later") == "later"
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python", "--total-timeout-ms", "100")
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(
+                self.json_stdout(proc),
+                {"status": "fail", "passed": [], "failed": ["tests.py:1", "tests.py:2"]},
+            )
+
+    def test_python_async_entrypoint_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+            solution = root / "solution.py"
+            write(
+                solution,
+                """
+                import asyncio
+
+                async def solve(value):
+                    await asyncio.sleep(0)
+                    return value + 1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
         tests_dir, solution = self.make_generated_case("javascript", "solution.js")
@@ -862,6 +977,24 @@ class BabelCodeGoatTests(unittest.TestCase):
             solution,
             """
             function solve(value) {
+              return value + 1;
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "javascript").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "javascript")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
+    def test_javascript_async_entrypoint_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("javascript", "solution.js")
+        write(
+            solution,
+            """
+            async function solve(value) {
               return value + 1;
             }
             """,
@@ -1023,6 +1156,26 @@ class BabelCodeGoatTests(unittest.TestCase):
             """
             class Solution {
               static solve(value: number): number {
+                return value + 1;
+              }
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "typescript").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("node") is None, "node is required for TypeScript smoke tests")
+    def test_typescript_async_entrypoint_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("typescript", "solution.ts")
+        write(
+            solution,
+            """
+            class Solution {
+              static async solve(value: number): Promise<number> {
                 return value + 1;
               }
             }
@@ -1210,6 +1363,29 @@ class BabelCodeGoatTests(unittest.TestCase):
         shutil.which("g++") is None and shutil.which("clang++") is None,
         "a C++ compiler is required for C++ smoke tests",
     )
+    def test_cpp_future_entrypoint_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("cpp", "solution.cpp")
+        write(
+            solution,
+            """
+            std::future<int> solve(int value) {
+              return std::async(std::launch::deferred, [value]() {
+                return value + 1;
+              });
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(
+        shutil.which("g++") is None and shutil.which("clang++") is None,
+        "a C++ compiler is required for C++ smoke tests",
+    )
     def test_cpp_null_mutation_output_tolerance_and_exception_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1330,6 +1506,24 @@ class BabelCodeGoatTests(unittest.TestCase):
             solution,
             """
             fn solve(value: i32) -> i32 {
+                value + 1
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "rust").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "rust")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_async_entrypoint_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("rust", "solution.rs")
+        write(
+            solution,
+            """
+            async fn solve(value: i32) -> i32 {
                 value + 1
             }
             """,
