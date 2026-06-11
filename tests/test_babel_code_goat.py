@@ -69,6 +69,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 "python": "tester.py",
                 "javascript": "tester.js",
                 "typescript": "tester.ts",
+                "cpp": "tester.cpp",
+                "rust": "tester.rs",
             }
             for lang, filename in expected.items():
                 with self.subTest(lang=lang):
@@ -84,6 +86,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 tests_dir / "tester.py": "py sentinel",
                 tests_dir / "tester.js": "js sentinel",
                 tests_dir / "tester.ts": "ts sentinel",
+                tests_dir / "tester.cpp": "cpp sentinel",
+                tests_dir / "tester.rs": "rust sentinel",
             }
             for path, content in sentinels.items():
                 path.write_text(content, encoding="utf-8")
@@ -109,6 +113,8 @@ class BabelCodeGoatTests(unittest.TestCase):
             "python": "tester.py",
             "javascript": "tester.js",
             "typescript": "tester.ts",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
         }
         for lang, filename in filenames.items():
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
@@ -122,6 +128,40 @@ class BabelCodeGoatTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2)
                 self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
                 self.assertFalse((tests_dir / filename).exists())
+
+    def test_compiled_target_test_preserves_existing_tester_files(self) -> None:
+        solutions = {
+            "cpp": (
+                "solution.cpp",
+                """
+                int solve(int value) {
+                  return value;
+                }
+                """,
+            ),
+            "rust": (
+                "solution.rs",
+                """
+                fn solve(value: i32) -> i32 {
+                    value
+                }
+                """,
+            ),
+        }
+        for lang, (solution_name, solution_source) in solutions.items():
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tests_dir = root / "tests"
+                write(tests_dir / "tests.py", "assert solve(1) == 1\n")
+                self.assertEqual(self.generate(tests_dir, lang).returncode, 0)
+                tester = tests_dir / bcg.tester_filename(lang)
+                before = tester.read_text(encoding="utf-8")
+                solution = root / solution_name
+                write(solution, solution_source)
+
+                self.run_cli("test", str(solution), str(tests_dir), "--lang", lang)
+
+                self.assertEqual(tester.read_text(encoding="utf-8"), before)
 
     def test_discovery_supports_allowed_constructs_and_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,6 +409,9 @@ class BabelCodeGoatTests(unittest.TestCase):
                 tests_dir = Path(tmp)
                 write(tests_dir / "tests.py", "assert solve(1) == 2\n")
                 write(tests_dir / "tester.js", "// generated tester is ignored\n")
+                write(tests_dir / "tester.ts", "// generated tester is ignored\n")
+                write(tests_dir / "tester.cpp", "// generated tester is ignored\n")
+                write(tests_dir / "tester.rs", "// generated tester is ignored\n")
                 write(tests_dir / filename, "not python\n")
 
                 with self.assertRaises(bcg.DiscoveryError):
@@ -1139,6 +1182,301 @@ class BabelCodeGoatTests(unittest.TestCase):
 
             proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
 
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(
+        shutil.which("g++") is None and shutil.which("clang++") is None,
+        "a C++ compiler is required for C++ smoke tests",
+    )
+    def test_cpp_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("cpp", "solution.cpp")
+        write(
+            solution,
+            """
+            int solve(int value) {
+              return value + 1;
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(
+        shutil.which("g++") is None and shutil.which("clang++") is None,
+        "a C++ compiler is required for C++ smoke tests",
+    )
+    def test_cpp_null_mutation_output_tolerance_and_exception_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            null_tests = root / "null_tests"
+            write(
+                null_tests / "tests.py",
+                """
+                assert solve(None) == None
+                assert solve([1, None, 3]) == [1, None, 3]
+                """,
+            )
+            null_solution = root / "null_solution.cpp"
+            write(
+                null_solution,
+                """
+                std::optional<int> solve(std::optional<int> value) {
+                  return value;
+                }
+
+                std::vector<std::optional<int>> solve(std::vector<std::optional<int>> value) {
+                  return value;
+                }
+                """,
+            )
+            self.assertEqual(self.generate(null_tests, "cpp").returncode, 0)
+            proc = self.run_cli("test", str(null_solution), str(null_tests), "--lang", "cpp")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            behavior_tests = root / "behavior_tests"
+            write(
+                behavior_tests / "tests.py",
+                """
+                import math
+
+                a = [3, 1, 2]
+                solve(a)
+                assert a == [1, 2, 3]
+                separator = 1
+
+                # expect_stdout: "hi\\n"
+                assert solve(1) == 1
+                assert math.isclose(solve(1.0), 1.0, abs_tol=0.01)
+                try:
+                    solve("boom")
+                    assert False
+                except RuntimeError as e:
+                    assert "bad" in str(e)
+                """,
+            )
+            behavior_solution = root / "behavior_solution.cpp"
+            write(
+                behavior_solution,
+                """
+                void solve(std::vector<int>& values) {
+                  std::sort(values.begin(), values.end());
+                }
+
+                int solve(int value) {
+                  std::cout << "hi\\n";
+                  return value;
+                }
+
+                long double solve(long double) {
+                  return 1.005L;
+                }
+
+                int solve(std::string) {
+                  throw std::runtime_error("bad input");
+                }
+                """,
+            )
+            self.assertEqual(self.generate(behavior_tests, "cpp").returncode, 0)
+            proc = self.run_cli("test", str(behavior_solution), str(behavior_tests), "--lang", "cpp")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            deque_tests = root / "deque_tests"
+            write(
+                deque_tests / "tests.py",
+                """
+                from collections import deque
+                assert solve(deque([1, 2, 3])) == deque([1, 2, 3])
+                """,
+            )
+            deque_solution = root / "deque_solution.cpp"
+            write(
+                deque_solution,
+                """
+                std::vector<int> solve(std::vector<int> value) {
+                  return value;
+                }
+                """,
+            )
+            self.assertEqual(self.generate(deque_tests, "cpp").returncode, 0)
+            proc = self.run_cli("test", str(deque_solution), str(deque_tests), "--lang", "cpp")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    def test_rust_deque_cases_are_detected_without_vecdeque_translation(self) -> None:
+        case = bcg.TestCase(
+            id="tests.py:1",
+            line=1,
+            source_path="tests.py",
+            kind="eq",
+            args=[deque([1, 2, 3])],
+            expected=deque([1, 2, 3]),
+        )
+
+        self.assertTrue(bcg.case_contains_deque(case))
+        self.assertFalse(bcg.run_rust_case(Path("solution.rs"), "solve", case, None))
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("rust", "solution.rs")
+        write(
+            solution,
+            """
+            fn solve(value: i32) -> i32 {
+                value + 1
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "rust").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "rust")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_null_mutation_output_tolerance_and_panic_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            null_tests = root / "null_tests"
+            write(null_tests / "tests.py", "assert solve(None) == None\n")
+            null_solution = root / "null_solution.rs"
+            write(
+                null_solution,
+                """
+                fn solve(value: Option<i32>) -> Option<i32> {
+                    value
+                }
+                """,
+            )
+            self.assertEqual(self.generate(null_tests, "rust").returncode, 0)
+            proc = self.run_cli("test", str(null_solution), str(null_tests), "--lang", "rust")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            mutation_tests = root / "mutation_tests"
+            write(
+                mutation_tests / "tests.py",
+                """
+                a = [3, 1, 2]
+                solve(a)
+                assert a == [1, 2, 3]
+                """,
+            )
+            mutation_solution = root / "mutation_solution.rs"
+            write(
+                mutation_solution,
+                """
+                fn solve(values: &mut Vec<i32>) {
+                    values.sort();
+                }
+                """,
+            )
+            self.assertEqual(self.generate(mutation_tests, "rust").returncode, 0)
+            proc = self.run_cli("test", str(mutation_solution), str(mutation_tests), "--lang", "rust")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            map_tests = root / "map_tests"
+            write(
+                map_tests / "tests.py",
+                """
+                data = {"items": [1, 2]}
+                solve(data)
+                assert data == {"items": [1, 2, 3]}
+                """,
+            )
+            map_solution = root / "map_solution.rs"
+            write(
+                map_solution,
+                """
+                use std::collections::HashMap;
+
+                fn solve(data: &mut HashMap<String, Vec<i32>>) {
+                    data.get_mut(String::from("items")).unwrap().push(3);
+                }
+                """,
+            )
+            self.assertEqual(self.generate(map_tests, "rust").returncode, 0)
+            proc = self.run_cli("test", str(map_solution), str(map_tests), "--lang", "rust")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            output_tests = root / "output_tests"
+            write(
+                output_tests / "tests.py",
+                """
+                # expect_stdout: "hi\\n"
+                assert solve(1) == 1
+                """,
+            )
+            output_solution = root / "output_solution.rs"
+            write(
+                output_solution,
+                """
+                fn solve(value: i32) -> i32 {
+                    println!("hi");
+                    value
+                }
+                """,
+            )
+            self.assertEqual(self.generate(output_tests, "rust").returncode, 0)
+            proc = self.run_cli("test", str(output_solution), str(output_tests), "--lang", "rust")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            tolerance_tests = root / "tolerance_tests"
+            write(
+                tolerance_tests / "tests.py",
+                """
+                import math
+                assert math.isclose(solve(1), 1.0, abs_tol=0.01)
+                """,
+            )
+            tolerance_solution = root / "tolerance_solution.rs"
+            write(
+                tolerance_solution,
+                """
+                fn solve(_: i32) -> f64 {
+                    1.005
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tolerance_tests, "rust").returncode, 0)
+            proc = self.run_cli("test", str(tolerance_solution), str(tolerance_tests), "--lang", "rust")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+            panic_tests = root / "panic_tests"
+            write(
+                panic_tests / "tests.py",
+                """
+                try:
+                    solve(1)
+                    assert False
+                except RuntimeError as e:
+                    assert "bad" in str(e)
+                """,
+            )
+            panic_solution = root / "panic_solution.rs"
+            write(
+                panic_solution,
+                """
+                fn solve(_: i32) {
+                    panic!("bad input");
+                }
+                """,
+            )
+            self.assertEqual(self.generate(panic_tests, "rust").returncode, 0)
+            proc = self.run_cli("test", str(panic_solution), str(panic_tests), "--lang", "rust")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
