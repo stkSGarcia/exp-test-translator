@@ -30,6 +30,8 @@ SUPPORTED_LANGS = {
     "python": "tester.py",
     "javascript": "tester.js",
     "typescript": "tester.ts",
+    "cpp": "tester.cpp",
+    "rust": "tester.rs",
 }
 METADATA_MARKER = "BABEL_CODE_GOAT_METADATA:"
 METADATA_VERSION = 1
@@ -1673,6 +1675,1524 @@ def case_to_json(case: TestCase, default_abs_tol: float | None = None) -> dict[s
     }
 
 
+def tag_is_scalar(tag: dict[str, Any], expected_type: type | tuple[type, ...] | None = None) -> bool:
+    if not isinstance(tag, dict) or tag.get("type") != "scalar":
+        return False
+    if expected_type is None:
+        return True
+    return isinstance(tag.get("value"), expected_type)
+
+
+def tag_is_numeric(tag: dict[str, Any]) -> bool:
+    if not isinstance(tag, dict):
+        return False
+    if tag.get("type") == "decimal":
+        return True
+    if tag.get("type") != "scalar":
+        return False
+    value = tag.get("value")
+    return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def tag_to_decimal(tag: dict[str, Any]) -> Decimal:
+    if tag.get("type") == "decimal":
+        return Decimal(str(tag.get("value")))
+    return Decimal(str(tag.get("value")))
+
+
+def runtime_numeric_close(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    abs_tol: Any = None,
+    rel_tol: Any = None,
+) -> bool:
+    if not tag_is_numeric(left) or not tag_is_numeric(right):
+        return False
+    abs_value = Decimal("0") if abs_tol is None else Decimal(str(abs_tol))
+    rel_value = Decimal("0") if rel_tol is None else Decimal(str(rel_tol))
+    left_value = tag_to_decimal(left)
+    right_value = tag_to_decimal(right)
+    diff = abs(left_value - right_value)
+    limit = max(abs_value, rel_value * max(abs(left_value), abs(right_value)))
+    return diff <= limit
+
+
+def tag_entries(tag: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    return list(tag.get("entries") or [])
+
+
+def tag_items(tag: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(tag.get("items") or [])
+
+
+def tag_unordered_equal(
+    left_items: list[dict[str, Any]],
+    right_items: list[dict[str, Any]],
+    abs_tol: Any = None,
+    rel_tol: Any = None,
+) -> bool:
+    unmatched = list(right_items)
+    for left_item in left_items:
+        for index, right_item in enumerate(unmatched):
+            if tag_deep_equal(left_item, right_item, abs_tol, rel_tol):
+                unmatched.pop(index)
+                break
+        else:
+            return False
+    return not unmatched
+
+
+def tag_mapping_equal(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    abs_tol: Any = None,
+    rel_tol: Any = None,
+) -> bool:
+    left_entries = tag_entries(left)
+    right_entries = tag_entries(right)
+    if len(left_entries) != len(right_entries):
+        return False
+    unmatched = list(right_entries)
+    for left_key, left_value in left_entries:
+        for index, (right_key, right_value) in enumerate(unmatched):
+            if tag_deep_equal(left_key, right_key, abs_tol, rel_tol) and tag_deep_equal(
+                left_value, right_value, abs_tol, rel_tol
+            ):
+                unmatched.pop(index)
+                break
+        else:
+            return False
+    return not unmatched
+
+
+def tag_deep_equal(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    abs_tol: Any = None,
+    rel_tol: Any = None,
+) -> bool:
+    if tag_is_numeric(left) and tag_is_numeric(right):
+        if abs_tol is not None or rel_tol is not None:
+            return runtime_numeric_close(left, right, abs_tol, rel_tol)
+        return tag_to_decimal(left) == tag_to_decimal(right)
+
+    left_type = left.get("type")
+    right_type = right.get("type")
+    if left_type == "scalar" or right_type == "scalar":
+        return left_type == right_type and left.get("value") == right.get("value")
+
+    mapping_types = {"dict", "defaultdict", "counter"}
+    if left_type in mapping_types or right_type in mapping_types:
+        return left_type in mapping_types and right_type in mapping_types and tag_mapping_equal(
+            left, right, abs_tol, rel_tol
+        )
+
+    sequence_types = {"list", "tuple", "deque"}
+    if left_type in sequence_types or right_type in sequence_types:
+        if left_type != right_type:
+            return False
+        left_items = tag_items(left)
+        right_items = tag_items(right)
+        return len(left_items) == len(right_items) and all(
+            tag_deep_equal(left_item, right_items[index], abs_tol, rel_tol)
+            for index, left_item in enumerate(left_items)
+        )
+
+    set_types = {"set", "frozenset"}
+    if left_type in set_types or right_type in set_types:
+        return left_type in set_types and right_type in set_types and len(tag_items(left)) == len(
+            tag_items(right)
+        ) and tag_unordered_equal(tag_items(left), tag_items(right), abs_tol, rel_tol)
+
+    if left_type == "decimal" or right_type == "decimal":
+        return left_type == right_type and left.get("value") == right.get("value")
+    return left == right
+
+
+def tag_truthy(tag: dict[str, Any]) -> bool:
+    kind = tag.get("type")
+    if kind == "scalar":
+        return bool(tag.get("value"))
+    if kind == "decimal":
+        return tag_to_decimal(tag) != 0
+    if kind in {"list", "tuple", "deque", "set", "frozenset"}:
+        return bool(tag_items(tag))
+    if kind in {"dict", "defaultdict", "counter"}:
+        return bool(tag_entries(tag))
+    return True
+
+
+def effective_case_abs_tol(case: TestCase, default_abs_tol: float | None) -> Any:
+    return case.abs_tol if case.abs_tol is not None else default_abs_tol
+
+
+def target_message_matches(case: TestCase, message: str) -> bool:
+    if case.message_match is None:
+        return True
+    pattern = case.message_pattern or ""
+    if case.message_match == "contains":
+        return pattern in message
+    if case.message_match == "regex":
+        try:
+            return re.search(pattern, message) is not None
+        except re.error:
+            return False
+    return False
+
+
+def target_exception_matches(case: TestCase, result: dict[str, Any]) -> bool:
+    if not result.get("raised"):
+        return False
+    expected_type = case.exception_type
+    actual_type = str(result.get("exception_type") or "Exception")
+    if expected_type is not None and expected_type != "Exception" and actual_type != expected_type:
+        return False
+    return target_message_matches(case, str(result.get("message") or ""))
+
+
+def target_case_matches(
+    case: TestCase,
+    result: dict[str, Any],
+    default_abs_tol: float | None,
+) -> bool:
+    if case.kind == "raises":
+        passed = target_exception_matches(case, result)
+    elif result.get("raised"):
+        passed = False
+    else:
+        actual = result.get("actual")
+        if not isinstance(actual, dict):
+            passed = False
+        elif case.kind == "mutation":
+            passed = tag_truthy(actual)
+        elif case.kind == "eq":
+            passed = tag_deep_equal(actual, encode_value(case.expected), effective_case_abs_tol(case, default_abs_tol), case.rel_tol)
+        elif case.kind == "ne":
+            passed = not tag_deep_equal(actual, encode_value(case.expected), effective_case_abs_tol(case, default_abs_tol), case.rel_tol)
+        elif case.kind == "isclose":
+            passed = runtime_numeric_close(actual, encode_value(case.expected), case.abs_tol, case.rel_tol)
+        elif case.kind == "absdiff":
+            expected = encode_value(case.expected)
+            if not tag_is_numeric(actual) or not tag_is_numeric(expected):
+                passed = False
+            else:
+                diff = abs(tag_to_decimal(actual) - tag_to_decimal(expected))
+                tolerance = Decimal(str(case.abs_tol))
+                passed = diff < tolerance if case.comparison == "abs_lt" else diff <= tolerance
+        elif case.kind == "truthy":
+            passed = tag_truthy(actual)
+        elif case.kind == "not":
+            passed = not tag_truthy(actual)
+        else:
+            passed = False
+
+    if case.expect_stdout is not None:
+        passed = passed and result.get("stdout") == case.expect_stdout
+    if case.expect_stderr is not None:
+        passed = passed and result.get("stderr") == case.expect_stderr
+    return bool(passed)
+
+
+def split_top_level(text: str, separator: str = ",") -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    in_string: str | None = None
+    escaped = False
+    pairs = {"<": ">", "(": ")", "[": "]", "{": "}"}
+    closing = set(pairs.values())
+    for index, char in enumerate(text):
+        if in_string is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == in_string:
+                in_string = None
+            continue
+        if char in {"'", '"'}:
+            in_string = char
+            continue
+        if char in pairs:
+            depth += 1
+            continue
+        if char in closing and depth > 0:
+            depth -= 1
+            continue
+        if char == separator and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def strip_top_level_default(param: str) -> str:
+    depth = 0
+    for index, char in enumerate(param):
+        if char in "<([{":
+            depth += 1
+        elif char in ">)]}" and depth > 0:
+            depth -= 1
+        elif char == "=" and depth == 0:
+            return param[:index].strip()
+    return param.strip()
+
+
+def json_source_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def cpp_string_literal(value: str) -> str:
+    return json_source_string(value)
+
+
+def rust_string_literal(value: str) -> str:
+    return json_source_string(value)
+
+
+def normalize_cpp_type(type_text: str | None) -> str | None:
+    if type_text is None:
+        return None
+    text = re.sub(r"\bconst\b", "", type_text).strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace(" &", "&").replace("& ", "&").replace(" *", "*").replace("* ", "*")
+    while text.endswith("&") or text.endswith("*"):
+        text = text[:-1].strip()
+    return text or None
+
+
+def normalize_rust_type(type_text: str | None) -> str | None:
+    if type_text is None:
+        return None
+    text = type_text.strip()
+    while text.startswith("&"):
+        text = text[1:].strip()
+        if text.startswith("'"):
+            text = text.split(maxsplit=1)[1] if " " in text else ""
+        if text.startswith("mut "):
+            text = text[4:].strip()
+    return text or None
+
+
+def template_args(type_text: str | None, names: tuple[str, ...]) -> list[str] | None:
+    if type_text is None:
+        return None
+    compact = normalize_cpp_type(type_text) or type_text.strip()
+    for name in names:
+        for prefix in (f"std::{name}<", f"{name}<"):
+            if not compact.startswith(prefix):
+                continue
+            args_start = len(prefix)
+            depth = 1
+            for index in range(args_start, len(compact)):
+                char = compact[index]
+                if char == "<":
+                    depth += 1
+                elif char == ">":
+                    depth -= 1
+                    if depth == 0:
+                        return split_top_level(compact[args_start:index])
+    return None
+
+
+def rust_template_args(type_text: str | None, names: tuple[str, ...]) -> list[str] | None:
+    if type_text is None:
+        return None
+    compact = normalize_rust_type(type_text) or type_text.strip()
+    for name in names:
+        for prefix in (f"std::collections::{name}<", f"{name}<"):
+            if not compact.startswith(prefix):
+                continue
+            args_start = len(prefix)
+            depth = 1
+            for index in range(args_start, len(compact)):
+                char = compact[index]
+                if char == "<":
+                    depth += 1
+                elif char == ">":
+                    depth -= 1
+                    if depth == 0:
+                        return split_top_level(compact[args_start:index])
+    return None
+
+
+def cpp_optional_inner(type_text: str | None) -> str | None:
+    args = template_args(type_text, ("optional",))
+    return args[0] if args else None
+
+
+def rust_option_inner(type_text: str | None) -> str | None:
+    args = rust_template_args(type_text, ("Option",))
+    return args[0] if args else None
+
+
+def cpp_sequence_inner(type_text: str | None) -> tuple[str, str] | None:
+    for name, concrete in (("vector", "std::vector"), ("deque", "std::deque"), ("list", "std::vector")):
+        args = template_args(type_text, (name,))
+        if args:
+            return concrete, args[0]
+    return None
+
+
+def cpp_set_inner(type_text: str | None) -> tuple[str, str] | None:
+    for name, concrete in (("set", "std::set"), ("unordered_set", "std::unordered_set")):
+        args = template_args(type_text, (name,))
+        if args:
+            return concrete, args[0]
+    return None
+
+
+def cpp_map_args(type_text: str | None) -> tuple[str, str, str] | None:
+    for name, concrete in (("unordered_map", "std::unordered_map"), ("map", "std::map")):
+        args = template_args(type_text, (name,))
+        if args and len(args) >= 2:
+            return concrete, args[0], args[1]
+    return None
+
+
+def rust_vec_inner(type_text: str | None) -> str | None:
+    args = rust_template_args(type_text, ("Vec",))
+    return args[0] if args else None
+
+
+def rust_set_inner(type_text: str | None) -> tuple[str, str] | None:
+    for name in ("HashSet", "BTreeSet"):
+        args = rust_template_args(type_text, (name,))
+        if args:
+            return name, args[0]
+    return None
+
+
+def rust_map_args(type_text: str | None) -> tuple[str, str, str] | None:
+    for name in ("HashMap", "BTreeMap"):
+        args = rust_template_args(type_text, (name,))
+        if args and len(args) >= 2:
+            return name, args[0], args[1]
+    return None
+
+
+def cpp_unify_types(types: list[str]) -> str:
+    concrete = [item for item in types if item != "std::nullopt_t"]
+    if not concrete:
+        return "std::optional<long long>"
+    if any(item.startswith("std::optional<") for item in concrete) or len(concrete) != len(types):
+        inner = cpp_unify_types([item[14:-1] if item.startswith("std::optional<") else item for item in concrete])
+        return f"std::optional<{inner}>"
+    if any(item in {"long double", "double", "float"} for item in concrete):
+        return "long double"
+    first = concrete[0]
+    if all(item == first for item in concrete):
+        return first
+    if all(item in {"int", "long", "long long"} for item in concrete):
+        return "long long"
+    return first
+
+
+def cpp_type_for_value(value: Any, context_type: str | None = None) -> str:
+    normalized = normalize_cpp_type(context_type)
+    optional_inner = cpp_optional_inner(normalized)
+    if optional_inner is not None:
+        return f"std::optional<{optional_inner}>"
+    if value is None:
+        return "std::nullopt_t"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "long long"
+    if isinstance(value, (float, Decimal)):
+        return "long double"
+    if isinstance(value, str):
+        return "std::string"
+    sequence = cpp_sequence_inner(normalized)
+    if isinstance(value, (list, tuple, deque)):
+        inner = sequence[1] if sequence else cpp_unify_types([cpp_type_for_value(item) for item in value])
+        container = sequence[0] if sequence else ("std::deque" if isinstance(value, deque) else "std::vector")
+        if isinstance(value, tuple):
+            item_types = [cpp_type_for_value(item) for item in value]
+            return f"std::tuple<{', '.join(item_types)}>"
+        return f"{container}<{inner}>"
+    map_context = cpp_map_args(normalized)
+    if isinstance(value, (dict, defaultdict, Counter)):
+        entries = list(value.items())
+        key_type = map_context[1] if map_context else cpp_unify_types([cpp_type_for_value(key) for key, _ in entries] or ["std::string"])
+        value_type = map_context[2] if map_context else (
+            "long long" if isinstance(value, Counter) else cpp_unify_types([cpp_type_for_value(item) for _, item in entries] or ["long long"])
+        )
+        container = map_context[0] if map_context else "std::map"
+        return f"{container}<{key_type}, {value_type}>"
+    set_context = cpp_set_inner(normalized)
+    if isinstance(value, (set, frozenset)):
+        inner = set_context[1] if set_context else cpp_unify_types([cpp_type_for_value(item) for item in value] or ["long long"])
+        container = set_context[0] if set_context else "std::set"
+        return f"{container}<{inner}>"
+    return "auto"
+
+
+def render_cpp_value(value: Any, context_type: str | None = None) -> str:
+    normalized = normalize_cpp_type(context_type)
+    optional_inner = cpp_optional_inner(normalized)
+    if optional_inner is not None:
+        if value is None:
+            return f"std::optional<{optional_inner}>{{}}"
+        return f"std::optional<{optional_inner}>{{{render_cpp_value(value, optional_inner)}}}"
+    if value is None:
+        return "std::nullopt"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, Decimal):
+        return f"std::stold({cpp_string_literal(str(value))})"
+    if isinstance(value, str):
+        return f"std::string({cpp_string_literal(value)})"
+    if isinstance(value, tuple):
+        item_types = [cpp_type_for_value(item) for item in value]
+        items = ", ".join(render_cpp_value(item, item_type) for item, item_type in zip(value, item_types))
+        return f"std::tuple<{', '.join(item_types)}>{{{items}}}"
+    sequence = cpp_sequence_inner(normalized)
+    if isinstance(value, (list, deque)):
+        value_type = cpp_type_for_value(value, normalized)
+        inner = sequence[1] if sequence else template_args(value_type, ("vector", "deque"))[0]  # type: ignore[index]
+        items = ", ".join(render_cpp_value(item, inner) for item in value)
+        return f"{value_type}{{{items}}}"
+    map_context = cpp_map_args(normalized)
+    if isinstance(value, (dict, defaultdict, Counter)):
+        value_type = cpp_type_for_value(value, normalized)
+        key_type = map_context[1] if map_context else (cpp_map_args(value_type) or ("", "std::string", "long long"))[1]
+        item_type = map_context[2] if map_context else (cpp_map_args(value_type) or ("", "std::string", "long long"))[2]
+        entries = list(value.items())
+        rendered = ", ".join(
+            "{" + render_cpp_value(key, key_type) + ", " + render_cpp_value(count if isinstance(value, Counter) else item, item_type) + "}"
+            for key, item in entries
+            for count in ([item] if isinstance(value, Counter) else [None])
+        )
+        return f"{value_type}{{{rendered}}}"
+    set_context = cpp_set_inner(normalized)
+    if isinstance(value, (set, frozenset)):
+        value_type = cpp_type_for_value(value, normalized)
+        inner = set_context[1] if set_context else (cpp_set_inner(value_type) or ("", "long long"))[1]
+        items = ", ".join(render_cpp_value(item, inner) for item in value)
+        return f"{value_type}{{{items}}}"
+    raise DiscoveryError(f"unsupported C++ value: {value!r}")
+
+
+def render_rust_value(value: Any, context_type: str | None = None) -> str:
+    normalized = normalize_rust_type(context_type)
+    option_inner = rust_option_inner(normalized)
+    if option_inner is not None:
+        if value is None:
+            return f"None::<{option_inner}>"
+        return f"Some({render_rust_value(value, option_inner)})"
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        if normalized in {"f32", "f64"}:
+            return f"{value}.0"
+        return str(value)
+    if isinstance(value, (float, Decimal)):
+        return str(value)
+    if isinstance(value, str):
+        if normalized in {"&str", "str"}:
+            return rust_string_literal(value)
+        return f"String::from({rust_string_literal(value)})"
+    if isinstance(value, tuple):
+        items = ", ".join(render_rust_value(item) for item in value)
+        comma = "," if len(value) == 1 else ""
+        return f"({items}{comma})"
+    inner_context = rust_vec_inner(normalized)
+    if isinstance(value, (list, deque)):
+        items = ", ".join(render_rust_value(item, inner_context) for item in value)
+        return f"vec![{items}]"
+    map_context = rust_map_args(normalized)
+    if isinstance(value, (dict, defaultdict, Counter)):
+        container = map_context[0] if map_context else "HashMap"
+        key_type = map_context[1] if map_context else None
+        item_type = map_context[2] if map_context else None
+        entries = list(value.items())
+        lines = [f"let mut __bcg_map = std::collections::{container}::new();"]
+        for key, item in entries:
+            value_item = item
+            lines.append(
+                f"__bcg_map.insert({render_rust_value(key, key_type)}, {render_rust_value(value_item, item_type)});"
+            )
+        lines.append("__bcg_map")
+        return "{ " + " ".join(lines) + " }"
+    set_context = rust_set_inner(normalized)
+    if isinstance(value, (set, frozenset)):
+        container = set_context[0] if set_context else "HashSet"
+        inner_type = set_context[1] if set_context else None
+        lines = [f"let mut __bcg_set = std::collections::{container}::new();"]
+        for item in value:
+            lines.append(f"__bcg_set.insert({render_rust_value(item, inner_type)});")
+        lines.append("__bcg_set")
+        return "{ " + " ".join(lines) + " }"
+    raise DiscoveryError(f"unsupported Rust value: {value!r}")
+
+
+def parse_cpp_param_types(solution_source: str, entrypoint: str) -> list[str]:
+    pattern = re.compile(
+        rf"(?:^|[;\n}}])\s*(?:template\s*<[^>]+>\s*)?(?:[\w:<>~,\s*&]+?)\s+{re.escape(entrypoint)}\s*\(([^)]*)\)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(solution_source)
+    if not match:
+        return []
+    raw = match.group(1).strip()
+    if not raw or raw == "void":
+        return []
+    params: list[str] = []
+    for param in split_top_level(raw):
+        cleaned = strip_top_level_default(param)
+        cleaned = re.sub(r"\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\[[^\]]*\])?$", "", cleaned).strip()
+        params.append(cleaned)
+    return params
+
+
+def parse_rust_param_types(solution_source: str, entrypoint: str) -> list[str]:
+    pattern = re.compile(rf"(?:pub\s+)?fn\s+{re.escape(entrypoint)}\s*\((.*?)\)", re.DOTALL)
+    match = pattern.search(solution_source)
+    if not match:
+        return []
+    raw = match.group(1).strip()
+    if not raw:
+        return []
+    params: list[str] = []
+    for param in split_top_level(raw):
+        if ":" not in param:
+            continue
+        params.append(param.split(":", 1)[1].strip())
+    return params
+
+
+def value_contains_deque(value: Any) -> bool:
+    if isinstance(value, deque):
+        return True
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(value_contains_deque(item) for item in value)
+    if isinstance(value, (dict, defaultdict, Counter)):
+        return any(value_contains_deque(key) or value_contains_deque(item) for key, item in value.items())
+    return False
+
+
+def expr_contains_deque(expr: dict[str, Any]) -> bool:
+    op = expr.get("op")
+    if op == "value":
+        return value_contains_deque(expr.get("value"))
+    if op in {"list", "tuple", "set"}:
+        return any(expr_contains_deque(item) for item in expr.get("items", []))
+    if op == "dict":
+        return any(expr_contains_deque(key) or expr_contains_deque(value) for key, value in expr.get("entries", []))
+    for key in ("operand", "left", "right", "receiver", "value", "index", "lower", "upper", "step"):
+        item = expr.get(key)
+        if isinstance(item, dict) and expr_contains_deque(item):
+            return True
+    return any(expr_contains_deque(item) for item in expr.get("args", []))
+
+
+def case_requires_deque(case: TestCase) -> bool:
+    return (
+        any(value_contains_deque(arg) for arg in case.args)
+        or value_contains_deque(case.expected)
+        or expr_contains_deque(case.actual_expr)
+    )
+
+
+def render_cpp_expr(expr: dict[str, Any], variables: dict[str, str]) -> str:
+    op = expr["op"]
+    if op == "result":
+        return "__bcg_result"
+    if op == "var":
+        return variables[expr["name"]]
+    if op == "value":
+        return render_cpp_value(expr["value"])
+    if op in {"list", "tuple", "set"}:
+        values = [render_cpp_expr(item, variables) for item in expr["items"]]
+        if op == "tuple":
+            return f"std::make_tuple({', '.join(values)})"
+        container = "std::set" if op == "set" else "std::vector"
+        return f"{container}{{{', '.join(values)}}}"
+    if op == "dict":
+        entries = [
+            "{" + render_cpp_expr(key, variables) + ", " + render_cpp_expr(value, variables) + "}"
+            for key, value in expr["entries"]
+        ]
+        return f"std::map{{{', '.join(entries)}}}"
+    if op == "unary":
+        operand = render_cpp_expr(expr["operand"], variables)
+        if expr["operator"] == "uadd":
+            return f"(+({operand}))"
+        if expr["operator"] == "usub":
+            return f"(-({operand}))"
+        if expr["operator"] == "not":
+            return f"(!__bcg_truthy({operand}))"
+    if op == "binary":
+        left = render_cpp_expr(expr["left"], variables)
+        right = render_cpp_expr(expr["right"], variables)
+        operator = {
+            "add": "+",
+            "sub": "-",
+            "mult": "*",
+            "truediv": "/",
+            "floordiv": "/",
+            "mod": "%",
+        }.get(expr["operator"])
+        if operator is not None:
+            return f"(({left}) {operator} ({right}))"
+        if expr["operator"] == "pow":
+            return f"std::pow(({left}), ({right}))"
+    if op == "compare":
+        left = render_cpp_expr(expr["left"], variables)
+        right = render_cpp_expr(expr["right"], variables)
+        operator = expr["operator"]
+        if operator == "eq":
+            return f"__bcg_deep_equal(({left}), ({right}))"
+        if operator == "ne":
+            return f"(!__bcg_deep_equal(({left}), ({right})))"
+        if operator == "lt":
+            return f"(({left}) < ({right}))"
+        if operator == "lte":
+            return f"(({left}) <= ({right}))"
+        if operator == "gt":
+            return f"(({left}) > ({right}))"
+        if operator == "gte":
+            return f"(({left}) >= ({right}))"
+        if operator == "in":
+            return f"__bcg_contains(({right}), ({left}))"
+        if operator == "not_in":
+            return f"(!__bcg_contains(({right}), ({left})))"
+    if op == "call":
+        args = [render_cpp_expr(arg, variables) for arg in expr["args"]]
+        name = expr["name"]
+        if name == "abs":
+            return f"std::abs({args[0]})"
+        if name == "bool":
+            return f"__bcg_truthy({args[0]})"
+        if name == "float":
+            return f"static_cast<long double>({args[0]})"
+        if name == "int":
+            return f"static_cast<long long>({args[0]})"
+        if name == "len":
+            return f"__bcg_len({args[0]})"
+        if name in {"list", "tuple"}:
+            return f"__bcg_to_vector({args[0]})"
+        if name in {"set", "frozenset"}:
+            return f"__bcg_to_set({args[0]})"
+        if name == "sorted":
+            return f"__bcg_sorted({args[0]})"
+        if name == "str":
+            return f"__bcg_stringify({args[0]})"
+        if name == "sum":
+            return f"__bcg_sum({args[0]})"
+        if name == "max":
+            return f"__bcg_max({', '.join(args)})"
+        if name == "min":
+            return f"__bcg_min({', '.join(args)})"
+    if op == "method":
+        receiver = render_cpp_expr(expr["receiver"], variables)
+        args = [render_cpp_expr(arg, variables) for arg in expr["args"]]
+        joined = ", ".join([receiver] + args)
+        return f"__bcg_str_{expr['name']}({joined})"
+    if op == "subscript":
+        return f"__bcg_subscript({render_cpp_expr(expr['value'], variables)}, {render_cpp_expr(expr['index'], variables)})"
+    if op == "slice":
+        lower = "std::nullopt" if expr["lower"] is None else render_cpp_expr(expr["lower"], variables)
+        upper = "std::nullopt" if expr["upper"] is None else render_cpp_expr(expr["upper"], variables)
+        step = "std::nullopt" if expr["step"] is None else render_cpp_expr(expr["step"], variables)
+        return f"__bcg_slice({render_cpp_expr(expr['value'], variables)}, {lower}, {upper}, {step})"
+    raise DiscoveryError(f"unsupported C++ expression operation: {op}")
+
+
+def rust_call_arg(name: str, param_type: str | None) -> str:
+    stripped = (param_type or "").strip()
+    if stripped.startswith("&mut"):
+        return f"&mut {name}"
+    if stripped.startswith("&"):
+        return f"&{name}"
+    return name
+
+
+def render_rust_expr(expr: dict[str, Any], variables: dict[str, str]) -> str:
+    op = expr["op"]
+    if op == "result":
+        return "__bcg_result"
+    if op == "var":
+        return variables[expr["name"]]
+    if op == "value":
+        return render_rust_value(expr["value"])
+    if op in {"list", "tuple", "set"}:
+        values = [render_rust_expr(item, variables) for item in expr["items"]]
+        if op == "tuple":
+            comma = "," if len(values) == 1 else ""
+            return f"({', '.join(values)}{comma})"
+        if op == "set":
+            return "{ let mut __bcg_set = std::collections::HashSet::new(); " + " ".join(
+                f"__bcg_set.insert({value});" for value in values
+            ) + " __bcg_set }"
+        return f"vec![{', '.join(values)}]"
+    if op == "dict":
+        lines = ["let mut __bcg_map = std::collections::HashMap::new();"]
+        for key, value in expr["entries"]:
+            lines.append(f"__bcg_map.insert({render_rust_expr(key, variables)}, {render_rust_expr(value, variables)});")
+        lines.append("__bcg_map")
+        return "{ " + " ".join(lines) + " }"
+    if op == "unary":
+        operand = render_rust_expr(expr["operand"], variables)
+        if expr["operator"] == "uadd":
+            return f"({operand})"
+        if expr["operator"] == "usub":
+            return f"(-({operand}))"
+        if expr["operator"] == "not":
+            return f"(!__bcg_truthy(&({operand})))"
+    if op == "binary":
+        left = render_rust_expr(expr["left"], variables)
+        right = render_rust_expr(expr["right"], variables)
+        operator = {
+            "add": "+",
+            "sub": "-",
+            "mult": "*",
+            "truediv": "/",
+            "floordiv": "/",
+            "mod": "%",
+        }.get(expr["operator"])
+        if operator is not None:
+            return f"(({left}) {operator} ({right}))"
+        if expr["operator"] == "pow":
+            return f"(({left}).powf(({right}) as f64))"
+    if op == "compare":
+        left = render_rust_expr(expr["left"], variables)
+        right = render_rust_expr(expr["right"], variables)
+        operator = expr["operator"]
+        if operator == "eq":
+            return f"__bcg_deep_equal(&({left}), &({right}))"
+        if operator == "ne":
+            return f"(!__bcg_deep_equal(&({left}), &({right})))"
+        if operator == "lt":
+            return f"(({left}) < ({right}))"
+        if operator == "lte":
+            return f"(({left}) <= ({right}))"
+        if operator == "gt":
+            return f"(({left}) > ({right}))"
+        if operator == "gte":
+            return f"(({left}) >= ({right}))"
+        if operator == "in":
+            return f"__bcg_contains(&({right}), &({left}))"
+        if operator == "not_in":
+            return f"(!__bcg_contains(&({right}), &({left})))"
+    if op == "call":
+        args = [render_rust_expr(arg, variables) for arg in expr["args"]]
+        name = expr["name"]
+        if name == "abs":
+            return f"({args[0]}).abs()"
+        if name == "bool":
+            return f"__bcg_truthy(&({args[0]}))"
+        if name == "float":
+            return f"(({args[0]}) as f64)"
+        if name == "int":
+            return f"(({args[0]}) as i64)"
+        if name == "len":
+            return f"__bcg_len(&({args[0]}))"
+        if name in {"list", "tuple"}:
+            return f"__bcg_to_vec(&({args[0]}))"
+        if name in {"set", "frozenset"}:
+            return f"__bcg_to_set(&({args[0]}))"
+        if name == "sorted":
+            return f"__bcg_sorted(&({args[0]}))"
+        if name == "str":
+            return f"format!(\"{{}}\", ({args[0]}))"
+        if name == "sum":
+            return f"__bcg_sum(&({args[0]}))"
+        if name == "max":
+            return f"__bcg_max(vec![{', '.join(args)}])"
+        if name == "min":
+            return f"__bcg_min(vec![{', '.join(args)}])"
+    if op == "method":
+        receiver = render_rust_expr(expr["receiver"], variables)
+        args = [render_rust_expr(arg, variables) for arg in expr["args"]]
+        joined = ", ".join([f"&({receiver})"] + args)
+        return f"__bcg_str_{expr['name']}({joined})"
+    if op == "subscript":
+        return f"__bcg_subscript(&({render_rust_expr(expr['value'], variables)}), &({render_rust_expr(expr['index'], variables)}))"
+    if op == "slice":
+        lower = "None" if expr["lower"] is None else f"Some({render_rust_expr(expr['lower'], variables)} as isize)"
+        upper = "None" if expr["upper"] is None else f"Some({render_rust_expr(expr['upper'], variables)} as isize)"
+        step = "None" if expr["step"] is None else f"Some({render_rust_expr(expr['step'], variables)} as isize)"
+        return f"__bcg_slice(&({render_rust_expr(expr['value'], variables)}), {lower}, {upper}, {step})"
+    raise DiscoveryError(f"unsupported Rust expression operation: {op}")
+
+
+CPP_HARNESS_HELPERS = r'''
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <deque>
+#include <iomanip>
+#include <iostream>
+#include <list>
+#include <map>
+#include <optional>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+static string __bcg_json_string(const string& value) {
+    ostringstream out;
+    out << '"';
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '"': out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    out << "\\u" << hex << setw(4) << setfill('0') << static_cast<int>(ch) << dec << setfill(' ');
+                } else {
+                    out << ch;
+                }
+        }
+    }
+    out << '"';
+    return out.str();
+}
+
+static string __bcg_number(long double value) {
+    if (!isfinite(static_cast<double>(value))) {
+        return "null";
+    }
+    ostringstream out;
+    out << setprecision(21) << value;
+    return out.str();
+}
+
+static string __bcg_to_json(const bool& value) {
+    return string("{\"type\":\"scalar\",\"value\":") + (value ? "true" : "false") + "}";
+}
+
+template <typename T, typename enable_if<is_integral<T>::value && !is_same<T, bool>::value, int>::type = 0>
+static string __bcg_to_json(const T& value) {
+    return string("{\"type\":\"scalar\",\"value\":") + to_string(static_cast<long long>(value)) + "}";
+}
+
+template <typename T, typename enable_if<is_floating_point<T>::value, int>::type = 0>
+static string __bcg_to_json(const T& value) {
+    return string("{\"type\":\"scalar\",\"value\":") + __bcg_number(static_cast<long double>(value)) + "}";
+}
+
+static string __bcg_to_json(const string& value) {
+    return string("{\"type\":\"scalar\",\"value\":") + __bcg_json_string(value) + "}";
+}
+
+static string __bcg_to_json(const char* value) {
+    return __bcg_to_json(string(value));
+}
+
+static string __bcg_to_json(nullopt_t) {
+    return "{\"type\":\"scalar\",\"value\":null}";
+}
+
+template <typename T>
+static string __bcg_to_json(const optional<T>& value) {
+    if (!value.has_value()) {
+        return __bcg_to_json(nullopt);
+    }
+    return __bcg_to_json(*value);
+}
+
+template <typename T>
+static string __bcg_json_items(const T& values, const string& type_name) {
+    string out = "{\"type\":\"" + type_name + "\",\"items\":[";
+    bool first = true;
+    for (const auto& item : values) {
+        if (!first) out += ",";
+        first = false;
+        out += __bcg_to_json(item);
+    }
+    out += "]}";
+    return out;
+}
+
+template <typename T>
+static string __bcg_to_json(const vector<T>& values) {
+    return __bcg_json_items(values, "list");
+}
+
+template <typename T>
+static string __bcg_to_json(const deque<T>& values) {
+    return __bcg_json_items(values, "deque");
+}
+
+template <typename T>
+static string __bcg_to_json(const set<T>& values) {
+    return __bcg_json_items(values, "set");
+}
+
+template <typename T>
+static string __bcg_to_json(const unordered_set<T>& values) {
+    return __bcg_json_items(values, "set");
+}
+
+template <typename K, typename V>
+static string __bcg_json_map_entries(const K& values, const string& type_name) {
+    string out = "{\"type\":\"" + type_name + "\",\"entries\":[";
+    bool first = true;
+    for (const auto& item : values) {
+        if (!first) out += ",";
+        first = false;
+        out += "[" + __bcg_to_json(item.first) + "," + __bcg_to_json(item.second) + "]";
+    }
+    out += "]}";
+    return out;
+}
+
+template <typename K, typename V>
+static string __bcg_to_json(const map<K, V>& values) {
+    return __bcg_json_map_entries<map<K, V>, V>(values, "dict");
+}
+
+template <typename K, typename V>
+static string __bcg_to_json(const unordered_map<K, V>& values) {
+    return __bcg_json_map_entries<unordered_map<K, V>, V>(values, "dict");
+}
+
+template <class Tuple, size_t... Indexes>
+static string __bcg_tuple_json_impl(const Tuple& values, index_sequence<Indexes...>) {
+    vector<string> items = {__bcg_to_json(get<Indexes>(values))...};
+    string out = "{\"type\":\"tuple\",\"items\":[";
+    for (size_t index = 0; index < items.size(); ++index) {
+        if (index) out += ",";
+        out += items[index];
+    }
+    out += "]}";
+    return out;
+}
+
+template <typename... Ts>
+static string __bcg_to_json(const tuple<Ts...>& values) {
+    return __bcg_tuple_json_impl(values, index_sequence_for<Ts...>{});
+}
+
+template <typename L, typename R>
+static bool __bcg_deep_equal(const L& left, const R& right) {
+    return __bcg_to_json(left) == __bcg_to_json(right);
+}
+
+template <typename T>
+static bool __bcg_truthy(const T& value) {
+    return static_cast<bool>(value);
+}
+
+static bool __bcg_truthy(const string& value) { return !value.empty(); }
+template <typename T> static bool __bcg_truthy(const vector<T>& value) { return !value.empty(); }
+template <typename T> static bool __bcg_truthy(const deque<T>& value) { return !value.empty(); }
+template <typename T> static bool __bcg_truthy(const set<T>& value) { return !value.empty(); }
+template <typename K, typename V> static bool __bcg_truthy(const map<K, V>& value) { return !value.empty(); }
+template <typename T> static bool __bcg_truthy(const optional<T>& value) { return value.has_value() && __bcg_truthy(*value); }
+
+template <typename T>
+static auto __bcg_len(const T& value) -> decltype(value.size()) { return value.size(); }
+
+template <typename T>
+static vector<T> __bcg_to_vector(const vector<T>& value) { return value; }
+template <typename T>
+static vector<T> __bcg_to_vector(const set<T>& value) { return vector<T>(value.begin(), value.end()); }
+static vector<char> __bcg_to_vector(const string& value) { return vector<char>(value.begin(), value.end()); }
+
+template <typename T>
+static set<T> __bcg_to_set(const vector<T>& value) { return set<T>(value.begin(), value.end()); }
+template <typename T>
+static set<T> __bcg_to_set(const set<T>& value) { return value; }
+
+template <typename T>
+static vector<T> __bcg_sorted(const vector<T>& value) {
+    vector<T> copy = value;
+    sort(copy.begin(), copy.end());
+    return copy;
+}
+
+template <typename T>
+static vector<T> __bcg_sorted(const set<T>& value) {
+    return vector<T>(value.begin(), value.end());
+}
+
+template <typename T>
+static auto __bcg_sum(const T& value) {
+    typename T::value_type total{};
+    for (const auto& item : value) total += item;
+    return total;
+}
+
+template <typename T>
+static T __bcg_max(const vector<T>& value) { return *max_element(value.begin(), value.end()); }
+template <typename T, typename... Rest>
+static T __bcg_max(const T& first, const Rest&... rest) { return max(first, __bcg_max(vector<T>{rest...})); }
+template <typename T>
+static T __bcg_min(const vector<T>& value) { return *min_element(value.begin(), value.end()); }
+template <typename T, typename... Rest>
+static T __bcg_min(const T& first, const Rest&... rest) { return min(first, __bcg_min(vector<T>{rest...})); }
+
+template <typename T, typename U>
+static bool __bcg_contains(const vector<T>& values, const U& item) {
+    return any_of(values.begin(), values.end(), [&](const T& value) { return __bcg_deep_equal(value, item); });
+}
+template <typename T, typename U>
+static bool __bcg_contains(const set<T>& values, const U& item) {
+    return any_of(values.begin(), values.end(), [&](const T& value) { return __bcg_deep_equal(value, item); });
+}
+static bool __bcg_contains(const string& value, const string& item) { return value.find(item) != string::npos; }
+template <typename K, typename V, typename U>
+static bool __bcg_contains(const map<K, V>& values, const U& item) {
+    return any_of(values.begin(), values.end(), [&](const auto& entry) { return __bcg_deep_equal(entry.first, item); });
+}
+
+template <typename T>
+static auto __bcg_subscript(const vector<T>& value, long long index) {
+    long long resolved = index < 0 ? static_cast<long long>(value.size()) + index : index;
+    return value.at(static_cast<size_t>(resolved));
+}
+static string __bcg_subscript(const string& value, long long index) {
+    long long resolved = index < 0 ? static_cast<long long>(value.size()) + index : index;
+    return string(1, value.at(static_cast<size_t>(resolved)));
+}
+template <typename K, typename V>
+static V __bcg_subscript(const map<K, V>& value, const K& key) { return value.at(key); }
+
+template <typename T>
+static vector<T> __bcg_slice(const vector<T>& value, optional<long long> lower, optional<long long> upper, optional<long long> step) {
+    long long actual_step = step.value_or(1);
+    vector<T> result;
+    if (actual_step == 0) return result;
+    long long size = static_cast<long long>(value.size());
+    long long start = lower.value_or(actual_step > 0 ? 0 : size - 1);
+    long long stop = upper.value_or(actual_step > 0 ? size : -1);
+    if (start < 0) start += size;
+    if (stop < 0 && upper.has_value()) stop += size;
+    if (actual_step > 0) {
+        for (long long i = start; i < stop && i < size; i += actual_step) result.push_back(value.at(static_cast<size_t>(i)));
+    } else {
+        for (long long i = start; i > stop && i >= 0; i += actual_step) result.push_back(value.at(static_cast<size_t>(i)));
+    }
+    return result;
+}
+
+static string __bcg_slice(const string& value, optional<long long> lower, optional<long long> upper, optional<long long> step) {
+    vector<char> chars(value.begin(), value.end());
+    auto sliced = __bcg_slice(chars, lower, upper, step);
+    return string(sliced.begin(), sliced.end());
+}
+
+template <typename T>
+static string __bcg_stringify(const T& value) {
+    ostringstream out;
+    out << value;
+    return out.str();
+}
+
+static string __bcg_str_upper(string value) {
+    transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(toupper(c)); });
+    return value;
+}
+static string __bcg_str_lower(string value) {
+    transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    return value;
+}
+static bool __bcg_str_startswith(const string& value, const string& needle) { return value.rfind(needle, 0) == 0; }
+static bool __bcg_str_endswith(const string& value, const string& needle) {
+    return value.size() >= needle.size() && value.compare(value.size() - needle.size(), needle.size(), needle) == 0;
+}
+static long long __bcg_str_find(const string& value, const string& needle) {
+    auto found = value.find(needle);
+    return found == string::npos ? -1 : static_cast<long long>(found);
+}
+static vector<string> __bcg_str_split(const string& value, const string& sep) {
+    vector<string> result;
+    size_t start = 0;
+    while (true) {
+        size_t pos = value.find(sep, start);
+        if (pos == string::npos) {
+            result.push_back(value.substr(start));
+            return result;
+        }
+        result.push_back(value.substr(start, pos - start));
+        start = pos + sep.size();
+    }
+}
+static string __bcg_str_join(const string& sep, const vector<string>& values) {
+    string out;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) out += sep;
+        out += values[i];
+    }
+    return out;
+}
+static long long __bcg_str_count(const string& value, const string& needle) {
+    if (needle.empty()) return static_cast<long long>(value.size()) + 1;
+    long long count = 0;
+    size_t start = 0;
+    while ((start = value.find(needle, start)) != string::npos) {
+        ++count;
+        start += needle.size();
+    }
+    return count;
+}
+static string __bcg_str_replace(string value, const string& old_value, const string& new_value) {
+    size_t start = 0;
+    while ((start = value.find(old_value, start)) != string::npos) {
+        value.replace(start, old_value.size(), new_value);
+        start += new_value.size();
+    }
+    return value;
+}
+static string __bcg_trim_chars(string value, const string& chars, bool left, bool right) {
+    if (left) value.erase(value.begin(), find_if(value.begin(), value.end(), [&](char c) { return chars.find(c) == string::npos; }));
+    if (right) value.erase(find_if(value.rbegin(), value.rend(), [&](char c) { return chars.find(c) == string::npos; }).base(), value.end());
+    return value;
+}
+static string __bcg_str_strip(const string& value) { return __bcg_trim_chars(value, " \t\n\r\f\v", true, true); }
+static string __bcg_str_strip(const string& value, const string& chars) { return __bcg_trim_chars(value, chars, true, true); }
+static string __bcg_str_lstrip(const string& value) { return __bcg_trim_chars(value, " \t\n\r\f\v", true, false); }
+static string __bcg_str_lstrip(const string& value, const string& chars) { return __bcg_trim_chars(value, chars, true, false); }
+static string __bcg_str_rstrip(const string& value) { return __bcg_trim_chars(value, " \t\n\r\f\v", false, true); }
+static string __bcg_str_rstrip(const string& value, const string& chars) { return __bcg_trim_chars(value, chars, false, true); }
+'''
+
+
+RUST_HARNESS_HELPERS = r'''
+#![allow(dead_code)]
+#![allow(unused_imports)]
+use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Display;
+use std::hash::Hash;
+use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+fn __bcg_json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if c < '\u{20}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+trait BcgToJson {
+    fn __bcg_to_json(&self) -> String;
+}
+
+trait BcgTruthy {
+    fn __bcg_truthy(&self) -> bool;
+}
+
+impl<T: BcgToJson + ?Sized> BcgToJson for &T {
+    fn __bcg_to_json(&self) -> String { (*self).__bcg_to_json() }
+}
+
+impl<T: BcgTruthy + ?Sized> BcgTruthy for &T {
+    fn __bcg_truthy(&self) -> bool { (*self).__bcg_truthy() }
+}
+
+impl BcgToJson for bool {
+    fn __bcg_to_json(&self) -> String {
+        format!("{{\"type\":\"scalar\",\"value\":{}}}", if *self { "true" } else { "false" })
+    }
+}
+impl BcgTruthy for bool { fn __bcg_truthy(&self) -> bool { *self } }
+
+macro_rules! impl_bcg_int {
+    ($($t:ty),*) => {$(
+        impl BcgToJson for $t {
+            fn __bcg_to_json(&self) -> String { format!("{{\"type\":\"scalar\",\"value\":{}}}", *self) }
+        }
+        impl BcgTruthy for $t { fn __bcg_truthy(&self) -> bool { *self != 0 } }
+    )*};
+}
+impl_bcg_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+
+macro_rules! impl_bcg_float {
+    ($($t:ty),*) => {$(
+        impl BcgToJson for $t {
+            fn __bcg_to_json(&self) -> String {
+                if self.is_finite() {
+                    format!("{{\"type\":\"scalar\",\"value\":{}}}", *self)
+                } else {
+                    String::from("{\"type\":\"scalar\",\"value\":null}")
+                }
+            }
+        }
+        impl BcgTruthy for $t { fn __bcg_truthy(&self) -> bool { *self != 0.0 && !self.is_nan() } }
+    )*};
+}
+impl_bcg_float!(f32, f64);
+
+impl BcgToJson for String {
+    fn __bcg_to_json(&self) -> String { format!("{{\"type\":\"scalar\",\"value\":{}}}", __bcg_json_string(self)) }
+}
+impl BcgTruthy for String { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+impl BcgToJson for str {
+    fn __bcg_to_json(&self) -> String { format!("{{\"type\":\"scalar\",\"value\":{}}}", __bcg_json_string(self)) }
+}
+impl BcgTruthy for str { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+
+impl<T: BcgToJson> BcgToJson for Option<T> {
+    fn __bcg_to_json(&self) -> String {
+        match self {
+            Some(value) => value.__bcg_to_json(),
+            None => String::from("{\"type\":\"scalar\",\"value\":null}"),
+        }
+    }
+}
+impl<T: BcgTruthy> BcgTruthy for Option<T> {
+    fn __bcg_truthy(&self) -> bool { self.as_ref().map(|value| value.__bcg_truthy()).unwrap_or(false) }
+}
+
+fn __bcg_json_items<T: BcgToJson>(values: impl Iterator<Item = T>, type_name: &str) -> String {
+    let mut out = format!("{{\"type\":\"{}\",\"items\":[", type_name);
+    let mut first = true;
+    for item in values {
+        if !first { out.push(','); }
+        first = false;
+        out.push_str(&item.__bcg_to_json());
+    }
+    out.push_str("]}");
+    out
+}
+
+impl<T: BcgToJson + Clone> BcgToJson for Vec<T> {
+    fn __bcg_to_json(&self) -> String { __bcg_json_items(self.iter().cloned(), "list") }
+}
+impl<T> BcgTruthy for Vec<T> { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+
+impl<T: BcgToJson + Clone + Eq + Hash> BcgToJson for HashSet<T> {
+    fn __bcg_to_json(&self) -> String { __bcg_json_items(self.iter().cloned(), "set") }
+}
+impl<T> BcgTruthy for HashSet<T> { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+
+impl<T: BcgToJson + Clone + Ord> BcgToJson for BTreeSet<T> {
+    fn __bcg_to_json(&self) -> String { __bcg_json_items(self.iter().cloned(), "set") }
+}
+impl<T> BcgTruthy for BTreeSet<T> { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+
+impl<K: BcgToJson + Eq + Hash, V: BcgToJson> BcgToJson for HashMap<K, V> {
+    fn __bcg_to_json(&self) -> String {
+        let mut out = String::from("{\"type\":\"dict\",\"entries\":[");
+        let mut first = true;
+        for (key, value) in self.iter() {
+            if !first { out.push(','); }
+            first = false;
+            out.push('[');
+            out.push_str(&key.__bcg_to_json());
+            out.push(',');
+            out.push_str(&value.__bcg_to_json());
+            out.push(']');
+        }
+        out.push_str("]}");
+        out
+    }
+}
+impl<K, V> BcgTruthy for HashMap<K, V> { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+
+impl<K: BcgToJson + Ord, V: BcgToJson> BcgToJson for BTreeMap<K, V> {
+    fn __bcg_to_json(&self) -> String {
+        let mut out = String::from("{\"type\":\"dict\",\"entries\":[");
+        let mut first = true;
+        for (key, value) in self.iter() {
+            if !first { out.push(','); }
+            first = false;
+            out.push('[');
+            out.push_str(&key.__bcg_to_json());
+            out.push(',');
+            out.push_str(&value.__bcg_to_json());
+            out.push(']');
+        }
+        out.push_str("]}");
+        out
+    }
+}
+impl<K, V> BcgTruthy for BTreeMap<K, V> { fn __bcg_truthy(&self) -> bool { !self.is_empty() } }
+
+macro_rules! impl_tuple_json {
+    ($($name:ident),+) => {
+        impl<$($name: BcgToJson),+> BcgToJson for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn __bcg_to_json(&self) -> String {
+                let ($($name,)+) = self;
+                let items = vec![$($name.__bcg_to_json()),+];
+                format!("{{\"type\":\"tuple\",\"items\":[{}]}}", items.join(","))
+            }
+        }
+        impl<$($name),+> BcgTruthy for ($($name,)+) {
+            fn __bcg_truthy(&self) -> bool { true }
+        }
+    };
+}
+impl_tuple_json!(A);
+impl_tuple_json!(A, B);
+impl_tuple_json!(A, B, C);
+impl_tuple_json!(A, B, C, D);
+
+fn __bcg_to_json<T: BcgToJson + ?Sized>(value: &T) -> String { value.__bcg_to_json() }
+fn __bcg_truthy<T: BcgTruthy + ?Sized>(value: &T) -> bool { value.__bcg_truthy() }
+fn __bcg_deep_equal<L: BcgToJson + ?Sized, R: BcgToJson + ?Sized>(left: &L, right: &R) -> bool {
+    left.__bcg_to_json() == right.__bcg_to_json()
+}
+
+trait BcgLen { fn __bcg_len(&self) -> usize; }
+impl<T> BcgLen for Vec<T> { fn __bcg_len(&self) -> usize { self.len() } }
+impl<T> BcgLen for HashSet<T> { fn __bcg_len(&self) -> usize { self.len() } }
+impl<K, V> BcgLen for HashMap<K, V> { fn __bcg_len(&self) -> usize { self.len() } }
+impl BcgLen for String { fn __bcg_len(&self) -> usize { self.len() } }
+impl BcgLen for str { fn __bcg_len(&self) -> usize { self.len() } }
+fn __bcg_len<T: BcgLen + ?Sized>(value: &T) -> usize { value.__bcg_len() }
+
+fn __bcg_contains<C: BcgToJson + ?Sized, I: BcgToJson + ?Sized>(container: &C, item: &I) -> bool {
+    container.__bcg_to_json().contains(&item.__bcg_to_json())
+}
+fn __bcg_to_vec<T: Clone>(value: &Vec<T>) -> Vec<T> { value.clone() }
+fn __bcg_to_set<T: Clone + Eq + Hash>(value: &Vec<T>) -> HashSet<T> { value.iter().cloned().collect() }
+fn __bcg_sorted<T: Clone + Ord>(value: &Vec<T>) -> Vec<T> {
+    let mut copy = value.clone();
+    copy.sort();
+    copy
+}
+fn __bcg_sum<T>(value: &Vec<T>) -> T where T: Copy + Default + std::ops::Add<Output = T> {
+    value.iter().copied().fold(T::default(), |total, item| total + item)
+}
+fn __bcg_max<T: Ord + Clone>(values: Vec<T>) -> T { values.into_iter().max().unwrap() }
+fn __bcg_min<T: Ord + Clone>(values: Vec<T>) -> T { values.into_iter().min().unwrap() }
+fn __bcg_subscript<T: Clone>(value: &Vec<T>, index: &isize) -> T {
+    let len = value.len() as isize;
+    let resolved = if *index < 0 { len + *index } else { *index };
+    value[resolved as usize].clone()
+}
+fn __bcg_slice<T: Clone>(value: &Vec<T>, lower: Option<isize>, upper: Option<isize>, step: Option<isize>) -> Vec<T> {
+    let step = step.unwrap_or(1);
+    if step == 0 { return vec![]; }
+    let len = value.len() as isize;
+    let mut index = lower.unwrap_or(if step > 0 { 0 } else { len - 1 });
+    if index < 0 { index += len; }
+    let mut stop = upper.unwrap_or(if step > 0 { len } else { -1 });
+    if upper.is_some() && stop < 0 { stop += len; }
+    let mut result = Vec::new();
+    if step > 0 {
+        while index < stop && index < len {
+            result.push(value[index as usize].clone());
+            index += step;
+        }
+    } else {
+        while index > stop && index >= 0 {
+            result.push(value[index as usize].clone());
+            index += step;
+        }
+    }
+    result
+}
+fn __bcg_str_upper(value: &String) -> String { value.to_uppercase() }
+fn __bcg_str_lower(value: &String) -> String { value.to_lowercase() }
+fn __bcg_str_strip(value: &String) -> String { value.trim().to_string() }
+fn __bcg_str_lstrip(value: &String) -> String { value.trim_start().to_string() }
+fn __bcg_str_rstrip(value: &String) -> String { value.trim_end().to_string() }
+fn __bcg_str_startswith(value: &String, needle: String) -> bool { value.starts_with(&needle) }
+fn __bcg_str_endswith(value: &String, needle: String) -> bool { value.ends_with(&needle) }
+fn __bcg_str_find(value: &String, needle: String) -> isize { value.find(&needle).map(|i| i as isize).unwrap_or(-1) }
+fn __bcg_str_split(value: &String, sep: String) -> Vec<String> { value.split(&sep).map(|s| s.to_string()).collect() }
+fn __bcg_str_count(value: &String, needle: String) -> usize { value.matches(&needle).count() }
+fn __bcg_str_replace(value: &String, old_value: String, new_value: String) -> String { value.replace(&old_value, &new_value) }
+
+#[cfg(unix)]
+mod __bcg_capture {
+    use super::*;
+    type CInt = i32;
+    unsafe extern "C" {
+        fn pipe(fds: *mut CInt) -> CInt;
+        fn dup(fd: CInt) -> CInt;
+        fn dup2(fd: CInt, fd2: CInt) -> CInt;
+        fn close(fd: CInt) -> CInt;
+        fn read(fd: CInt, buf: *mut u8, count: usize) -> isize;
+    }
+    unsafe fn read_fd(fd: CInt) -> String {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = read(fd, buf.as_mut_ptr(), buf.len());
+            if n <= 0 { break; }
+            bytes.extend_from_slice(&buf[..n as usize]);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    pub fn run<F: FnOnce() -> String>(f: F) -> (Result<String, Box<dyn Any + Send>>, String, String) {
+        unsafe {
+            let mut out_pipe = [0 as CInt; 2];
+            let mut err_pipe = [0 as CInt; 2];
+            if pipe(out_pipe.as_mut_ptr()) != 0 || pipe(err_pipe.as_mut_ptr()) != 0 {
+                return (catch_unwind(AssertUnwindSafe(f)), String::new(), String::new());
+            }
+            let old_out = dup(1);
+            let old_err = dup(2);
+            dup2(out_pipe[1], 1);
+            dup2(err_pipe[1], 2);
+            let result = catch_unwind(AssertUnwindSafe(f));
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            dup2(old_out, 1);
+            dup2(old_err, 2);
+            close(old_out);
+            close(old_err);
+            close(out_pipe[1]);
+            close(err_pipe[1]);
+            let stdout = read_fd(out_pipe[0]);
+            let stderr = read_fd(err_pipe[0]);
+            close(out_pipe[0]);
+            close(err_pipe[0]);
+            (result, stdout, stderr)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod __bcg_capture {
+    use super::*;
+    pub fn run<F: FnOnce() -> String>(f: F) -> (Result<String, Box<dyn Any + Send>>, String, String) {
+        (catch_unwind(AssertUnwindSafe(f)), String::new(), String::new())
+    }
+}
+
+fn __bcg_panic_message(error: &(dyn Any + Send)) -> String {
+    if let Some(value) = error.downcast_ref::<&str>() { return value.to_string(); }
+    if let Some(value) = error.downcast_ref::<String>() { return value.clone(); }
+    String::new()
+}
+'''
+
+
 def run_python_case(
     solution_path: Path,
     entrypoint: str,
@@ -3148,6 +4668,265 @@ def run_node_case(
     return parse_subprocess_result(proc)
 
 
+def render_cpp_case_source(
+    solution_path: Path,
+    entrypoint: str,
+    case: TestCase,
+    param_types: list[str],
+) -> str:
+    include_path = str(solution_path.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+    arg_lines: list[str] = []
+    call_args: list[str] = []
+    for index, arg in enumerate(case.args):
+        context = param_types[index] if index < len(param_types) else None
+        value_type = normalize_cpp_type(context)
+        rendered = render_cpp_value(arg, value_type)
+        if value_type is not None:
+            arg_lines.append(f"        {value_type} __bcg_arg{index} = {rendered};")
+        else:
+            arg_lines.append(f"        auto __bcg_arg{index} = {rendered};")
+        call_args.append(f"__bcg_arg{index}")
+
+    variables = {
+        name: f"__bcg_arg{index}"
+        for name, index in case.mutation_arg_names.items()
+    }
+    if case.mutation_assignment is not None:
+        variables[case.mutation_assignment] = "__bcg_result"
+    actual_expr = render_cpp_expr(case.actual_expr, variables)
+    call = f"{entrypoint}({', '.join(call_args)})"
+    body = list(arg_lines)
+    if case.kind == "raises":
+        body.append(f"        (void){call};")
+    elif case.kind == "mutation" and case.mutation_assignment is None:
+        body.append(f"        {call};")
+        body.append(f"        auto __bcg_actual = {actual_expr};")
+        body.append("        __bcg_actual_json = __bcg_to_json(__bcg_actual);")
+    else:
+        body.append(f"        auto __bcg_result = {call};")
+        body.append(f"        auto __bcg_actual = {actual_expr};")
+        body.append("        __bcg_actual_json = __bcg_to_json(__bcg_actual);")
+
+    body_source = "\n".join(body)
+    return f'''{CPP_HARNESS_HELPERS}
+#include "{include_path}"
+
+int main() {{
+    std::ostringstream __bcg_stdout_capture;
+    std::ostringstream __bcg_stderr_capture;
+    auto* __bcg_old_stdout = std::cout.rdbuf(__bcg_stdout_capture.rdbuf());
+    auto* __bcg_old_stderr = std::cerr.rdbuf(__bcg_stderr_capture.rdbuf());
+    bool __bcg_raised = false;
+    std::string __bcg_exception_type;
+    std::string __bcg_message;
+    std::string __bcg_actual_json = "null";
+    try {{
+{body_source}
+    }} catch (const std::invalid_argument& e) {{
+        __bcg_raised = true;
+        __bcg_exception_type = "ValueError";
+        __bcg_message = e.what();
+    }} catch (const std::out_of_range& e) {{
+        __bcg_raised = true;
+        __bcg_exception_type = "IndexError";
+        __bcg_message = e.what();
+    }} catch (const std::runtime_error& e) {{
+        __bcg_raised = true;
+        __bcg_exception_type = "RuntimeError";
+        __bcg_message = e.what();
+    }} catch (const std::exception& e) {{
+        __bcg_raised = true;
+        __bcg_exception_type = "Exception";
+        __bcg_message = e.what();
+    }} catch (...) {{
+        __bcg_raised = true;
+        __bcg_exception_type = "Exception";
+        __bcg_message = "";
+    }}
+    std::cout.rdbuf(__bcg_old_stdout);
+    std::cerr.rdbuf(__bcg_old_stderr);
+    std::cout
+        << "{{\\"raised\\":" << (__bcg_raised ? "true" : "false")
+        << ",\\"exception_type\\":" << __bcg_json_string(__bcg_exception_type)
+        << ",\\"message\\":" << __bcg_json_string(__bcg_message)
+        << ",\\"stdout\\":" << __bcg_json_string(__bcg_stdout_capture.str())
+        << ",\\"stderr\\":" << __bcg_json_string(__bcg_stderr_capture.str())
+        << ",\\"actual\\":" << __bcg_actual_json
+        << "}}" << std::endl;
+    return 0;
+}}
+'''
+
+
+def render_rust_case_source(
+    solution_path: Path,
+    entrypoint: str,
+    case: TestCase,
+    param_types: list[str],
+) -> str:
+    include_path = str(solution_path.resolve())
+    arg_lines: list[str] = []
+    call_args: list[str] = []
+    for index, arg in enumerate(case.args):
+        raw_context = param_types[index] if index < len(param_types) else None
+        variable_type = normalize_rust_type(raw_context)
+        rendered = render_rust_value(arg, raw_context)
+        if variable_type is not None and variable_type != "str":
+            arg_lines.append(f"        let mut __bcg_arg{index}: {variable_type} = {rendered};")
+        else:
+            arg_lines.append(f"        let mut __bcg_arg{index} = {rendered};")
+        call_args.append(rust_call_arg(f"__bcg_arg{index}", raw_context))
+
+    variables = {
+        name: f"__bcg_arg{index}"
+        for name, index in case.mutation_arg_names.items()
+    }
+    if case.mutation_assignment is not None:
+        variables[case.mutation_assignment] = "__bcg_result"
+    actual_expr = render_rust_expr(case.actual_expr, variables)
+    call = f"{entrypoint}({', '.join(call_args)})"
+    body = list(arg_lines)
+    if case.kind == "raises":
+        body.append(f"        let _ = {call};")
+        body.append("        String::from(\"{\\\"type\\\":\\\"scalar\\\",\\\"value\\\":null}\")")
+    elif case.kind == "mutation" and case.mutation_assignment is None:
+        body.append(f"        {call};")
+        body.append(f"        let __bcg_actual = {actual_expr};")
+        body.append("        __bcg_to_json(&__bcg_actual)")
+    else:
+        body.append(f"        let __bcg_result = {call};")
+        body.append(f"        let __bcg_actual = {actual_expr};")
+        body.append("        __bcg_to_json(&__bcg_actual)")
+    body_source = "\n".join(body)
+    return f'''{RUST_HARNESS_HELPERS}
+include!(r#"{include_path}"#);
+
+fn main() {{
+    let (__bcg_run, __bcg_stdout, __bcg_stderr) = __bcg_capture::run(|| {{
+{body_source}
+    }});
+    let mut __bcg_raised = false;
+    let mut __bcg_exception_type = String::new();
+    let mut __bcg_message = String::new();
+    let __bcg_actual_json = match __bcg_run {{
+        Ok(value) => value,
+        Err(error) => {{
+            __bcg_raised = true;
+            __bcg_exception_type = String::from("Exception");
+            __bcg_message = __bcg_panic_message(error.as_ref());
+            String::from("null")
+        }}
+    }};
+    println!(
+        "{{\\"raised\\":{{}},\\"exception_type\\":{{}},\\"message\\":{{}},\\"stdout\\":{{}},\\"stderr\\":{{}},\\"actual\\":{{}}}}",
+        if __bcg_raised {{ "true" }} else {{ "false" }},
+        __bcg_json_string(&__bcg_exception_type),
+        __bcg_json_string(&__bcg_message),
+        __bcg_json_string(&__bcg_stdout),
+        __bcg_json_string(&__bcg_stderr),
+        __bcg_actual_json
+    );
+}}
+'''
+
+
+def parse_target_result(proc: subprocess.CompletedProcess[str]) -> dict[str, Any] | None:
+    if proc.returncode != 0:
+        return None
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        data = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_cpp_case(
+    solution_path: Path,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+) -> bool:
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        return False
+    try:
+        solution_source = solution_path.read_text(encoding="utf-8")
+        param_types = parse_cpp_param_types(solution_source, entrypoint)
+        harness_source = render_cpp_case_source(solution_path, entrypoint, case, param_types)
+    except (OSError, DiscoveryError):
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        harness_path = tmp_path / "bcg_case.cpp"
+        binary_path = tmp_path / "bcg_case"
+        harness_path.write_text(harness_source, encoding="utf-8")
+        try:
+            compile_proc = subprocess.run(
+                [compiler, "-std=c++17", str(harness_path), "-o", str(binary_path)],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            if compile_proc.returncode != 0:
+                return False
+            proc = subprocess.run(
+                [str(binary_path)],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    result = parse_target_result(proc)
+    return False if result is None else target_case_matches(case, result, default_abs_tol)
+
+
+def run_rust_case(
+    solution_path: Path,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+) -> bool:
+    if case_requires_deque(case):
+        return True
+    compiler = shutil.which("rustc")
+    if compiler is None:
+        return False
+    try:
+        solution_source = solution_path.read_text(encoding="utf-8")
+        param_types = parse_rust_param_types(solution_source, entrypoint)
+        harness_source = render_rust_case_source(solution_path, entrypoint, case, param_types)
+    except (OSError, DiscoveryError):
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        harness_path = tmp_path / "bcg_case.rs"
+        binary_path = tmp_path / "bcg_case"
+        harness_path.write_text(harness_source, encoding="utf-8")
+        try:
+            compile_proc = subprocess.run(
+                [compiler, "--edition=2021", str(harness_path), "-o", str(binary_path)],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            if compile_proc.returncode != 0:
+                return False
+            proc = subprocess.run(
+                [str(binary_path)],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    result = parse_target_result(proc)
+    return False if result is None else target_case_matches(case, result, default_abs_tol)
+
+
 def parse_subprocess_result(proc: subprocess.CompletedProcess[str]) -> bool:
     if proc.returncode != 0:
         return False
@@ -3174,6 +4953,10 @@ def execute_case(
         return run_python_case(solution_path, entrypoint, case, default_abs_tol)
     if lang in {"javascript", "typescript"}:
         return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol)
+    if lang == "cpp":
+        return run_cpp_case(solution_path, entrypoint, case, default_abs_tol)
+    if lang == "rust":
+        return run_rust_case(solution_path, entrypoint, case, default_abs_tol)
     return False
 
 

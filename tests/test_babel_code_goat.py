@@ -74,6 +74,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 "python": "tester.py",
                 "javascript": "tester.js",
                 "typescript": "tester.ts",
+                "cpp": "tester.cpp",
+                "rust": "tester.rs",
             }
             for lang, filename in expected.items():
                 with self.subTest(lang=lang):
@@ -89,6 +91,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 tests_dir / "tester.py": "py sentinel",
                 tests_dir / "tester.js": "js sentinel",
                 tests_dir / "tester.ts": "ts sentinel",
+                tests_dir / "tester.cpp": "cpp sentinel",
+                tests_dir / "tester.rs": "rust sentinel",
             }
             for path, content in sentinels.items():
                 path.write_text(content, encoding="utf-8")
@@ -114,6 +118,8 @@ class BabelCodeGoatTests(unittest.TestCase):
             "python": "tester.py",
             "javascript": "tester.js",
             "typescript": "tester.ts",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
         }
         for lang, filename in filenames.items():
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
@@ -819,6 +825,199 @@ class BabelCodeGoatTests(unittest.TestCase):
                 self.assertEqual(result["status"], "fail")
                 self.assertEqual(result["passed"], ["tests.py:3"])
                 self.assertEqual(result["failed"], ["tests.py:6"])
+
+    @unittest.skipIf(
+        shutil.which("g++") is None and shutil.which("clang++") is None,
+        "g++ or clang++ is required for C++ smoke tests",
+    )
+    def test_cpp_solution_execution(self) -> None:
+        scenarios = [
+            (
+                "numeric_loop_tolerance",
+                """
+                import math
+
+                cases = [(1, 2), (2, 3)]
+                for value, expected in cases:
+                    assert solve(value) == expected
+                assert math.isclose(solve(1.0), 2.005, abs_tol=0.01)
+                """,
+                """
+                long double solve(long double value) {
+                    return value + 1.0L;
+                }
+                """,
+                "pass",
+            ),
+            (
+                "optional_nested_values",
+                """
+                assert solve([None, 1, 2]) == [None, 1, 3]
+                """,
+                """
+                std::vector<std::optional<int>> solve(std::vector<std::optional<int>> values) {
+                    values[2] = 3;
+                    return values;
+                }
+                """,
+                "pass",
+            ),
+            (
+                "output_and_exception",
+                """
+                # expect_stdout: "hi\\n"
+                assert solve("out") == "ok"
+                try:
+                    solve("boom")
+                    assert False
+                except ValueError as e:
+                    assert "bad" in str(e)
+                """,
+                """
+                std::string solve(std::string value) {
+                    if (value == "out") {
+                        std::cout << "hi\\n";
+                        return "ok";
+                    }
+                    throw std::invalid_argument("bad input");
+                }
+                """,
+                "pass",
+            ),
+            (
+                "mutation",
+                """
+                a = [2, 0, 1]
+                solve(a)
+                assert a == [0, 1, 2]
+                """,
+                """
+                void solve(std::vector<int>& values) {
+                    std::sort(values.begin(), values.end());
+                }
+                """,
+                "pass",
+            ),
+        ]
+        for name, tests_source, solution_source, status in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tests_dir = make_tests_dir(root)
+                write(tests_dir / "tests.py", tests_source)
+                solution = root / "solution.cpp"
+                write(solution, solution_source)
+                self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+                proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.json_stdout(proc)["status"], status)
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_solution_execution(self) -> None:
+        scenarios = [
+            (
+                "numeric_loop_tolerance",
+                """
+                import math
+
+                cases = [(1, 2), (2, 3)]
+                for value, expected in cases:
+                    assert solve(value) == expected
+                assert math.isclose(solve(1.0), 2.005, abs_tol=0.01)
+                """,
+                """
+                fn solve(value: f64) -> f64 {
+                    value + 1.0
+                }
+                """,
+            ),
+            (
+                "optional_nested_values",
+                """
+                assert solve([None, 1, 2]) == [None, 1, 3]
+                """,
+                """
+                fn solve(mut values: Vec<Option<i64>>) -> Vec<Option<i64>> {
+                    values[2] = Some(3);
+                    values
+                }
+                """,
+            ),
+            (
+                "output_and_exception",
+                """
+                # expect_stdout: "hi\\n"
+                assert solve("out") == "ok"
+                try:
+                    solve("boom")
+                    assert False
+                except Exception as e:
+                    assert "bad" in str(e)
+                """,
+                """
+                fn solve(value: String) -> String {
+                    if value == "out" {
+                        print!("hi\\n");
+                        return String::from("ok");
+                    }
+                    panic!("bad input");
+                }
+                """,
+            ),
+            (
+                "mutation",
+                """
+                a = [2, 0, 1]
+                solve(a)
+                assert a == [0, 1, 2]
+                """,
+                """
+                fn solve(values: &mut Vec<i64>) {
+                    values.sort();
+                }
+                """,
+            ),
+            (
+                "owned_string_map_lookup",
+                """
+                data = {"items": [2, 0, 1]}
+                solve(data)
+                assert data == {"items": [0, 1, 2]}
+                """,
+                """
+                fn solve(data: &mut HashMap<String, Vec<i64>>) {
+                    data.get_mut(&String::from("items")).unwrap().sort();
+                }
+                """,
+            ),
+            (
+                "deque_skip",
+                """
+                from collections import deque
+
+                assert solve(deque([1, 2])) == deque([1, 2])
+                """,
+                """
+                fn solve(values: Vec<i64>) -> Vec<i64> {
+                    values
+                }
+                """,
+            ),
+        ]
+        for name, tests_source, solution_source in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tests_dir = make_tests_dir(root)
+                write(tests_dir / "tests.py", tests_source)
+                solution = root / "solution.rs"
+                write(solution, solution_source)
+                self.assertEqual(self.generate(tests_dir, "rust").returncode, 0)
+
+                proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "rust")
+
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
