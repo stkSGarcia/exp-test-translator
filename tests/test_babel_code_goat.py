@@ -14,6 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "babel_code_goat.py"
+CPP_AVAILABLE = shutil.which("g++") is not None or shutil.which("clang++") is not None
+RUST_AVAILABLE = shutil.which("rustc") is not None
 sys.path.insert(0, str(ROOT))
 
 import babel_code_goat as bcg  # noqa: E402
@@ -58,6 +60,30 @@ class BabelCodeGoatTests(unittest.TestCase):
             lang,
         )
 
+    def run_generated_solution(
+        self,
+        lang: str,
+        solution_name: str,
+        tests_source: str,
+        solution_source: str,
+        *extra_args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "tests.py", tests_source)
+            solution = tests_dir / solution_name
+            write(solution, solution_source)
+            generated = self.generate(tests_dir, lang)
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            return self.run_cli(
+                "test",
+                str(solution),
+                str(tests_dir),
+                "--lang",
+                lang,
+                *extra_args,
+            )
+
     def test_generate_language_validation_and_tester_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -67,6 +93,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 "python": "tester.py",
                 "javascript": "tester.js",
                 "typescript": "tester.ts",
+                "cpp": "tester.cpp",
+                "rust": "tester.rs",
             }
             for lang, filename in expected.items():
                 with self.subTest(lang=lang):
@@ -82,6 +110,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 tests_dir / "tester.py": "py sentinel",
                 tests_dir / "tester.js": "js sentinel",
                 tests_dir / "tester.ts": "ts sentinel",
+                tests_dir / "tester.cpp": "cpp sentinel",
+                tests_dir / "tester.rs": "rust sentinel",
             }
             for path, content in sentinels.items():
                 path.write_text(content, encoding="utf-8")
@@ -91,22 +121,32 @@ class BabelCodeGoatTests(unittest.TestCase):
                 self.assertEqual(path.read_text(encoding="utf-8"), content)
 
     def test_generate_preserves_existing_tester_on_discovery_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tests_dir = Path(tmp)
-            write(tests_dir / "tests.py", "import os\n")
-            tester = tests_dir / "tester.py"
-            tester.write_text("sentinel", encoding="utf-8")
+        filenames = {
+            "python": "tester.py",
+            "javascript": "tester.js",
+            "typescript": "tester.ts",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
+        }
+        for lang, filename in filenames.items():
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", "import os\n")
+                tester = tests_dir / filename
+                tester.write_text("sentinel", encoding="utf-8")
 
-            proc = self.generate(tests_dir, "python")
+                proc = self.generate(tests_dir, lang)
 
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertEqual(tester.read_text(encoding="utf-8"), "sentinel")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(tester.read_text(encoding="utf-8"), "sentinel")
 
     def test_missing_tester_errors_and_does_not_create_files(self) -> None:
         filenames = {
             "python": "tester.py",
             "javascript": "tester.js",
             "typescript": "tester.ts",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
         }
         for lang, filename in filenames.items():
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
@@ -798,6 +838,254 @@ class BabelCodeGoatTests(unittest.TestCase):
 
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(not CPP_AVAILABLE, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_solution_execution_and_expression_wrappers(self) -> None:
+        proc = self.run_generated_solution(
+            "cpp",
+            "solution.cpp",
+            """
+            assert sorted(solve([3, 1, 2])) == [1, 2, 3]
+            assert solve("abc").upper() == "ABC"
+            assert solve("abc")[1] == "b"
+            """,
+            """
+            #include <string>
+            #include <vector>
+
+            std::vector<int> solve(std::vector<int> values) {
+                return values;
+            }
+
+            std::string solve(std::string value) {
+                return value;
+            }
+            """,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(not CPP_AVAILABLE, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_rich_container_and_decimal_execution(self) -> None:
+        proc = self.run_generated_solution(
+            "cpp",
+            "solution.cpp",
+            """
+            from collections import Counter, deque, defaultdict
+            from decimal import Decimal
+
+            assert solve({1: 2, 3: 4}) == {1: 2, 3: 4}
+            assert solve(set([2, 1])) == set([1, 2])
+            assert solve(Counter(["a", "a", "b"])) == Counter({"a": 2, "b": 1})
+            assert solve(deque([1, 2])) == deque([1, 2])
+            assert solve(defaultdict(int, {"x": 1})) == defaultdict(list, {"x": 1})
+            assert solve(Decimal("1.25")) == Decimal("1.25")
+            """,
+            """
+            #include <deque>
+            #include <map>
+            #include <set>
+            #include <string>
+
+            std::map<int, int> solve(std::map<int, int> value) {
+                return value;
+            }
+
+            std::set<int> solve(std::set<int> value) {
+                return value;
+            }
+
+            std::map<std::string, int> solve(std::map<std::string, int> value) {
+                return value;
+            }
+
+            std::deque<int> solve(std::deque<int> value) {
+                return value;
+            }
+
+            long double solve(long double value) {
+                return value;
+            }
+            """,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(not CPP_AVAILABLE, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_optional_mutation_output_tolerance_and_exception_execution(self) -> None:
+        proc = self.run_generated_solution(
+            "cpp",
+            "solution.cpp",
+            """
+            from decimal import Decimal
+
+            a = [2, 0, 1]
+            solve(a)
+            assert a == [0, 1, 2]
+            sentinel = 0
+            assert solve([None, 2]) == [None, 2]
+            assert abs(Decimal("1.00") - solve(Decimal("1.01"))) <= Decimal("0.01")
+            # expect_stdout: "hi\\n"
+            assert solve(1) == 2
+            try:
+                solve("boom")
+                assert False
+            except ValueError as e:
+                assert "bad" in str(e)
+            """,
+            """
+            #include <algorithm>
+            #include <iostream>
+            #include <optional>
+            #include <stdexcept>
+            #include <string>
+            #include <vector>
+
+            class ValueError : public std::runtime_error {
+            public:
+                using std::runtime_error::runtime_error;
+            };
+
+            void solve(std::vector<int>& values) {
+                std::sort(values.begin(), values.end());
+            }
+
+            std::vector<std::optional<int>> solve(std::vector<std::optional<int>> values) {
+                return values;
+            }
+
+            long double solve(long double value) {
+                return value;
+            }
+
+            int solve(int value) {
+                std::cout << "hi\\n";
+                return value + 1;
+            }
+
+            int solve(std::string) {
+                throw ValueError("bad input");
+            }
+            """,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(not RUST_AVAILABLE, "rustc is required for Rust smoke tests")
+    def test_rust_solution_execution(self) -> None:
+        proc = self.run_generated_solution(
+            "rust",
+            "solution.rs",
+            """
+            assert solve(2) == 3
+            """,
+            """
+            fn solve(value: i32) -> i32 {
+                value + 1
+            }
+            """,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(RUST_AVAILABLE, "only checks the missing-rustc error path")
+    def test_rust_execution_errors_when_compiler_is_unavailable(self) -> None:
+        proc = self.run_generated_solution(
+            "rust",
+            "solution.rs",
+            """
+            assert solve(2) == 3
+            """,
+            """
+            fn solve(value: i32) -> i32 {
+                value + 1
+            }
+            """,
+        )
+
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+    @unittest.skipIf(not RUST_AVAILABLE, "rustc is required for Rust smoke tests")
+    def test_rust_option_map_mutation_output_and_panic_execution(self) -> None:
+        cases = [
+            (
+                """
+                assert solve([None, 2]) == [None, 2]
+                """,
+                """
+                fn solve(value: Vec<Option<i32>>) -> Vec<Option<i32>> {
+                    value
+                }
+                """,
+            ),
+            (
+                """
+                assert solve({"items": 1}) == {"items": 2}
+                """,
+                """
+                use std::collections::HashMap;
+
+                fn solve(mut value: HashMap<String, i32>) -> HashMap<String, i32> {
+                    if let Some(item) = value.get_mut(&String::from("items")) {
+                        *item += 1;
+                    }
+                    value
+                }
+                """,
+            ),
+            (
+                """
+                a = [2, 0, 1]
+                solve(a)
+                assert a == [0, 1, 2]
+                """,
+                """
+                fn solve(values: &mut Vec<i32>) {
+                    values.sort();
+                }
+                """,
+            ),
+            (
+                """
+                # expect_stdout: "hi\\n"
+                assert solve(1) == 2
+                """,
+                """
+                fn solve(value: i32) -> i32 {
+                    println!("hi");
+                    value + 1
+                }
+                """,
+            ),
+            (
+                """
+                try:
+                    solve("boom")
+                    assert False
+                except Exception:
+                    pass
+                """,
+                """
+                fn solve(_value: String) -> i32 {
+                    panic!("bad input");
+                }
+                """,
+            ),
+        ]
+        for tests_source, solution_source in cases:
+            with self.subTest(tests_source=tests_source):
+                proc = self.run_generated_solution("rust", "solution.rs", tests_source, solution_source)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skip("Rust deque-specific behavior is intentionally skipped until VecDeque mapping is specified")
+    def test_rust_deque_specific_regression_is_skipped(self) -> None:
+        self.fail("Rust deque-specific behavior should stay skipped")
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
