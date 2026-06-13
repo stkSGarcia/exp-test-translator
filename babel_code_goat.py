@@ -26,6 +26,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on some platforms.
+    resource = None
+
 
 SUPPORTED_LANGS = {
     "python": "tester.py",
@@ -113,6 +118,10 @@ class ExecutionSetupError(Exception):
     """Raised when a target cannot be prepared before tests execute."""
 
 
+class CommandPreparationError(Exception):
+    """Raised when a CLI command cannot prepare execution."""
+
+
 class LoopEvaluationError(Exception):
     """Raised when a loop cannot be evaluated as a supported parameterization."""
 
@@ -162,6 +171,27 @@ class TestCase:
     expect_stdout: str | None = None
     expect_stderr: str | None = None
     mutation_bindings: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PreparedExecution:
+    solution_path: Path
+    tests_dir: Path
+    lang: str
+    entrypoint: str
+    cases: list[TestCase]
+    default_abs_tol: float | None
+    timeout_seconds: float | None
+    total_timeout_seconds: float | None
+    list_result: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ProfileSample:
+    case_id: str
+    passed: bool
+    runtime_ns: int
+    memory_kb: float | None = None
 
 
 def tester_filename(lang: str) -> str:
@@ -214,6 +244,34 @@ def parse_timeout_ms(raw: str | None) -> float | None:
     if milliseconds <= 0:
         raise DiscoveryError("invalid timeout")
     return milliseconds / 1000.0
+
+
+def parse_positive_int(raw: str, error_message: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DiscoveryError(error_message) from exc
+    if value <= 0:
+        raise DiscoveryError(error_message)
+    return value
+
+
+def parse_non_negative_int(raw: str, error_message: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DiscoveryError(error_message) from exc
+    if value < 0:
+        raise DiscoveryError(error_message)
+    return value
+
+
+def parse_profile_counts(trials_raw: str, warmup_raw: str) -> tuple[int, int]:
+    trials = parse_positive_int(trials_raw, "invalid trials")
+    warmup = parse_non_negative_int(warmup_raw, "invalid warmup")
+    if warmup >= trials:
+        raise DiscoveryError("invalid warmup")
+    return trials, warmup
 
 
 def render_tester(lang: str, entrypoint: str) -> str:
@@ -4965,6 +5023,192 @@ def aggregate_results(
     return {"status": status, "passed": passed, "failed": failed}
 
 
+def list_tests_result(cases: list[TestCase]) -> dict[str, Any]:
+    return {"status": "pass", "passed": [case.id for case in cases], "failed": []}
+
+
+def prepare_execution_command(args: argparse.Namespace) -> PreparedExecution:
+    lang = args.lang
+    if not is_supported_lang(lang):
+        raise CommandPreparationError("unsupported language")
+
+    default_abs_tol = parse_default_tolerance(args.tol)
+    timeout_seconds = parse_timeout_ms(args.timeout_ms)
+    total_timeout_seconds = parse_timeout_ms(args.total_timeout_ms)
+
+    tests_dir = Path(args.tests_dir)
+    tester_path = tests_dir / tester_filename(lang)
+    if not tester_path.is_file():
+        raise CommandPreparationError("tester missing")
+
+    try:
+        metadata = read_tester_metadata(tester_path)
+    except MetadataError as exc:
+        raise CommandPreparationError("invalid tester metadata") from exc
+    if metadata["lang"] != lang:
+        raise CommandPreparationError("tester language mismatch")
+
+    entrypoint = metadata["entrypoint"]
+    cases = discover_tests(tests_dir, entrypoint)
+    list_result = list_tests_result(cases) if args.list_tests else None
+
+    if list_result is None and args.run is not None:
+        selected = [case for case in cases if case.id == args.run]
+        if not selected:
+            raise CommandPreparationError("unknown test id")
+        cases = selected
+
+    return PreparedExecution(
+        solution_path=Path(args.solution_path),
+        tests_dir=tests_dir,
+        lang=lang,
+        entrypoint=entrypoint,
+        cases=cases,
+        default_abs_tol=default_abs_tol,
+        timeout_seconds=timeout_seconds,
+        total_timeout_seconds=total_timeout_seconds,
+        list_result=list_result,
+    )
+
+
+def current_memory_kb() -> float:
+    if resource is None:
+        return 0.0
+    try:
+        self_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        child_usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    except (AttributeError, OSError):
+        return 0.0
+    value = float(max(self_usage, child_usage))
+    if sys.platform == "darwin":
+        value /= 1024.0
+    return max(value, 0.0)
+
+
+def numeric_stats(samples: list[float | int]) -> dict[str, float]:
+    if not samples:
+        return {"mean": 0.0, "std": 0.0}
+    mean = sum(float(sample) for sample in samples) / len(samples)
+    variance = sum((float(sample) - mean) ** 2 for sample in samples) / len(samples)
+    return {"mean": mean, "std": math.sqrt(variance)}
+
+
+def failed_profile_sample(case_id: str, capture_memory: bool) -> ProfileSample:
+    return ProfileSample(case_id=case_id, passed=False, runtime_ns=0, memory_kb=0.0 if capture_memory else None)
+
+
+def execute_profile_case(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+    timeout_seconds: float | None,
+    capture_memory: bool,
+) -> ProfileSample:
+    before_memory = current_memory_kb() if capture_memory else None
+    started_ns = time.perf_counter_ns()
+    passed = execute_case(solution_path, lang, entrypoint, case, default_abs_tol, timeout_seconds)
+    runtime_ns = max(time.perf_counter_ns() - started_ns, 0)
+    memory_kb = None
+    if capture_memory:
+        after_memory = current_memory_kb()
+        memory_kb = max(after_memory - (before_memory or 0.0), 0.0)
+    return ProfileSample(case_id=case.id, passed=passed, runtime_ns=runtime_ns, memory_kb=memory_kb)
+
+
+def run_profile_round(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    cases: list[TestCase],
+    default_abs_tol: float | None,
+    timeout_seconds: float | None,
+    deadline: float | None,
+    capture_memory: bool,
+) -> list[ProfileSample]:
+    samples: list[ProfileSample] = []
+    for index, case in enumerate(cases):
+        case_timeout = timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                samples.extend(failed_profile_sample(item.id, capture_memory) for item in cases[index:])
+                break
+            case_timeout = remaining if case_timeout is None else min(case_timeout, remaining)
+
+        samples.append(
+            execute_profile_case(
+                solution_path,
+                lang,
+                entrypoint,
+                case,
+                default_abs_tol,
+                case_timeout,
+                capture_memory,
+            )
+        )
+
+        if deadline is not None and time.monotonic() >= deadline:
+            samples.extend(failed_profile_sample(item.id, capture_memory) for item in cases[index + 1 :])
+            break
+    return samples
+
+
+def aggregate_profile_results(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    cases: list[TestCase],
+    default_abs_tol: float | None,
+    timeout_seconds: float | None,
+    total_timeout_seconds: float | None,
+    trials: int,
+    warmup: int,
+    capture_memory: bool,
+) -> dict[str, Any]:
+    deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
+    for _ in range(warmup):
+        run_profile_round(
+            solution_path,
+            lang,
+            entrypoint,
+            cases,
+            default_abs_tol,
+            timeout_seconds,
+            deadline,
+            False,
+        )
+
+    measured_samples: list[ProfileSample] = []
+    for _ in range(trials):
+        measured_samples.extend(
+            run_profile_round(
+                solution_path,
+                lang,
+                entrypoint,
+                cases,
+                default_abs_tol,
+                timeout_seconds,
+                deadline,
+                capture_memory,
+            )
+        )
+
+    failed_ids = {sample.case_id for sample in measured_samples if not sample.passed}
+    passed = [case.id for case in cases if case.id not in failed_ids]
+    failed = [case.id for case in cases if case.id in failed_ids]
+    result: dict[str, Any] = {
+        "status": "pass" if not failed else "fail",
+        "passed": passed,
+        "failed": failed,
+        "runtime_ns": numeric_stats([sample.runtime_ns for sample in measured_samples]),
+    }
+    if capture_memory:
+        result["memory_kb"] = numeric_stats([sample.memory_kb or 0.0 for sample in measured_samples])
+    return result
+
+
 def command_generate(args: argparse.Namespace) -> int:
     lang = args.lang
     tests_dir = Path(args.tests_dir)
@@ -4995,61 +5239,57 @@ def command_generate(args: argparse.Namespace) -> int:
 
 
 def command_test(args: argparse.Namespace) -> int:
-    lang = args.lang
-    if not is_supported_lang(lang):
-        print_json_result(error_result())
-        return 2
     try:
-        default_abs_tol = parse_default_tolerance(args.tol)
-        timeout_seconds = parse_timeout_ms(args.timeout_ms)
-        total_timeout_seconds = parse_timeout_ms(args.total_timeout_ms)
-    except DiscoveryError:
+        prepared = prepare_execution_command(args)
+    except (CommandPreparationError, DiscoveryError):
         print_json_result(error_result())
         return 2
 
-    tests_dir = Path(args.tests_dir)
-    tester_path = tests_dir / tester_filename(lang)
-    if not tester_path.is_file():
-        print_json_result(error_result())
-        return 2
-
-    try:
-        metadata = read_tester_metadata(tester_path)
-    except MetadataError:
-        print_json_result(error_result())
-        return 2
-    if metadata["lang"] != lang:
-        print_json_result(error_result())
-        return 2
-
-    entrypoint = metadata["entrypoint"]
-    try:
-        cases = discover_tests(tests_dir, entrypoint)
-    except DiscoveryError:
-        print_json_result(error_result())
-        return 2
-
-    if args.list_tests:
-        result = {"status": "pass", "passed": [case.id for case in cases], "failed": []}
-        print_json_result(result)
-        return 0
-
-    if args.run is not None:
-        selected = [case for case in cases if case.id == args.run]
-        if not selected:
-            print_json_result(error_result())
-            return 2
-        cases = selected
+    if prepared.list_result is not None:
+        print_json_result(prepared.list_result)
+        return status_exit_code(prepared.list_result["status"])
 
     try:
         result = aggregate_results(
-            Path(args.solution_path),
-            lang,
-            entrypoint,
-            cases,
-            default_abs_tol,
-            timeout_seconds,
-            total_timeout_seconds,
+            prepared.solution_path,
+            prepared.lang,
+            prepared.entrypoint,
+            prepared.cases,
+            prepared.default_abs_tol,
+            prepared.timeout_seconds,
+            prepared.total_timeout_seconds,
+        )
+    except ExecutionSetupError:
+        print_json_result(error_result())
+        return 2
+    print_json_result(result)
+    return status_exit_code(result["status"])
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    try:
+        trials, warmup = parse_profile_counts(args.trials, args.warmup)
+        prepared = prepare_execution_command(args)
+    except (CommandPreparationError, DiscoveryError):
+        print_json_result(error_result())
+        return 2
+
+    if prepared.list_result is not None:
+        print_json_result(prepared.list_result)
+        return status_exit_code(prepared.list_result["status"])
+
+    try:
+        result = aggregate_profile_results(
+            prepared.solution_path,
+            prepared.lang,
+            prepared.entrypoint,
+            prepared.cases,
+            prepared.default_abs_tol,
+            prepared.timeout_seconds,
+            prepared.total_timeout_seconds,
+            trials,
+            warmup,
+            args.memory,
         )
     except ExecutionSetupError:
         print_json_result(error_result())
@@ -5078,6 +5318,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms")
     test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("--tol")
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms")
+    profile.add_argument("--total-timeout-ms")
+    profile.add_argument("-n", dest="trials", default="1")
+    profile.add_argument("--warmup", default="0")
+    profile.add_argument("--memory", action="store_true")
+    profile.set_defaults(func=command_profile)
 
     return parser
 
