@@ -160,6 +160,17 @@ class TestCase:
     postconditions: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PreparedExecution:
+    solution_path: Path
+    lang: str
+    entrypoint: str
+    cases: list[TestCase]
+    default_abs_tol: float | None
+    timeout_ms: int | None
+    total_timeout_ms: int | None
+
+
 def tester_filename(lang: str) -> str:
     return SUPPORTED_LANGS[lang]
 
@@ -213,6 +224,26 @@ def parse_positive_milliseconds(raw: str | None) -> int | None:
         raise DiscoveryError("invalid timeout") from exc
     if value <= 0:
         raise DiscoveryError("invalid timeout")
+    return value
+
+
+def parse_positive_integer(raw: str, label: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DiscoveryError(f"invalid {label}") from exc
+    if value <= 0:
+        raise DiscoveryError(f"invalid {label}")
+    return value
+
+
+def parse_nonnegative_integer(raw: str, label: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DiscoveryError(f"invalid {label}") from exc
+    if value < 0:
+        raise DiscoveryError(f"invalid {label}")
     return value
 
 
@@ -4450,62 +4481,162 @@ def command_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_test(args: argparse.Namespace) -> int:
+def prepare_execution(
+    args: argparse.Namespace,
+) -> tuple[PreparedExecution | None, dict[str, Any] | None, int | None]:
     lang = args.lang
     if not is_supported_lang(lang):
-        print_json_result(error_result())
-        return 2
+        return None, error_result(), 2
     try:
         default_abs_tol = parse_default_tolerance(args.tol)
         timeout_ms = parse_positive_milliseconds(args.timeout_ms)
         total_timeout_ms = parse_positive_milliseconds(args.total_timeout_ms)
     except DiscoveryError:
-        print_json_result(error_result())
-        return 2
+        return None, error_result(), 2
 
     tests_dir = Path(args.tests_dir)
     tester_path = tests_dir / tester_filename(lang)
     if not tester_path.is_file():
-        print_json_result(error_result())
-        return 2
+        return None, error_result(), 2
 
     try:
         metadata = read_tester_metadata(tester_path)
     except MetadataError:
-        print_json_result(error_result())
-        return 2
+        return None, error_result(), 2
     if metadata["lang"] != lang:
-        print_json_result(error_result())
-        return 2
+        return None, error_result(), 2
 
     entrypoint = metadata["entrypoint"]
     try:
         cases = discover_tests(tests_dir, entrypoint, {tester_path, Path(args.solution_path)})
     except DiscoveryError:
-        print_json_result(error_result())
-        return 2
+        return None, error_result(), 2
 
     if args.list_tests:
         result = {"status": "pass", "passed": [case.id for case in cases], "failed": []}
-        print_json_result(result)
-        return status_exit_code(result["status"])
+        return None, result, status_exit_code(result["status"])
 
     if args.run is not None:
         selected = [case for case in cases if case.id == args.run]
         if not selected:
-            print_json_result(error_result())
-            return 2
+            return None, error_result(), 2
         cases = selected
 
-    result = aggregate_results(
-        Path(args.solution_path),
-        lang,
-        entrypoint,
-        cases,
-        default_abs_tol,
-        timeout_ms,
-        total_timeout_ms,
+    return (
+        PreparedExecution(
+            solution_path=Path(args.solution_path),
+            lang=lang,
+            entrypoint=entrypoint,
+            cases=cases,
+            default_abs_tol=default_abs_tol,
+            timeout_ms=timeout_ms,
+            total_timeout_ms=total_timeout_ms,
+        ),
+        None,
+        None,
     )
+
+
+def command_test(args: argparse.Namespace) -> int:
+    prepared, immediate_result, immediate_code = prepare_execution(args)
+    if immediate_result is not None:
+        print_json_result(immediate_result)
+        return immediate_code if immediate_code is not None else status_exit_code(immediate_result["status"])
+    if prepared is None:
+        print_json_result(error_result())
+        return 2
+
+    result = aggregate_results(
+        prepared.solution_path,
+        prepared.lang,
+        prepared.entrypoint,
+        prepared.cases,
+        prepared.default_abs_tol,
+        prepared.timeout_ms,
+        prepared.total_timeout_ms,
+    )
+    print_json_result(result)
+    return status_exit_code(result["status"])
+
+
+def numeric_stats(samples: list[float]) -> dict[str, float]:
+    mean = sum(samples) / len(samples)
+    variance = sum((sample - mean) ** 2 for sample in samples) / len(samples)
+    return {"mean": mean, "std": math.sqrt(variance)}
+
+
+def current_memory_kb() -> int:
+    try:
+        import resource
+    except ImportError:
+        return 0
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        usage //= 1024
+    return int(usage)
+
+
+def measured_profile_run(
+    prepared: PreparedExecution,
+    include_memory: bool,
+) -> tuple[dict[str, Any], int, int | None]:
+    memory_before = current_memory_kb() if include_memory else 0
+    started_ns = time.perf_counter_ns()
+    result = aggregate_results(
+        prepared.solution_path,
+        prepared.lang,
+        prepared.entrypoint,
+        prepared.cases,
+        prepared.default_abs_tol,
+        prepared.timeout_ms,
+        prepared.total_timeout_ms,
+    )
+    elapsed_ns = time.perf_counter_ns() - started_ns
+    if not include_memory:
+        return result, elapsed_ns, None
+    memory_after = current_memory_kb()
+    delta = memory_after - memory_before
+    return result, elapsed_ns, delta if delta > 0 else memory_after
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    try:
+        trials = parse_positive_integer(args.n, "trials")
+        warmup = parse_nonnegative_integer(args.warmup, "warmup")
+    except DiscoveryError:
+        print_json_result(error_result())
+        return 2
+    if warmup >= trials:
+        print_json_result(error_result())
+        return 2
+
+    prepared, immediate_result, immediate_code = prepare_execution(args)
+    if immediate_result is not None:
+        print_json_result(immediate_result)
+        return immediate_code if immediate_code is not None else status_exit_code(immediate_result["status"])
+    if prepared is None:
+        print_json_result(error_result())
+        return 2
+
+    for _ in range(warmup):
+        result, _, _ = measured_profile_run(prepared, args.memory)
+        if result["status"] == "error":
+            print_json_result(result)
+            return status_exit_code(result["status"])
+
+    runtime_samples: list[float] = []
+    memory_samples: list[float] = []
+    result: dict[str, Any] = error_result()
+    for _ in range(trials - warmup):
+        result, runtime_ns, memory_kb = measured_profile_run(prepared, args.memory)
+        runtime_samples.append(float(runtime_ns))
+        if memory_kb is not None:
+            memory_samples.append(float(memory_kb))
+
+    result = dict(result)
+    result["runtime_ns"] = numeric_stats(runtime_samples)
+    if args.memory:
+        result["memory_kb"] = numeric_stats(memory_samples or [0.0])
     print_json_result(result)
     return status_exit_code(result["status"])
 
@@ -4530,6 +4661,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms")
     test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("-n", default="1")
+    profile.add_argument("--warmup", default="0")
+    profile.add_argument("--memory", action="store_true")
+    profile.add_argument("--tol")
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms")
+    profile.add_argument("--total-timeout-ms")
+    profile.set_defaults(func=command_profile)
 
     return parser
 

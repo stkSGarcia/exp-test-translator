@@ -1,0 +1,5 @@
+[
+  "async-test-execution-controls/add-async-test-selection-timeouts",
+  "babel-code-goat-cli/support-single-call-traceability",
+  "babel-code-goat-cli/support-rich-test-comparisons"
+]

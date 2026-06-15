@@ -127,6 +127,12 @@ class BabelCodeGoatTests(unittest.TestCase):
                 self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
                 self.assertFalse((tests_dir / filename).exists())
 
+                proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", lang)
+
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+                self.assertFalse((tests_dir / filename).exists())
+
     def test_discovery_supports_allowed_constructs_and_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -870,6 +876,150 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 2)
             self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
 
+    def test_profile_list_run_and_tolerance_match_test_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            calls = tests_dir / "calls.txt"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve("close") == 1.0
+                assert solve("selected") == "selected"
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                f"""
+                CALLS = {str(calls)!r}
+
+                def solve(value):
+                    with open(CALLS, "a", encoding="utf-8") as handle:
+                        handle.write(value + "\\n")
+                    if value == "close":
+                        return 1.005
+                    return value
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python", "--list-tests")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                self.json_stdout(proc),
+                {"status": "pass", "passed": ["tests.py:1", "tests.py:2"], "failed": []},
+            )
+            self.assertFalse(calls.exists())
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "--run",
+                "tests.py:2",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["passed"], ["tests.py:2"])
+            self.assertEqual(result["failed"], [])
+            self.assertIn("runtime_ns", result)
+
+            proc = self.run_cli("profile", str(tests_dir), str(solution), "--lang", "python")
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(self.json_stdout(proc)["status"], "fail")
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "--tol",
+                "0.01",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    def test_profile_warmup_validation_and_runtime_memory_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            calls = tests_dir / "calls.txt"
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                f"""
+                import time
+
+                CALLS = {str(calls)!r}
+
+                def solve(value):
+                    try:
+                        with open(CALLS, "r", encoding="utf-8") as handle:
+                            count = len(handle.read().splitlines())
+                    except FileNotFoundError:
+                        count = 0
+                    with open(CALLS, "a", encoding="utf-8") as handle:
+                        handle.write("call\\n")
+                    if count < 2:
+                        time.sleep(0.3)
+                    return value + 1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "-n",
+                "3",
+                "--warmup",
+                "3",
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, '{"status":"error","passed":[],"failed":[]}\n')
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "-n",
+                "5",
+                "--warmup",
+                "2",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "pass")
+            self.assertNotIn("memory_kb", result)
+            self.assertIsInstance(result["runtime_ns"]["mean"], (int, float))
+            self.assertIsInstance(result["runtime_ns"]["std"], (int, float))
+            self.assertLess(result["runtime_ns"]["mean"], 200_000_000)
+            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 5)
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "--memory",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertIsInstance(result["runtime_ns"]["mean"], (int, float))
+            self.assertIsInstance(result["runtime_ns"]["std"], (int, float))
+            self.assertIsInstance(result["memory_kb"]["mean"], (int, float))
+            self.assertIsInstance(result["memory_kb"]["std"], (int, float))
+
     def test_python_async_entrypoint_completes_before_assertion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -985,6 +1135,89 @@ class BabelCodeGoatTests(unittest.TestCase):
                 {"status": "fail", "passed": ["tests.py:1"], "failed": ["tests.py:2", "tests.py:3"]},
             )
             self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["fast", "slow"])
+
+    def test_profile_timeouts_are_failures_and_contribute_to_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                import time
+
+                def solve(value):
+                    time.sleep(0.2)
+                    return value + 1
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "-n",
+                "2",
+                "--timeout-ms",
+                "50",
+            )
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["passed"], [])
+            self.assertEqual(result["failed"], ["tests.py:1"])
+            self.assertGreater(result["runtime_ns"]["mean"], 0)
+            self.assertGreaterEqual(result["runtime_ns"]["std"], 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            calls = tests_dir / "calls.txt"
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve("fast") == "fast"
+                assert solve("slow") == "slow"
+                assert solve("never") == "never"
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                f"""
+                import time
+
+                CALLS = {str(calls)!r}
+
+                def solve(value):
+                    with open(CALLS, "a", encoding="utf-8") as handle:
+                        handle.write(value + "\\n")
+                    if value == "fast":
+                        time.sleep(0.02)
+                    else:
+                        time.sleep(0.5)
+                    return value
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli(
+                "profile",
+                str(tests_dir),
+                str(solution),
+                "--lang",
+                "python",
+                "--total-timeout-ms",
+                "350",
+            )
+            self.assertEqual(proc.returncode, 1)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["passed"], ["tests.py:1"])
+            self.assertEqual(result["failed"], ["tests.py:2", "tests.py:3"])
+            self.assertGreater(result["runtime_ns"]["mean"], 0)
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
