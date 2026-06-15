@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections import Counter, defaultdict, deque
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
@@ -201,6 +202,24 @@ def parse_default_tolerance(raw: str | None) -> float | None:
     if value < 0 or not math.isfinite(value):
         raise DiscoveryError("invalid tolerance")
     return value
+
+
+def parse_positive_milliseconds(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DiscoveryError("invalid timeout") from exc
+    if value <= 0:
+        raise DiscoveryError("invalid timeout")
+    return value
+
+
+def timeout_seconds(timeout_ms: int | None, default_seconds: float | None = None) -> float | None:
+    if timeout_ms is None:
+        return default_seconds
+    return timeout_ms / 1000
 
 
 def render_tester(
@@ -2701,6 +2720,7 @@ def run_python_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_ms: int | None = None,
 ) -> bool:
     payload = {
         "solution_path": str(solution_path),
@@ -2713,7 +2733,7 @@ def run_python_case(
             [sys.executable, "-c", harness],
             text=True,
             capture_output=True,
-            timeout=10,
+            timeout=timeout_seconds(timeout_ms, 10),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -2721,6 +2741,7 @@ def run_python_case(
 
 
 PYTHON_CASE_RUNNER = r'''
+import asyncio
 import builtins
 import inspect
 import io
@@ -3208,6 +3229,8 @@ def run(payload):
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
             value = function(*case["args"])
+            if inspect.isawaitable(value):
+                value = asyncio.run(value)
     except BaseException as exc:
         raised = exc
 
@@ -4173,6 +4196,7 @@ def run_node_case(
     lang: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_ms: int | None = None,
 ) -> bool:
     node_path = shutil.which("node")
     if node_path is None:
@@ -4193,7 +4217,7 @@ def run_node_case(
             text=True,
             capture_output=True,
             env=env,
-            timeout=10,
+            timeout=timeout_seconds(timeout_ms, 10),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -4247,6 +4271,8 @@ def run_cpp_suite(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None,
+    timeout_ms: int | None = None,
+    total_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
     compiler = cxx_compiler()
     if compiler is None:
@@ -4271,16 +4297,22 @@ def run_cpp_suite(
                 [compiler, "-std=c++17", str(runner), "-o", str(binary)],
                 text=True,
                 capture_output=True,
-                timeout=20,
+                timeout=timeout_seconds(total_timeout_ms, 20),
             )
             if compile_proc.returncode != 0:
                 return error_result()
-            run_proc = subprocess.run(
-                [str(binary)],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
+            run_timeout_ms = min(
+                value for value in (timeout_ms, total_timeout_ms) if value is not None
+            ) if timeout_ms is not None or total_timeout_ms is not None else None
+            try:
+                run_proc = subprocess.run(
+                    [str(binary)],
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds(run_timeout_ms, 10),
+                )
+            except subprocess.TimeoutExpired:
+                return {"status": "fail", "passed": [], "failed": [case.id for case in cases]}
     except (OSError, subprocess.TimeoutExpired):
         return error_result()
     return parse_native_suite_result(run_proc) or error_result()
@@ -4291,6 +4323,8 @@ def run_rust_suite(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None,
+    timeout_ms: int | None = None,
+    total_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
     rustc = shutil.which("rustc")
     if rustc is None:
@@ -4316,16 +4350,22 @@ def run_rust_suite(
                 [rustc, "--edition=2021", str(runner), "-o", str(binary)],
                 text=True,
                 capture_output=True,
-                timeout=20,
+                timeout=timeout_seconds(total_timeout_ms, 20),
             )
             if compile_proc.returncode != 0:
                 return error_result()
-            run_proc = subprocess.run(
-                [str(binary)],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
+            run_timeout_ms = min(
+                value for value in (timeout_ms, total_timeout_ms) if value is not None
+            ) if timeout_ms is not None or total_timeout_ms is not None else None
+            try:
+                run_proc = subprocess.run(
+                    [str(binary)],
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds(run_timeout_ms, 10),
+                )
+            except subprocess.TimeoutExpired:
+                return {"status": "fail", "passed": [], "failed": [case.id for case in supported]}
     except (OSError, subprocess.TimeoutExpired):
         return error_result()
     return parse_native_suite_result(run_proc) or error_result()
@@ -4337,13 +4377,14 @@ def execute_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout_ms: int | None = None,
 ) -> bool:
     if case.kind == "loop":
         return case.loop_pass is True
     if lang == "python":
-        return run_python_case(solution_path, entrypoint, case, default_abs_tol)
+        return run_python_case(solution_path, entrypoint, case, default_abs_tol, timeout_ms)
     if lang in {"javascript", "typescript"}:
-        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol)
+        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol, timeout_ms)
     return False
 
 
@@ -4353,15 +4394,26 @@ def aggregate_results(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None = None,
+    timeout_ms: int | None = None,
+    total_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
     if lang == "cpp":
-        return run_cpp_suite(solution_path, entrypoint, cases, default_abs_tol)
+        return run_cpp_suite(solution_path, entrypoint, cases, default_abs_tol, timeout_ms, total_timeout_ms)
     if lang == "rust":
-        return run_rust_suite(solution_path, entrypoint, cases, default_abs_tol)
+        return run_rust_suite(solution_path, entrypoint, cases, default_abs_tol, timeout_ms, total_timeout_ms)
     passed: list[str] = []
     failed: list[str] = []
-    for case in cases:
-        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol):
+    started = time.monotonic()
+    for index, case in enumerate(cases):
+        case_timeout_ms = timeout_ms
+        if total_timeout_ms is not None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            remaining_ms = total_timeout_ms - elapsed_ms
+            if remaining_ms <= 0:
+                failed.extend(remaining.id for remaining in cases[index:])
+                break
+            case_timeout_ms = min(case_timeout_ms, remaining_ms) if case_timeout_ms is not None else remaining_ms
+        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol, case_timeout_ms):
             passed.append(case.id)
         else:
             failed.append(case.id)
@@ -4405,6 +4457,8 @@ def command_test(args: argparse.Namespace) -> int:
         return 2
     try:
         default_abs_tol = parse_default_tolerance(args.tol)
+        timeout_ms = parse_positive_milliseconds(args.timeout_ms)
+        total_timeout_ms = parse_positive_milliseconds(args.total_timeout_ms)
     except DiscoveryError:
         print_json_result(error_result())
         return 2
@@ -4431,7 +4485,27 @@ def command_test(args: argparse.Namespace) -> int:
         print_json_result(error_result())
         return 2
 
-    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases, default_abs_tol)
+    if args.list_tests:
+        result = {"status": "pass", "passed": [case.id for case in cases], "failed": []}
+        print_json_result(result)
+        return status_exit_code(result["status"])
+
+    if args.run is not None:
+        selected = [case for case in cases if case.id == args.run]
+        if not selected:
+            print_json_result(error_result())
+            return 2
+        cases = selected
+
+    result = aggregate_results(
+        Path(args.solution_path),
+        lang,
+        entrypoint,
+        cases,
+        default_abs_tol,
+        timeout_ms,
+        total_timeout_ms,
+    )
     print_json_result(result)
     return status_exit_code(result["status"])
 
@@ -4451,6 +4525,10 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
     test.add_argument("--tol")
+    test.add_argument("--list-tests", action="store_true")
+    test.add_argument("--run")
+    test.add_argument("--timeout-ms")
+    test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
 
     return parser
