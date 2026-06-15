@@ -35,6 +35,7 @@ METADATA_MARKER = "BABEL_CODE_GOAT_METADATA:"
 METADATA_VERSION = 1
 ERROR_RESULT = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"#\s*(expect_stdout|expect_stderr):\s*(.+)\s*$")
+TEST_LIKE_STEM_RE = re.compile(r"^(?:test.*|.*_test|tests|.*_tests)$")
 MATH_ISCLOSE_REL_TOL = 1e-09
 MATH_ISCLOSE_ABS_TOL = 0.0
 LOOP_ITERATION_LIMIT = 10000
@@ -116,6 +117,7 @@ def result_expr() -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class PendingTest:
+    source_path: str
     line: int
     kind: str
     args: list[Any] = field(default_factory=list)
@@ -136,6 +138,7 @@ class PendingTest:
 @dataclass(frozen=True)
 class TestCase:
     id: str
+    source_path: str
     line: int
     kind: str
     args: list[Any] = field(default_factory=list)
@@ -340,9 +343,10 @@ def parse_expectation_value(raw: str, line_no: int) -> str:
 
 
 class TestDiscoverer:
-    def __init__(self, entrypoint: str, source_lines: list[str]) -> None:
+    def __init__(self, entrypoint: str, source_lines: list[str], source_path: str) -> None:
         self.entrypoint = entrypoint
         self.source_lines = source_lines
+        self.source_path = source_path
         self.module_aliases: dict[str, str] = {}
         self.constructor_aliases: dict[str, str] = {}
         self.env: dict[str, Any] = {}
@@ -356,11 +360,17 @@ class TestDiscoverer:
 
     def visit_body(self, body: list[ast.stmt]) -> None:
         self.collect_imports(body)
-        for stmt in body:
+        index = 0
+        while index < len(body):
+            stmt = body[index]
+            mutation = self.parse_mutation_statement(stmt)
+            if mutation is not None:
+                index = self.visit_mutation_group(body, index, mutation)
+                continue
             if isinstance(stmt, ast.FunctionDef):
                 self.visit_function(stmt)
             elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                continue
+                pass
             elif isinstance(stmt, ast.Assert):
                 self.visit_assert(stmt)
             elif isinstance(stmt, ast.Try):
@@ -377,6 +387,7 @@ class TestDiscoverer:
                 raise DiscoveryError(
                     f"unsupported statement at line {getattr(stmt, 'lineno', '?')}"
                 )
+            index += 1
 
     def visit_function(self, stmt: ast.FunctionDef) -> None:
         if stmt.decorator_list:
@@ -396,6 +407,99 @@ class TestDiscoverer:
             raise DiscoveryError(f"multiple assignment targets are unsupported at line {stmt.lineno}")
         value = self.parse_value(stmt.value)
         self.bind_target(stmt.targets[0], value, stmt.lineno)
+
+    def parse_mutation_statement(
+        self,
+        stmt: ast.stmt,
+    ) -> tuple[list[Any], dict[str, dict[str, Any]]] | None:
+        if isinstance(stmt, ast.Expr):
+            call = stmt.value
+            if not self.is_entrypoint_call(call):
+                return None
+            args, refs = self.parse_mutation_call(call, stmt.lineno)
+            return args, refs
+        if isinstance(stmt, ast.Assign):
+            if len(stmt.targets) != 1 or not self.is_entrypoint_call(stmt.value):
+                return None
+            args, refs = self.parse_mutation_call(stmt.value, stmt.lineno)
+            refs.update(self.mutation_target_refs(stmt.targets[0], result_expr(), stmt.lineno))
+            return args, refs
+        return None
+
+    def visit_mutation_group(
+        self,
+        body: list[ast.stmt],
+        index: int,
+        mutation: tuple[list[Any], dict[str, dict[str, Any]]],
+    ) -> int:
+        args, refs = mutation
+        line_no = getattr(body[index], "lineno", 0)
+        if not refs:
+            raise DiscoveryError(f"mutation-style test has no trackable variables at line {line_no}")
+        next_index = index + 1
+        if next_index >= len(body) or not isinstance(body[next_index], ast.Assert):
+            raise DiscoveryError(f"mutation-style call must be followed by assertions at line {line_no}")
+        while next_index < len(body) and isinstance(body[next_index], ast.Assert):
+            self.visit_mutation_assert(body[next_index], args, refs)
+            next_index += 1
+        return next_index
+
+    def is_entrypoint_call(self, node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == self.entrypoint
+        )
+
+    def parse_mutation_call(
+        self,
+        node: ast.AST,
+        line_no: int,
+    ) -> tuple[list[Any], dict[str, dict[str, Any]]]:
+        if not isinstance(node, ast.Call):
+            raise DiscoveryError(f"expected call to {self.entrypoint} at line {line_no}")
+        args = self.parse_entrypoint_call(node, line_no)
+        refs = self.mutation_argument_refs(node.args, line_no)
+        return args, refs
+
+    def mutation_argument_refs(
+        self,
+        args: list[ast.expr],
+        line_no: int,
+    ) -> dict[str, dict[str, Any]]:
+        refs: dict[str, dict[str, Any]] = {}
+        arg_index = 0
+        for arg in args:
+            if isinstance(arg, ast.Starred):
+                arg_index += len(as_iterable_items(self.parse_value(arg.value), line_no, "starred argument"))
+                continue
+            if isinstance(arg, ast.Name) and arg.id not in refs:
+                refs[arg.id] = {"op": "arg", "index": arg_index}
+            arg_index += 1
+        return refs
+
+    def mutation_target_refs(
+        self,
+        target: ast.AST,
+        expr: dict[str, Any],
+        line_no: int,
+    ) -> dict[str, dict[str, Any]]:
+        if isinstance(target, ast.Name):
+            if target.id == self.entrypoint:
+                raise DiscoveryError(f"assignment to entrypoint is unsupported at line {line_no}")
+            return {target.id: expr}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            refs: dict[str, dict[str, Any]] = {}
+            for index, child in enumerate(target.elts):
+                refs.update(
+                    self.mutation_target_refs(
+                        child,
+                        {"op": "subscript", "value": expr, "index": {"op": "value", "value": index}},
+                        line_no,
+                    )
+                )
+            return refs
+        raise DiscoveryError(f"unsupported assignment target at line {line_no}")
 
     def visit_aug_assign(self, stmt: ast.AugAssign) -> None:
         if not isinstance(stmt.target, ast.Name):
@@ -619,6 +723,166 @@ class TestDiscoverer:
         args, actual_expr = self.parse_actual_expression(test, stmt.lineno)
         self.add_test(stmt.lineno, "truthy", args, actual_expr=actual_expr)
 
+    def visit_mutation_assert(
+        self,
+        stmt: ast.Assert,
+        args: list[Any],
+        actual_refs: dict[str, dict[str, Any]],
+    ) -> None:
+        if stmt.msg is not None:
+            raise DiscoveryError(f"assert messages are unsupported at line {stmt.lineno}")
+        if self.count_entrypoint_calls(stmt.test) != 0:
+            raise DiscoveryError(
+                f"mutation-style assertion must not call {self.entrypoint} at line {stmt.lineno}"
+            )
+
+        test = stmt.test
+        if isinstance(test, ast.Compare):
+            if self.visit_mutation_absdiff_assert(stmt, test, args, actual_refs):
+                return
+            self.visit_mutation_comparison_assert(stmt, test, args, actual_refs)
+            return
+
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            actual_expr = self.parse_dependent_expression(test.operand, stmt.lineno, actual_refs)
+            self.add_test(stmt.lineno, "not", args, actual_expr=actual_expr)
+            return
+
+        if isinstance(test, ast.Call) and self.call_name(test.func) == "math.isclose":
+            self.visit_mutation_isclose_assert(stmt, test, args, actual_refs)
+            return
+
+        actual_expr = self.parse_dependent_expression(test, stmt.lineno, actual_refs)
+        self.add_test(stmt.lineno, "truthy", args, actual_expr=actual_expr)
+
+    def visit_mutation_comparison_assert(
+        self,
+        stmt: ast.Assert,
+        test: ast.Compare,
+        args: list[Any],
+        actual_refs: dict[str, dict[str, Any]],
+    ) -> None:
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            raise DiscoveryError(f"unsupported comparison at line {stmt.lineno}")
+        operator = test.ops[0]
+        if type(operator) not in COMPARE_OPERATORS:
+            raise DiscoveryError(f"unsupported comparison operator at line {stmt.lineno}")
+
+        left_hits: list[str] = []
+        right_hits: list[str] = []
+        left_expr = self.parse_expression(test.left, [], actual_refs, left_hits)
+        right = test.comparators[0]
+        right_expr = self.parse_expression(right, [], actual_refs, right_hits)
+        if not left_hits and not right_hits:
+            raise DiscoveryError(f"mutation-style assertion must reference mutated state at line {stmt.lineno}")
+
+        if isinstance(operator, (ast.Eq, ast.NotEq)) and bool(left_hits) != bool(right_hits):
+            if left_hits:
+                actual_expr = left_expr
+                expected = self.parse_value(right)
+            else:
+                actual_expr = right_expr
+                expected = self.parse_value(test.left)
+            self.add_test(
+                stmt.lineno,
+                "eq" if isinstance(operator, ast.Eq) else "ne",
+                args,
+                expected,
+                actual_expr=actual_expr,
+            )
+            return
+
+        actual_expr = {
+            "op": "compare",
+            "operator": COMPARE_OPERATORS[type(operator)],
+            "left": left_expr,
+            "right": right_expr,
+        }
+        self.add_test(stmt.lineno, "truthy", args, actual_expr=actual_expr)
+
+    def visit_mutation_isclose_assert(
+        self,
+        stmt: ast.Assert,
+        call: ast.Call,
+        args: list[Any],
+        actual_refs: dict[str, dict[str, Any]],
+    ) -> None:
+        if len(call.args) != 2:
+            raise DiscoveryError(f"math.isclose requires two operands at line {stmt.lineno}")
+        actual_expr, expected = self.parse_dependent_expected_pair(
+            call.args[0],
+            call.args[1],
+            stmt.lineno,
+            actual_refs,
+        )
+        abs_tol: Any = MATH_ISCLOSE_ABS_TOL
+        rel_tol: Any = MATH_ISCLOSE_REL_TOL
+        seen: set[str] = set()
+        for keyword_arg in call.keywords:
+            if keyword_arg.arg not in {"abs_tol", "rel_tol"} or keyword_arg.arg in seen:
+                raise DiscoveryError(f"unsupported math.isclose keyword at line {stmt.lineno}")
+            seen.add(keyword_arg.arg)
+            value = self.parse_numeric_value(keyword_arg.value)
+            if value < 0:
+                raise DiscoveryError(f"negative tolerance at line {stmt.lineno}")
+            if keyword_arg.arg == "abs_tol":
+                abs_tol = value
+            else:
+                rel_tol = value
+        self.add_test(
+            stmt.lineno,
+            "isclose",
+            args,
+            expected,
+            actual_expr=actual_expr,
+            comparison="isclose",
+            abs_tol=abs_tol,
+            rel_tol=rel_tol,
+        )
+
+    def visit_mutation_absdiff_assert(
+        self,
+        stmt: ast.Assert,
+        test: ast.Compare,
+        args: list[Any],
+        actual_refs: dict[str, dict[str, Any]],
+    ) -> bool:
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            return False
+        operator = test.ops[0]
+        if not isinstance(operator, (ast.Lt, ast.LtE)):
+            return False
+        if not (
+            isinstance(test.left, ast.Call)
+            and isinstance(test.left.func, ast.Name)
+            and test.left.func.id == "abs"
+            and len(test.left.args) == 1
+            and not test.left.keywords
+            and isinstance(test.left.args[0], ast.BinOp)
+            and isinstance(test.left.args[0].op, ast.Sub)
+        ):
+            return False
+        difference = test.left.args[0]
+        actual_expr, expected = self.parse_dependent_expected_pair(
+            difference.left,
+            difference.right,
+            stmt.lineno,
+            actual_refs,
+        )
+        abs_tol = self.parse_numeric_value(test.comparators[0])
+        if abs_tol < 0:
+            raise DiscoveryError(f"negative tolerance at line {stmt.lineno}")
+        self.add_test(
+            stmt.lineno,
+            "absdiff",
+            args,
+            expected,
+            actual_expr=actual_expr,
+            comparison="abs_le" if isinstance(operator, ast.LtE) else "abs_lt",
+            abs_tol=abs_tol,
+        )
+        return True
+
     def visit_comparison_assert(self, stmt: ast.Assert, test: ast.Compare) -> None:
         if len(test.ops) != 1 or len(test.comparators) != 1:
             raise DiscoveryError(f"unsupported comparison at line {stmt.lineno}")
@@ -835,6 +1099,35 @@ class TestDiscoverer:
             return right_args, self.parse_value(left)
         raise DiscoveryError(f"expected one operand to call {self.entrypoint} at line {line_no}")
 
+    def parse_dependent_expression(
+        self,
+        node: ast.AST,
+        line_no: int,
+        actual_refs: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        hits: list[str] = []
+        expr = self.parse_expression(node, [], actual_refs, hits)
+        if not hits:
+            raise DiscoveryError(f"mutation-style assertion must reference mutated state at line {line_no}")
+        return expr
+
+    def parse_dependent_expected_pair(
+        self,
+        left: ast.AST,
+        right: ast.AST,
+        line_no: int,
+        actual_refs: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, Any], Any]:
+        left_hits: list[str] = []
+        right_hits: list[str] = []
+        left_expr = self.parse_expression(left, [], actual_refs, left_hits)
+        right_expr = self.parse_expression(right, [], actual_refs, right_hits)
+        if bool(left_hits) == bool(right_hits):
+            raise DiscoveryError(f"mutation-style assertion must compare mutated state to expected value at line {line_no}")
+        if left_hits:
+            return left_expr, self.parse_value(right)
+        return right_expr, self.parse_value(left)
+
     def count_entrypoint_calls(self, node: ast.AST) -> int:
         return sum(
             1
@@ -867,6 +1160,8 @@ class TestDiscoverer:
         self,
         node: ast.AST,
         entrypoint_args: list[list[Any]],
+        actual_refs: dict[str, dict[str, Any]] | None = None,
+        actual_ref_hits: list[str] | None = None,
     ) -> dict[str, Any]:
         line_no = getattr(node, "lineno", 0)
         if isinstance(node, ast.Constant):
@@ -874,21 +1169,34 @@ class TestDiscoverer:
                 return {"op": "value", "value": node.value}
             raise DiscoveryError(f"unsupported literal value at line {line_no}")
         if isinstance(node, ast.Name):
+            if actual_refs is not None and node.id in actual_refs:
+                if actual_ref_hits is not None:
+                    actual_ref_hits.append(node.id)
+                return actual_refs[node.id]
             return {"op": "value", "value": self.resolve_name(node.id, line_no)}
         if isinstance(node, ast.List):
             return {
                 "op": "list",
-                "items": [self.parse_expression(item, entrypoint_args) for item in node.elts],
+                "items": [
+                    self.parse_expression(item, entrypoint_args, actual_refs, actual_ref_hits)
+                    for item in node.elts
+                ],
             }
         if isinstance(node, ast.Tuple):
             return {
                 "op": "tuple",
-                "items": [self.parse_expression(item, entrypoint_args) for item in node.elts],
+                "items": [
+                    self.parse_expression(item, entrypoint_args, actual_refs, actual_ref_hits)
+                    for item in node.elts
+                ],
             }
         if isinstance(node, ast.Set):
             return {
                 "op": "set",
-                "items": [self.parse_expression(item, entrypoint_args) for item in node.elts],
+                "items": [
+                    self.parse_expression(item, entrypoint_args, actual_refs, actual_ref_hits)
+                    for item in node.elts
+                ],
             }
         if isinstance(node, ast.Dict):
             entries: list[list[dict[str, Any]]] = []
@@ -897,8 +1205,8 @@ class TestDiscoverer:
                     raise DiscoveryError(f"dictionary unpacking is unsupported at line {line_no}")
                 entries.append(
                     [
-                        self.parse_expression(key_node, entrypoint_args),
-                        self.parse_expression(value_node, entrypoint_args),
+                        self.parse_expression(key_node, entrypoint_args, actual_refs, actual_ref_hits),
+                        self.parse_expression(value_node, entrypoint_args, actual_refs, actual_ref_hits),
                     ]
                 )
             return {"op": "dict", "entries": entries}
@@ -906,14 +1214,14 @@ class TestDiscoverer:
             return {
                 "op": "unary",
                 "operator": UNARY_OPERATORS[type(node.op)],
-                "operand": self.parse_expression(node.operand, entrypoint_args),
+                "operand": self.parse_expression(node.operand, entrypoint_args, actual_refs, actual_ref_hits),
             }
         if isinstance(node, ast.BinOp) and type(node.op) in BINARY_OPERATORS:
             return {
                 "op": "binary",
                 "operator": BINARY_OPERATORS[type(node.op)],
-                "left": self.parse_expression(node.left, entrypoint_args),
-                "right": self.parse_expression(node.right, entrypoint_args),
+                "left": self.parse_expression(node.left, entrypoint_args, actual_refs, actual_ref_hits),
+                "right": self.parse_expression(node.right, entrypoint_args, actual_refs, actual_ref_hits),
             }
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
@@ -924,19 +1232,26 @@ class TestDiscoverer:
             return {
                 "op": "compare",
                 "operator": COMPARE_OPERATORS[type(operator)],
-                "left": self.parse_expression(node.left, entrypoint_args),
-                "right": self.parse_expression(node.comparators[0], entrypoint_args),
+                "left": self.parse_expression(node.left, entrypoint_args, actual_refs, actual_ref_hits),
+                "right": self.parse_expression(
+                    node.comparators[0],
+                    entrypoint_args,
+                    actual_refs,
+                    actual_ref_hits,
+                ),
             }
         if isinstance(node, ast.Subscript):
-            return self.parse_subscript_expression(node, entrypoint_args)
+            return self.parse_subscript_expression(node, entrypoint_args, actual_refs, actual_ref_hits)
         if isinstance(node, ast.Call):
-            return self.parse_call_expression(node, entrypoint_args)
+            return self.parse_call_expression(node, entrypoint_args, actual_refs, actual_ref_hits)
         raise DiscoveryError(f"unsupported expression at line {line_no}")
 
     def parse_call_expression(
         self,
         node: ast.Call,
         entrypoint_args: list[list[Any]],
+        actual_refs: dict[str, dict[str, Any]] | None = None,
+        actual_ref_hits: list[str] | None = None,
     ) -> dict[str, Any]:
         line_no = getattr(node, "lineno", 0)
         if (
@@ -959,7 +1274,10 @@ class TestDiscoverer:
             return {
                 "op": "call",
                 "name": node.func.id,
-                "args": [self.parse_expression(arg, entrypoint_args) for arg in node.args],
+                "args": [
+                    self.parse_expression(arg, entrypoint_args, actual_refs, actual_ref_hits)
+                    for arg in node.args
+                ],
             }
 
         if isinstance(node.func, ast.Attribute) and node.func.attr in STRING_METHODS:
@@ -969,8 +1287,16 @@ class TestDiscoverer:
             return {
                 "op": "method",
                 "name": node.func.attr,
-                "receiver": self.parse_expression(node.func.value, entrypoint_args),
-                "args": [self.parse_expression(arg, entrypoint_args) for arg in node.args],
+                "receiver": self.parse_expression(
+                    node.func.value,
+                    entrypoint_args,
+                    actual_refs,
+                    actual_ref_hits,
+                ),
+                "args": [
+                    self.parse_expression(arg, entrypoint_args, actual_refs, actual_ref_hits)
+                    for arg in node.args
+                ],
             }
 
         raise DiscoveryError(f"unsupported function call at line {line_no}")
@@ -1013,26 +1339,28 @@ class TestDiscoverer:
         self,
         node: ast.Subscript,
         entrypoint_args: list[list[Any]],
+        actual_refs: dict[str, dict[str, Any]] | None = None,
+        actual_ref_hits: list[str] | None = None,
     ) -> dict[str, Any]:
-        value = self.parse_expression(node.value, entrypoint_args)
+        value = self.parse_expression(node.value, entrypoint_args, actual_refs, actual_ref_hits)
         if isinstance(node.slice, ast.Slice):
             return {
                 "op": "slice",
                 "value": value,
-                "lower": self.parse_expression(node.slice.lower, entrypoint_args)
+                "lower": self.parse_expression(node.slice.lower, entrypoint_args, actual_refs, actual_ref_hits)
                 if node.slice.lower is not None
                 else None,
-                "upper": self.parse_expression(node.slice.upper, entrypoint_args)
+                "upper": self.parse_expression(node.slice.upper, entrypoint_args, actual_refs, actual_ref_hits)
                 if node.slice.upper is not None
                 else None,
-                "step": self.parse_expression(node.slice.step, entrypoint_args)
+                "step": self.parse_expression(node.slice.step, entrypoint_args, actual_refs, actual_ref_hits)
                 if node.slice.step is not None
                 else None,
             }
         return {
             "op": "subscript",
             "value": value,
-            "index": self.parse_expression(node.slice, entrypoint_args),
+            "index": self.parse_expression(node.slice, entrypoint_args, actual_refs, actual_ref_hits),
         }
 
     def resolve_name(self, name: str, line_no: int) -> Any:
@@ -1270,6 +1598,7 @@ class TestDiscoverer:
         expectations = self.expectations_for(line_no)
         self.pending.append(
             PendingTest(
+                source_path=self.source_path,
                 line=line_no,
                 kind=kind,
                 args=args,
@@ -1290,6 +1619,7 @@ class TestDiscoverer:
     def add_loop_test(self, line_no: int, passed: bool) -> None:
         self.pending.append(
             PendingTest(
+                source_path=self.source_path,
                 line=line_no,
                 kind="loop",
                 iteration_path=self.active_path,
@@ -1320,7 +1650,7 @@ class TestDiscoverer:
 
 
 def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
-    bases = [test_id_base(test.line, test.iteration_path) for test in pending]
+    bases = [test_id_base(test.source_path, test.line, test.iteration_path) for test in pending]
     counts = Counter(bases)
     seen: defaultdict[str, int] = defaultdict(int)
     cases: list[TestCase] = []
@@ -1334,6 +1664,7 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
         cases.append(
             TestCase(
                 id=test_id,
+                source_path=test.source_path,
                 line=test.line,
                 kind=test.kind,
                 args=test.args,
@@ -1354,21 +1685,55 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
     return cases
 
 
-def test_id_base(line_no: int, iteration_path: tuple[int, ...]) -> str:
+def test_id_base(source_path: str, line_no: int, iteration_path: tuple[int, ...]) -> str:
     suffix = "".join(f":{index}" for index in iteration_path)
-    return f"tests.py:{line_no}{suffix}"
+    return f"{source_path}:{line_no}{suffix}"
+
+
+def relative_source_path(path: Path, tests_dir: Path) -> str:
+    return path.relative_to(tests_dir).as_posix()
+
+
+def is_test_like_non_python(path: Path) -> bool:
+    if path.name in set(SUPPORTED_LANGS.values()):
+        return False
+    return path.suffix != ".py" and TEST_LIKE_STEM_RE.fullmatch(path.stem) is not None
+
+
+def is_ignored_python_candidate(path: Path) -> bool:
+    return path.name in set(SUPPORTED_LANGS.values()) or path.name == "solution.py"
+
+
+def discover_python_files(tests_dir: Path) -> list[Path]:
+    python_files: list[Path] = []
+    try:
+        paths = sorted(item for item in tests_dir.rglob("*") if item.is_file())
+    except OSError as exc:
+        raise DiscoveryError("cannot read tests directory") from exc
+    for path in paths:
+        if is_test_like_non_python(path):
+            raise DiscoveryError(f"test-like non-Python file is unsupported: {relative_source_path(path, tests_dir)}")
+        if path.suffix == ".py" and not is_ignored_python_candidate(path):
+            python_files.append(path)
+    return python_files
 
 
 def discover_tests(tests_dir: Path | str, entrypoint: str) -> list[TestCase]:
-    tests_path = Path(tests_dir) / "tests.py"
-    if not tests_path.is_file():
-        raise DiscoveryError("tests.py is required")
-    try:
-        source = tests_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename="tests.py")
-    except (OSError, SyntaxError) as exc:
-        raise DiscoveryError("cannot read or parse tests.py") from exc
-    return TestDiscoverer(entrypoint, source.splitlines()).discover(tree)
+    root = Path(tests_dir)
+    if not root.is_dir():
+        raise DiscoveryError("tests_dir is required")
+    cases: list[TestCase] = []
+    for tests_path in discover_python_files(root):
+        source_path = relative_source_path(tests_path, root)
+        try:
+            source = tests_path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=source_path)
+        except (OSError, SyntaxError) as exc:
+            raise DiscoveryError(f"cannot read or parse {source_path}") from exc
+        cases.extend(TestDiscoverer(entrypoint, source.splitlines(), source_path).discover(tree))
+    if not cases:
+        raise DiscoveryError("no tests discovered")
+    return cases
 
 
 def tag_sort_key(value: Any) -> str:
@@ -1435,6 +1800,8 @@ def encode_expr(expr: dict[str, Any]) -> dict[str, Any]:
         return {"op": "value", "value": encode_value(expr["value"])}
     if op == "result":
         return {"op": "result"}
+    if op == "arg":
+        return {"op": "arg", "index": expr["index"]}
     if op in {"list", "tuple", "set"}:
         return {"op": op, "items": [encode_expr(item) for item in expr["items"]]}
     if op == "dict":
@@ -1613,6 +1980,8 @@ def _decode_expr(expr):
         return {"op": "value", "value": _decode_value(expr["value"])}
     if op == "result":
         return {"op": "result"}
+    if op == "arg":
+        return {"op": "arg", "index": expr["index"]}
     if op in {"list", "tuple", "set"}:
         return {"op": op, "items": [_decode_expr(item) for item in expr["items"]]}
     if op == "dict":
@@ -1828,22 +2197,24 @@ def _eval_method(name, receiver, args):
     raise ValueError("unsupported string method")
 
 
-def _eval_expr(expr, result):
+def _eval_expr(expr, result, args):
     op = expr["op"]
     if op == "result":
         return result
+    if op == "arg":
+        return args[expr["index"]]
     if op == "value":
         return expr["value"]
     if op == "list":
-        return [_eval_expr(item, result) for item in expr["items"]]
+        return [_eval_expr(item, result, args) for item in expr["items"]]
     if op == "tuple":
-        return tuple(_eval_expr(item, result) for item in expr["items"])
+        return tuple(_eval_expr(item, result, args) for item in expr["items"])
     if op == "set":
-        return set(_eval_expr(item, result) for item in expr["items"])
+        return set(_eval_expr(item, result, args) for item in expr["items"])
     if op == "dict":
-        return {_eval_expr(key, result): _eval_expr(value, result) for key, value in expr["entries"]}
+        return {_eval_expr(key, result, args): _eval_expr(value, result, args) for key, value in expr["entries"]}
     if op == "unary":
-        operand = _eval_expr(expr["operand"], result)
+        operand = _eval_expr(expr["operand"], result, args)
         if expr["operator"] == "uadd":
             return +operand
         if expr["operator"] == "usub":
@@ -1851,8 +2222,8 @@ def _eval_expr(expr, result):
         if expr["operator"] == "not":
             return not operand
     if op == "binary":
-        left = _eval_expr(expr["left"], result)
-        right = _eval_expr(expr["right"], result)
+        left = _eval_expr(expr["left"], result, args)
+        right = _eval_expr(expr["right"], result, args)
         operator = expr["operator"]
         if operator == "add":
             return left + right
@@ -1869,8 +2240,8 @@ def _eval_expr(expr, result):
         if operator == "pow":
             return left ** right
     if op == "compare":
-        left = _eval_expr(expr["left"], result)
-        right = _eval_expr(expr["right"], result)
+        left = _eval_expr(expr["left"], result, args)
+        right = _eval_expr(expr["right"], result, args)
         operator = expr["operator"]
         if operator == "eq":
             return _deep_equal(left, right)
@@ -1889,18 +2260,18 @@ def _eval_expr(expr, result):
         if operator == "not_in":
             return not _contains(right, left)
     if op == "call":
-        return _eval_call(expr["name"], [_eval_expr(arg, result) for arg in expr["args"]])
+        return _eval_call(expr["name"], [_eval_expr(arg, result, args) for arg in expr["args"]])
     if op == "method":
-        receiver = _eval_expr(expr["receiver"], result)
-        args = [_eval_expr(arg, result) for arg in expr["args"]]
-        return _eval_method(expr["name"], receiver, args)
+        receiver = _eval_expr(expr["receiver"], result, args)
+        method_args = [_eval_expr(arg, result, args) for arg in expr["args"]]
+        return _eval_method(expr["name"], receiver, method_args)
     if op == "subscript":
-        return _eval_expr(expr["value"], result)[_eval_expr(expr["index"], result)]
+        return _eval_expr(expr["value"], result, args)[_eval_expr(expr["index"], result, args)]
     if op == "slice":
-        value = _eval_expr(expr["value"], result)
-        lower = _eval_expr(expr["lower"], result) if expr["lower"] is not None else None
-        upper = _eval_expr(expr["upper"], result) if expr["upper"] is not None else None
-        step = _eval_expr(expr["step"], result) if expr["step"] is not None else None
+        value = _eval_expr(expr["value"], result, args)
+        lower = _eval_expr(expr["lower"], result, args) if expr["lower"] is not None else None
+        upper = _eval_expr(expr["upper"], result, args) if expr["upper"] is not None else None
+        step = _eval_expr(expr["step"], result, args) if expr["step"] is not None else None
         return value[slice(lower, upper, step)]
     raise ValueError("unsupported expression operation")
 
@@ -1943,7 +2314,7 @@ def _matches(case, value, raised):
     if raised is not None:
         return False
     try:
-        actual = _eval_expr(case["actual_expr"], value)
+        actual = _eval_expr(case["actual_expr"], value, case["args"])
     except Exception:
         return False
     if kind == "eq":
@@ -2188,6 +2559,9 @@ function decodeExpr(expr) {
   }
   if (expr.op === "result") {
     return {op: "result"};
+  }
+  if (expr.op === "arg") {
+    return {op: "arg", index: expr.index};
   }
   if (expr.op === "list" || expr.op === "tuple" || expr.op === "set") {
     return {...expr, items: expr.items.map((item) => decodeExpr(item))};
@@ -2672,21 +3046,24 @@ function sliceValue(value, lower, upper, step) {
   return typeof value === "string" ? result.join("") : result;
 }
 
-function evalExpr(expr, result) {
+function evalExpr(expr, result, args) {
   if (expr.op === "result") {
     return result;
+  }
+  if (expr.op === "arg") {
+    return args[expr.index];
   }
   if (expr.op === "value") {
     return expr.value;
   }
   if (expr.op === "list" || expr.op === "tuple") {
-    return expr.items.map((item) => evalExpr(item, result));
+    return expr.items.map((item) => evalExpr(item, result, args));
   }
   if (expr.op === "set") {
-    return new Set(expr.items.map((item) => evalExpr(item, result)));
+    return new Set(expr.items.map((item) => evalExpr(item, result, args)));
   }
   if (expr.op === "dict") {
-    const entries = expr.entries.map(([key, value]) => [evalExpr(key, result), evalExpr(value, result)]);
+    const entries = expr.entries.map(([key, value]) => [evalExpr(key, result, args), evalExpr(value, result, args)]);
     if (entries.every(([key]) => typeof key === "string")) {
       const object = {};
       for (const [key, value] of entries) {
@@ -2697,7 +3074,7 @@ function evalExpr(expr, result) {
     return new Map(entries);
   }
   if (expr.op === "unary") {
-    const operand = evalExpr(expr.operand, result);
+    const operand = evalExpr(expr.operand, result, args);
     if (expr.operator === "uadd") {
       return +operand;
     }
@@ -2709,11 +3086,11 @@ function evalExpr(expr, result) {
     }
   }
   if (expr.op === "binary") {
-    return binaryValue(expr.operator, evalExpr(expr.left, result), evalExpr(expr.right, result));
+    return binaryValue(expr.operator, evalExpr(expr.left, result, args), evalExpr(expr.right, result, args));
   }
   if (expr.op === "compare") {
-    const left = evalExpr(expr.left, result);
-    const right = evalExpr(expr.right, result);
+    const left = evalExpr(expr.left, result, args);
+    const right = evalExpr(expr.right, result, args);
     if (expr.operator === "eq") {
       return deepEqual(left, right);
     }
@@ -2740,24 +3117,24 @@ function evalExpr(expr, result) {
     }
   }
   if (expr.op === "call") {
-    return callValue(expr.name, expr.args.map((arg) => evalExpr(arg, result)));
+    return callValue(expr.name, expr.args.map((arg) => evalExpr(arg, result, args)));
   }
   if (expr.op === "method") {
     return methodValue(
       expr.name,
-      evalExpr(expr.receiver, result),
-      expr.args.map((arg) => evalExpr(arg, result)),
+      evalExpr(expr.receiver, result, args),
+      expr.args.map((arg) => evalExpr(arg, result, args)),
     );
   }
   if (expr.op === "subscript") {
-    return subscriptValue(evalExpr(expr.value, result), evalExpr(expr.index, result));
+    return subscriptValue(evalExpr(expr.value, result, args), evalExpr(expr.index, result, args));
   }
   if (expr.op === "slice") {
     return sliceValue(
-      evalExpr(expr.value, result),
-      expr.lower === null ? null : evalExpr(expr.lower, result),
-      expr.upper === null ? null : evalExpr(expr.upper, result),
-      expr.step === null ? null : evalExpr(expr.step, result),
+      evalExpr(expr.value, result, args),
+      expr.lower === null ? null : evalExpr(expr.lower, result, args),
+      expr.upper === null ? null : evalExpr(expr.upper, result, args),
+      expr.step === null ? null : evalExpr(expr.step, result, args),
     );
   }
   throw new Error("unsupported expression operation");
@@ -2813,7 +3190,7 @@ function assertionMatches(testCase, callResult) {
   }
   let actual;
   try {
-    actual = evalExpr(testCase.actual_expr, callResult.value);
+    actual = evalExpr(testCase.actual_expr, callResult.value, testCase.args);
   } catch (_) {
     return false;
   }

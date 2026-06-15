@@ -154,6 +154,65 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual([case.kind for case in cases], ["eq", "ne", "truthy", "raises", "not", "eq"])
             self.assertEqual(cases[-1].args, [{"x": [1, (2,)]}])
 
+    def test_discovery_recurses_into_python_files_and_uses_relative_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            cases_dir = tests_dir / "cases"
+            nested_dir = cases_dir / "nested"
+            nested_dir.mkdir(parents=True)
+            write(
+                cases_dir / "sorting_tests.py",
+                """
+                assert solve(1) == 2; assert solve(2) == 3
+                """,
+            )
+            write(
+                nested_dir / "loop_tests.py",
+                """
+                values = [(3, 4), (4, 5)]
+                for value, expected in values:
+                    assert solve(value) == expected
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(
+                [case.id for case in cases],
+                [
+                    "cases/nested/loop_tests.py:2",
+                    "cases/nested/loop_tests.py:3:0",
+                    "cases/nested/loop_tests.py:3:1",
+                    "cases/sorting_tests.py:1#0",
+                    "cases/sorting_tests.py:1#1",
+                ],
+            )
+
+    def test_discovery_rejects_test_like_non_python_files_and_no_tests(self) -> None:
+        test_like_names = [
+            "test_cases.txt",
+            "cases/api_test.md",
+            "cases/tests.json",
+            "cases/nested/parser_tests.yaml",
+        ]
+        for relative_name in test_like_names:
+            with self.subTest(relative_name=relative_name), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                path = tests_dir / relative_name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("not python", encoding="utf-8")
+                write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+
+                with self.assertRaises(bcg.DiscoveryError):
+                    bcg.discover_tests(tests_dir, "solve")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "helpers.py", "VALUE = 1\n")
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
     def test_discovery_supports_rich_values_and_tolerance_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -235,12 +294,101 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(cases[4].actual_expr["op"], "call")
             self.assertEqual(cases[5].actual_expr["op"], "compare")
 
+    def test_discovery_supports_mutation_style_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                a = [2, 0, 2, 1, 1, 0]
+                solve(a)
+                assert a == [0, 0, 1, 1, 2, 2]
+                items = [3, 1, 2]
+                result = solve(items)
+                assert result == [1, 2, 3]
+                assert items == [1, 2, 3]
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual([case.id for case in cases], ["tests.py:3", "tests.py:6", "tests.py:7"])
+            self.assertEqual([case.kind for case in cases], ["eq", "eq", "eq"])
+            self.assertEqual(cases[0].args, [[2, 0, 2, 1, 1, 0]])
+            self.assertEqual(cases[0].actual_expr, {"op": "arg", "index": 0})
+            self.assertEqual(cases[1].actual_expr, {"op": "result"})
+            self.assertEqual(cases[2].actual_expr, {"op": "arg", "index": 0})
+
+    def test_python_mutation_style_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                a = [2, 0, 2, 1, 1, 0]
+                solve(a)
+                assert a == [0, 0, 1, 1, 2, 2]
+                items = [3, 1, 2]
+                result = solve(items)
+                assert result == [1, 2, 3]
+                assert items == [1, 2, 3]
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                def solve(values):
+                    values.sort()
+                    return values
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["passed"], ["tests.py:3", "tests.py:6", "tests.py:7"])
+
     def test_discovery_rejects_multi_call_and_unsupported_helper_expressions(self) -> None:
         sources = [
             "assert solve(1) == solve(2)\n",
             "assert solve(1) + solve(2) == 3\n",
             "assert helper(solve(1)) == 2\n",
             "assert solve(helper(1)) == 2\n",
+        ]
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", source)
+
+                with self.assertRaises(bcg.DiscoveryError):
+                    bcg.discover_tests(tests_dir, "solve")
+
+    def test_discovery_rejects_invalid_mutation_style_patterns(self) -> None:
+        sources = [
+            """
+            a = [2, 1]
+            solve(a)
+            b = list(a)
+            assert a == [1, 2]
+            """,
+            """
+            a = [2, 1]
+            solve(a)
+            assert True
+            """,
+            """
+            a = [2, 1]
+            result = solve(a)
+            assert len(a) == 2
+            assert "independent"
+            """,
+            """
+            solve([2, 1])
+            """,
         ]
         for source in sources:
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
