@@ -331,6 +331,92 @@ class BabelCodeGoatTests(unittest.TestCase):
             with self.assertRaises(bcg.DiscoveryError):
                 bcg.discover_tests(tests_dir, "solve")
 
+    def test_discovery_recurses_python_files_and_uses_relative_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "nested").mkdir()
+            (tests_dir / "other").mkdir()
+            write(tests_dir / "other" / "values.py", "assert solve(0) == 1\n")
+            write(
+                tests_dir / "nested" / "test_values.py",
+                "assert solve(1) == 2; assert solve(2) == 3\n",
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(
+                [case.id for case in cases],
+                [
+                    "nested/test_values.py:1#0",
+                    "nested/test_values.py:1#1",
+                    "other/values.py:1",
+                ],
+            )
+
+    def test_discovery_rejects_test_like_non_python_files_and_no_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "nested").mkdir()
+            write(tests_dir / "nested" / "test_cases.txt", "assert solve(1) == 2\n")
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "helper.py", "# no tests here\n")
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
+    def test_discovery_supports_mutation_style_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                values = [2, 0, 1]
+                solve(values)
+                assert values == [0, 1, 2]
+                result = solve([2, 1])
+                assert result == [1, 2]
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual([case.kind for case in cases], ["mutation", "mutation"])
+            self.assertEqual([case.id for case in cases], ["tests.py:2", "tests.py:4"])
+            self.assertEqual(cases[0].postconditions[0]["actual_expr"], {"op": "arg", "index": 0})
+            self.assertEqual(cases[1].postconditions[0]["actual_expr"], {"op": "result"})
+
+    def test_discovery_rejects_invalid_mutation_patterns(self) -> None:
+        sources = [
+            """
+            values = [2, 1]
+            solve(values)
+            assert solve(values) == [1, 2]
+            """,
+            """
+            values = [2, 1]
+            solve(values)
+            assert True
+            """,
+            """
+            values = [2, 1]
+            solve(values)
+            other = values
+            assert values == [1, 2]
+            """,
+        ]
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", source)
+
+                with self.assertRaises(bcg.DiscoveryError):
+                    bcg.discover_tests(tests_dir, "solve")
+
     def test_python_pass_fail_error_output_and_exit_codes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)
@@ -654,6 +740,41 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(result["status"], "fail")
             self.assertEqual(result["passed"], ["tests.py:2", "tests.py:3:0", "tests.py:3:1"])
             self.assertEqual(result["failed"], ["tests.py:3:2"])
+
+    def test_python_mutation_style_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            calls = tests_dir / "calls.txt"
+            write(
+                tests_dir / "tests.py",
+                """
+                values = [2, 0, 1]
+                solve(values)
+                assert values == [0, 1, 2]
+                result = solve([3, 1])
+                assert result == [1, 3]
+                """,
+            )
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                f"""
+                CALLS = {str(calls)!r}
+
+                def solve(values):
+                    with open(CALLS, "a", encoding="utf-8") as handle:
+                        handle.write("call\\n")
+                    values.sort()
+                    return values
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["call", "call"])
 
     @unittest.skipIf(shutil.which("node") is None, "node is required for JavaScript smoke tests")
     def test_javascript_solution_execution(self) -> None:
