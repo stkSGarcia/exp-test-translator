@@ -1,0 +1,5 @@
+[
+  "babel-code-goat-cli/add-babel-code-goat",
+  "babel-code-goat-cli/add-loop-as-test-support",
+  "babel-code-goat-cli/support-mutation-directory-discovery"
+]

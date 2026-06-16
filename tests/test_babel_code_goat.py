@@ -67,6 +67,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 "python": "tester.py",
                 "javascript": "tester.js",
                 "typescript": "tester.ts",
+                "cpp": "tester.cpp",
+                "rust": "tester.rs",
             }
             for lang, filename in expected.items():
                 with self.subTest(lang=lang):
@@ -82,6 +84,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 tests_dir / "tester.py": "py sentinel",
                 tests_dir / "tester.js": "js sentinel",
                 tests_dir / "tester.ts": "ts sentinel",
+                tests_dir / "tester.cpp": "cpp sentinel",
+                tests_dir / "tester.rs": "rust sentinel",
             }
             for path, content in sentinels.items():
                 path.write_text(content, encoding="utf-8")
@@ -91,22 +95,30 @@ class BabelCodeGoatTests(unittest.TestCase):
                 self.assertEqual(path.read_text(encoding="utf-8"), content)
 
     def test_generate_preserves_existing_tester_on_discovery_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tests_dir = Path(tmp)
-            write(tests_dir / "tests.py", "import os\n")
-            tester = tests_dir / "tester.py"
-            tester.write_text("sentinel", encoding="utf-8")
+        filenames = {
+            "python": "tester.py",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
+        }
+        for lang, filename in filenames.items():
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", "import os\n")
+                tester = tests_dir / filename
+                tester.write_text("sentinel", encoding="utf-8")
 
-            proc = self.generate(tests_dir, "python")
+                proc = self.generate(tests_dir, lang)
 
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertEqual(tester.read_text(encoding="utf-8"), "sentinel")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(tester.read_text(encoding="utf-8"), "sentinel")
 
     def test_missing_tester_errors_and_does_not_create_files(self) -> None:
         filenames = {
             "python": "tester.py",
             "javascript": "tester.js",
             "typescript": "tester.ts",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
         }
         for lang, filename in filenames.items():
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
@@ -1066,6 +1078,127 @@ class BabelCodeGoatTests(unittest.TestCase):
 
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    def test_cpp_generated_source_uses_native_idioms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                import math
+                from decimal import Decimal
+
+                assert solve(None) == None
+                assert solve([3, 1, 2]) == [1, 2, 3]
+                assert sorted(solve([3, 1, 2])) == [1, 2, 3]
+                assert solve({"items": [1, 2]}) == {"items": [1, 2]}
+                assert solve(set([2, 1])) == set([1, 2])
+                assert math.isclose(solve("decimal"), Decimal("1.00"), abs_tol=Decimal("0.01"))
+                assert solve("abc").upper() == "ABC"
+                try:
+                    solve("boom")
+                    assert False
+                except ValueError as e:
+                    assert "bad" in str(e)
+                """,
+            )
+
+            proc = self.generate(tests_dir, "cpp")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            source = (tests_dir / "tester.cpp").read_text(encoding="utf-8")
+            self.assertIn("std::optional", source)
+            self.assertIn("std::nullopt", source)
+            self.assertIn("std::vector", source)
+            self.assertIn("std::map", source)
+            self.assertIn("std::unordered_map", source)
+            self.assertIn("std::set", source)
+            self.assertIn("long double", source)
+            self.assertIn("std::string", source)
+            self.assertIn("std::sort", source)
+            self.assertIn("catch (const std::exception& e)", source)
+
+    def test_rust_generated_source_uses_native_idioms_and_skips_deque(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                from collections import deque
+                from decimal import Decimal
+
+                assert solve(None) == None
+                assert solve([3, 1, 2]) == [1, 2, 3]
+                assert solve({"items": [1, 2]}) == {"items": [1, 2]}
+                assert solve(set([2, 1])) == set([1, 2])
+                assert solve("abc").lower() == "abc"
+                assert solve("abc").find("b") == 1
+                assert solve("decimal") == Decimal("1.0")
+                assert solve(deque([1, 2])) == deque([1, 2])
+                try:
+                    solve("boom")
+                    assert False
+                except Exception:
+                    pass
+                """,
+            )
+
+            proc = self.generate(tests_dir, "rust")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            source = (tests_dir / "tester.rs").read_text(encoding="utf-8")
+            self.assertIn("Option", source)
+            self.assertIn("None", source)
+            self.assertIn("Vec", source)
+            self.assertIn("HashMap", source)
+            self.assertIn("BTreeMap", source)
+            self.assertIn("HashSet", source)
+            self.assertIn("f64", source)
+            self.assertIn("String::from", source)
+            self.assertIn('String::from("items")', source)
+            self.assertIn("to_lowercase", source)
+            self.assertIn(".sort()", source)
+            self.assertIn("catch_unwind", source)
+            self.assertIn("skipped Rust deque test", source)
+
+    @unittest.skipIf(
+        shutil.which("g++") is None and shutil.which("clang++") is None,
+        "g++ or clang++ is required for C++ smoke tests",
+    )
+    def test_cpp_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("cpp", "solution.cpp")
+        write(
+            solution,
+            """
+            int solve(int value) {
+              return value + 1;
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("rust", "solution.rs")
+        write(
+            solution,
+            """
+            fn solve(value: i64) -> i64 {
+                value + 1
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "rust").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "rust")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
 
 
 if __name__ == "__main__":
