@@ -1,7 +1,7 @@
 
 
 ============================= test session starts ==============================
-platform linux -- Python 3.12.13, pytest-9.1.0, pluggy-1.6.0 -- /tmp/uv-cache/archive-v0/mhLg8ZYtCzaDbA-s/bin/python
+platform linux -- Python 3.12.13, pytest-9.1.0, pluggy-1.6.0 -- /tmp/uv-cache/archive-v0/ZnxJe6ZNTg6fK3lh/bin/python
 cachedir: .pytest_cache
 metadata: {'Python': '3.12.13', 'Platform': 'Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41', 'Packages': {'pytest': '9.1.0', 'pluggy': '1.6.0'}, 'Plugins': {'json-ctrf': '0.5.2', 'timeout': '2.4.0', 'metadata': '3.1.1', 'json-report': '1.5.0'}}
 rootdir: /workspace
@@ -20054,14 +20054,14 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#0', 'tests.py:3#1'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
+E       AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#0'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#0'
 E         'tests.py:3#1'
+E         'tests.py:3#0'
 E         
 E         Full diff:
 E           {
@@ -20113,14 +20113,14 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#0', 'tests.py:3#1'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
+E       AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#0'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#0'
 E         'tests.py:3#1'
+E         'tests.py:3#0'
 E         
 E         Full diff:
 E           {
@@ -20172,14 +20172,14 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#0', 'tests.py:3#1'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
+E       AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#0'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#0'
 E         'tests.py:3#1'
+E         'tests.py:3#0'
 E         
 E         Full diff:
 E           {
@@ -20420,23 +20420,23 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}
+E       AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#10'
-E         'tests.py:3#6'
-E         'tests.py:3#0'
 E         'tests.py:3#1'
-E         'tests.py:3#7'
+E         'tests.py:3#8'
+E         'tests.py:3#10'
+E         'tests.py:3#2'
+E         'tests.py:3#3'
+E         'tests.py:3#9'
+E         'tests.py:3#0'
+E         'tests.py:3#6'
 E         'tests.py:3#5'
 E         'tests.py:3#4'
-E         'tests.py:3#2'
-E         'tests.py:3#9'
-E         'tests.py:3#8'
-E         'tests.py:3#3'
+E         'tests.py:3#7'
 E         
 E         Full diff:
 E           {
@@ -20496,23 +20496,23 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}
+E       AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#10'
-E         'tests.py:3#6'
-E         'tests.py:3#0'
 E         'tests.py:3#1'
-E         'tests.py:3#7'
+E         'tests.py:3#8'
+E         'tests.py:3#10'
+E         'tests.py:3#2'
+E         'tests.py:3#3'
+E         'tests.py:3#9'
+E         'tests.py:3#0'
+E         'tests.py:3#6'
 E         'tests.py:3#5'
 E         'tests.py:3#4'
-E         'tests.py:3#2'
-E         'tests.py:3#9'
-E         'tests.py:3#8'
-E         'tests.py:3#3'
+E         'tests.py:3#7'
 E         
 E         Full diff:
 E           {
@@ -20572,23 +20572,23 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}
+E       AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#10'
-E         'tests.py:3#6'
-E         'tests.py:3#0'
 E         'tests.py:3#1'
-E         'tests.py:3#7'
+E         'tests.py:3#8'
+E         'tests.py:3#10'
+E         'tests.py:3#2'
+E         'tests.py:3#3'
+E         'tests.py:3#9'
+E         'tests.py:3#0'
+E         'tests.py:3#6'
 E         'tests.py:3#5'
 E         'tests.py:3#4'
-E         'tests.py:3#2'
-E         'tests.py:3#9'
-E         'tests.py:3#8'
-E         'tests.py:3#3'
+E         'tests.py:3#7'
 E         
 E         Full diff:
 E           {
@@ -32062,14 +32062,14 @@ assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': 'mu
 FAILED .evaluation_tests/test_checkpoint_5.py::test_mutation_edge_cases[222_mutation_aliased_variable-typescript] - AssertionError: generate failed: mutation assert must reference mutated value at line 4
   
 assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': 'mutation assert must reference mutated value at line 4\n', 'generate_stdout': '', 'generate_returncode': 2}
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[233_same_line_suffix-python] - AssertionError: Expected IDs {'tests.py:3#0', 'tests.py:3#1'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[233_same_line_suffix-python] - AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#0'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#0'
   'tests.py:3#1'
+  'tests.py:3#0'
   
   Full diff:
     {
@@ -32079,14 +32079,14 @@ assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
   ?               ^
   -     'tests.py:3#1',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[233_same_line_suffix-javascript] - AssertionError: Expected IDs {'tests.py:3#0', 'tests.py:3#1'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[233_same_line_suffix-javascript] - AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#0'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#0'
   'tests.py:3#1'
+  'tests.py:3#0'
   
   Full diff:
     {
@@ -32096,14 +32096,14 @@ assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
   ?               ^
   -     'tests.py:3#1',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[233_same_line_suffix-typescript] - AssertionError: Expected IDs {'tests.py:3#0', 'tests.py:3#1'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#0', 'tests.py:3#1'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[233_same_line_suffix-typescript] - AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#0'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#0'
   'tests.py:3#1'
+  'tests.py:3#0'
   
   Full diff:
     {
@@ -32176,23 +32176,23 @@ assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:
   +     'sub/tests.py:6',
   ?                   ^
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-python] - AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-python] - AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#10'
-  'tests.py:3#6'
-  'tests.py:3#0'
   'tests.py:3#1'
-  'tests.py:3#7'
+  'tests.py:3#8'
+  'tests.py:3#10'
+  'tests.py:3#2'
+  'tests.py:3#3'
+  'tests.py:3#9'
+  'tests.py:3#0'
+  'tests.py:3#6'
   'tests.py:3#5'
   'tests.py:3#4'
-  'tests.py:3#2'
-  'tests.py:3#9'
-  'tests.py:3#8'
-  'tests.py:3#3'
+  'tests.py:3#7'
   
   Full diff:
     {
@@ -32210,23 +32210,23 @@ assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'test
   -     'tests.py:3#8',
   -     'tests.py:3#9',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-javascript] - AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-javascript] - AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#10'
-  'tests.py:3#6'
-  'tests.py:3#0'
   'tests.py:3#1'
-  'tests.py:3#7'
+  'tests.py:3#8'
+  'tests.py:3#10'
+  'tests.py:3#2'
+  'tests.py:3#3'
+  'tests.py:3#9'
+  'tests.py:3#0'
+  'tests.py:3#6'
   'tests.py:3#5'
   'tests.py:3#4'
-  'tests.py:3#2'
-  'tests.py:3#9'
-  'tests.py:3#8'
-  'tests.py:3#3'
+  'tests.py:3#7'
   
   Full diff:
     {
@@ -32244,23 +32244,23 @@ assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'test
   -     'tests.py:3#8',
   -     'tests.py:3#9',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-typescript] - AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#6', 'tests.py:3#0', 'tests.py:3#1', 'tests.py:3#7', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#2', 'tests.py:3#9', 'tests.py:3#8', 'tests.py:3#3'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-typescript] - AssertionError: Expected IDs {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#10', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#9', 'tests.py:3#0', 'tests.py:3#6', 'tests.py:3#5', 'tests.py:3#4', 'tests.py:3#7'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#10'
-  'tests.py:3#6'
-  'tests.py:3#0'
   'tests.py:3#1'
-  'tests.py:3#7'
+  'tests.py:3#8'
+  'tests.py:3#10'
+  'tests.py:3#2'
+  'tests.py:3#3'
+  'tests.py:3#9'
+  'tests.py:3#0'
+  'tests.py:3#6'
   'tests.py:3#5'
   'tests.py:3#4'
-  'tests.py:3#2'
-  'tests.py:3#9'
-  'tests.py:3#8'
-  'tests.py:3#3'
+  'tests.py:3#7'
   
   Full diff:
     {
@@ -33215,4 +33215,4 @@ assert 'error' == 'pass'
   
   - pass
   + error
-================ 763 failed, 1027 passed in 1422.56s (0:23:42) =================
+================ 763 failed, 1027 passed in 1701.04s (0:28:21) =================

@@ -1,7 +1,7 @@
 problems:
   - test_translator
 model:
-  name: claude-sonnet-4-6
+  name: codex-gpt5.5
 thinking: high
 prompt_path: external
 agent:

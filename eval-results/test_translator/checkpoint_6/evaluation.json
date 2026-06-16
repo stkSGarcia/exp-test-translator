@@ -4,7 +4,7 @@
   "problem_version": 2,
   "checkpoint_name": "checkpoint_6",
   "checkpoint_version": 1,
-  "duration": 1502.1378262043,
+  "duration": 1710.1312611103058,
   "entrypoint": "uv run babel_code_goat.py",
   "tests": {
     "checkpoint_1-Regression": {

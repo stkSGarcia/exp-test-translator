@@ -1,5 +1,0 @@
-[
-  "babel-code-goat-cli/add-babel-code-goat",
-  "babel-code-goat-cli/support-single-call-traceability",
-  "babel-code-goat-cli/support-mutation-directory-discovery"
-]

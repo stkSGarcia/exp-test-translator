@@ -1,5 +1,0 @@
-[
-  "babel-code-goat-cli/support-single-call-traceability",
-  "babel-code-goat-cli/support-rich-test-comparisons",
-  "babel-code-goat-cli/add-loop-as-test-support"
-]

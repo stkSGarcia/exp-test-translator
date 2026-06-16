@@ -4,7 +4,7 @@
   "problem_version": 2,
   "checkpoint_name": "checkpoint_7",
   "checkpoint_version": 1,
-  "duration": 1551.8207404613495,
+  "duration": 1724.2002692222595,
   "entrypoint": "uv run babel_code_goat.py",
   "tests": {
     "checkpoint_1-Regression": {
@@ -1945,7 +1945,6 @@
         "test_total_timeout_fail[total_timeout_slow_fail-python]",
         "test_total_timeout_fail[total_timeout_slow_fail-typescript]",
         "test_total_timeout_pass[total_timeout_fast_pass-javascript]",
-        "test_total_timeout_pass[total_timeout_fast_pass-python]",
         "test_total_timeout_pass[total_timeout_fast_pass-typescript]"
       ],
       "failed": [
@@ -1995,6 +1994,7 @@
         "test_total_timeout_fail[total_timeout_slow_fail-cpp]",
         "test_total_timeout_fail[total_timeout_slow_fail-rust]",
         "test_total_timeout_pass[total_timeout_fast_pass-cpp]",
+        "test_total_timeout_pass[total_timeout_fast_pass-python]",
         "test_total_timeout_pass[total_timeout_fast_pass-rust]"
       ],
       "skipped": []
@@ -2032,7 +2032,7 @@
   },
   "pass_counts": {
     "Core": 14,
-    "Functionality": 59,
+    "Functionality": 58,
     "Regression": 1026,
     "Error": 24
   },

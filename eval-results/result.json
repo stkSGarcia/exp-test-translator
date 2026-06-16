@@ -1,12 +1,12 @@
 {
-  "model": "claude-sonnet-4-6",
+  "model": "codex-gpt5.5",
   "thinking": "high",
   "prompt": "external",
   "agent_type": "external",
   "agent_version": null,
   "num_problems": 1,
   "num_checkpoints": 4,
-  "expected_checkpoints": 8,
+  "expected_checkpoints": 4,
   "costs": {
     "checkpoint": {
       "mean": null,
@@ -96,17 +96,17 @@
   "pass_rates": {
     "problem": {
       "core": 0.4981472491909385,
-      "total": 0.5884554366887943,
+      "total": 0.5880490265360131,
       "error": 0.9642857142857143,
-      "functionality": 0.6854256587330949,
-      "regression": 0.5639527191596748
+      "functionality": 0.6822810046450446,
+      "regression": 0.5635803101568965
     },
     "checkpoint": {
       "core": 0.4981472491909385,
-      "total": 0.5884554366887943,
+      "total": 0.5880490265360131,
       "error": 0.9642857142857143,
-      "functionality": 0.6854256587330949,
-      "regression": 0.5639527191596748
+      "functionality": 0.6822810046450446,
+      "regression": 0.5635803101568965
     }
   },
   "cc": {

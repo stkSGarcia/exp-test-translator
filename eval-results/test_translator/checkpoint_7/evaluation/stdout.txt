@@ -1,7 +1,7 @@
 
 
 ============================= test session starts ==============================
-platform linux -- Python 3.12.13, pytest-9.1.0, pluggy-1.6.0 -- /tmp/uv-cache/archive-v0/iH0fxceF7Kw5vBLv/bin/python
+platform linux -- Python 3.12.13, pytest-9.1.0, pluggy-1.6.0 -- /tmp/uv-cache/archive-v0/gWa_GQhfimZ92G0h/bin/python
 cachedir: .pytest_cache
 metadata: {'Python': '3.12.13', 'Platform': 'Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41', 'Packages': {'pytest': '9.1.0', 'pluggy': '1.6.0'}, 'Plugins': {'json-ctrf': '0.5.2', 'timeout': '2.4.0', 'metadata': '3.1.1', 'json-report': '1.5.0'}}
 rootdir: /workspace
@@ -1872,7 +1872,7 @@ collecting ... collected 1960 items
 .evaluation_tests/test_checkpoint_7.py::test_timeout_combined_pass[timeout_mutation_fast-typescript] PASSED [ 94%]
 .evaluation_tests/test_checkpoint_7.py::test_timeout_combined_pass[timeout_mutation_fast-cpp] FAILED [ 94%]
 .evaluation_tests/test_checkpoint_7.py::test_timeout_combined_pass[timeout_mutation_fast-rust] FAILED [ 94%]
-.evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-python] PASSED [ 94%]
+.evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-python] FAILED [ 94%]
 .evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-javascript] PASSED [ 95%]
 .evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-typescript] PASSED [ 95%]
 .evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-cpp] FAILED [ 95%]
@@ -17353,7 +17353,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
 
 self = <Popen: returncode: -9 args: ['uv', 'run', '--project', '/workspace', '/work...>
-endtime = 6987.305481126, orig_timeout = 30, stdout_seq = [], stderr_seq = []
+endtime = 85196.129492435, orig_timeout = 30, stdout_seq = [], stderr_seq = []
 skip_check_and_raise = False
 
     def _check_timeout(self, endtime, orig_timeout, stdout_seq, stderr_seq,
@@ -20455,15 +20455,15 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'sub/tests.py:7', 'sub/tests.py:3'}, got ['sub/tests.py:2', 'sub/tests.py:6']
-E       assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:3'}
+E       AssertionError: Expected IDs {'sub/tests.py:3', 'sub/tests.py:7'}, got ['sub/tests.py:2', 'sub/tests.py:6']
+E       assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:7'}
 E         
 E         Extra items in the left set:
 E         'sub/tests.py:6'
 E         'sub/tests.py:2'
 E         Extra items in the right set:
-E         'sub/tests.py:7'
 E         'sub/tests.py:3'
+E         'sub/tests.py:7'
 E         
 E         Full diff:
 E           {
@@ -20518,15 +20518,15 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'sub/tests.py:7', 'sub/tests.py:3'}, got ['sub/tests.py:2', 'sub/tests.py:6']
-E       assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:3'}
+E       AssertionError: Expected IDs {'sub/tests.py:3', 'sub/tests.py:7'}, got ['sub/tests.py:2', 'sub/tests.py:6']
+E       assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:7'}
 E         
 E         Extra items in the left set:
 E         'sub/tests.py:6'
 E         'sub/tests.py:2'
 E         Extra items in the right set:
-E         'sub/tests.py:7'
 E         'sub/tests.py:3'
+E         'sub/tests.py:7'
 E         
 E         Full diff:
 E           {
@@ -20581,15 +20581,15 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'sub/tests.py:7', 'sub/tests.py:3'}, got ['sub/tests.py:2', 'sub/tests.py:6']
-E       assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:3'}
+E       AssertionError: Expected IDs {'sub/tests.py:3', 'sub/tests.py:7'}, got ['sub/tests.py:2', 'sub/tests.py:6']
+E       assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:7'}
 E         
 E         Extra items in the left set:
 E         'sub/tests.py:6'
 E         'sub/tests.py:2'
 E         Extra items in the right set:
-E         'sub/tests.py:7'
 E         'sub/tests.py:3'
+E         'sub/tests.py:7'
 E         
 E         Full diff:
 E           {
@@ -20644,23 +20644,23 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}
+E       AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#5'
-E         'tests.py:3#1'
-E         'tests.py:3#8'
-E         'tests.py:3#9'
-E         'tests.py:3#3'
-E         'tests.py:3#4'
 E         'tests.py:3#10'
+E         'tests.py:3#9'
+E         'tests.py:3#6'
 E         'tests.py:3#7'
 E         'tests.py:3#2'
-E         'tests.py:3#6'
+E         'tests.py:3#3'
+E         'tests.py:3#5'
+E         'tests.py:3#1'
 E         'tests.py:3#0'
+E         'tests.py:3#8'
+E         'tests.py:3#4'
 E         
 E         Full diff:
 E           {
@@ -20720,23 +20720,23 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}
+E       AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#5'
-E         'tests.py:3#1'
-E         'tests.py:3#8'
-E         'tests.py:3#9'
-E         'tests.py:3#3'
-E         'tests.py:3#4'
 E         'tests.py:3#10'
+E         'tests.py:3#9'
+E         'tests.py:3#6'
 E         'tests.py:3#7'
 E         'tests.py:3#2'
-E         'tests.py:3#6'
+E         'tests.py:3#3'
+E         'tests.py:3#5'
+E         'tests.py:3#1'
 E         'tests.py:3#0'
+E         'tests.py:3#8'
+E         'tests.py:3#4'
 E         
 E         Full diff:
 E           {
@@ -20796,23 +20796,23 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_directory_test_id_exact
 >       assert all_ids == set(case["expected_ids"]), (
             f"Expected IDs {case['expected_ids']}, got {sorted(all_ids)}"
         )
-E       AssertionError: Expected IDs {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}, got ['tests.py:2']
-E       assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}
+E       AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}, got ['tests.py:2']
+E       assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}
 E         
 E         Extra items in the left set:
 E         'tests.py:2'
 E         Extra items in the right set:
-E         'tests.py:3#5'
-E         'tests.py:3#1'
-E         'tests.py:3#8'
-E         'tests.py:3#9'
-E         'tests.py:3#3'
-E         'tests.py:3#4'
 E         'tests.py:3#10'
+E         'tests.py:3#9'
+E         'tests.py:3#6'
 E         'tests.py:3#7'
 E         'tests.py:3#2'
-E         'tests.py:3#6'
+E         'tests.py:3#3'
+E         'tests.py:3#5'
+E         'tests.py:3#1'
 E         'tests.py:3#0'
+E         'tests.py:3#8'
+E         'tests.py:3#4'
 E         
 E         Full diff:
 E           {
@@ -31873,8 +31873,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_flag_run_selection_run_
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:1' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c691f00>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c691f00> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb69dbe040>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb69dbe040> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:841: AssertionError
 ________________ test_flag_run_selection[run_select_first-rust] ________________
@@ -31929,8 +31929,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_flag_run_selection_run_
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:1' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c5d12c0>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c5d12c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb69dbc500>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb69dbc500> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:841: AssertionError
 ________________ test_flag_run_selection[run_select_second-cpp] ________________
@@ -31985,8 +31985,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_flag_run_selection_run_
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:2' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c905100>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c905100> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb6a56c780>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb6a56c780> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:841: AssertionError
 _______________ test_flag_run_selection[run_select_second-rust] ________________
@@ -32041,8 +32041,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_flag_run_selection_run_
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:2' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c5fe300>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c5fe300> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb69dd0800>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb69dd0800> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:841: AssertionError
 _____________ test_timeout_per_test_pass[timeout_fast_pass-python] _____________
@@ -32474,6 +32474,60 @@ E         - pass
 E         + error
 
 .evaluation_tests/test_checkpoint_7.py:976: AssertionError
+___________ test_total_timeout_pass[total_timeout_fast_pass-python] ____________
+
+entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
+case = {'id': 'total_timeout_fast_pass', 'entrypoint': 'async_add', 'tests_content': 'assert async_add(1, 2) == 3\nassert async_add(3, 4) == 7\n', 'total_timeout_ms': 1000, ...}
+lang = 'python'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_total_timeout_pass_total_0')
+
+    @pytest.mark.functionality
+    @pytest.mark.parametrize("lang", ALL_LANGUAGES)
+    @pytest.mark.parametrize(
+        "case", TOTAL_TIMEOUT_PASS, ids=[c["id"] for c in TOTAL_TIMEOUT_PASS]
+    )
+    def test_total_timeout_pass(
+        entrypoint_argv: list[str], case: dict, lang: str, tmp_path: Path
+    ) -> None:
+        """--total-timeout-ms allows fast tests to complete."""
+        solutions = ASYNC_SOLUTIONS.get(case["entrypoint"], {})
+        if not solutions.get(_solution_key(lang)):
+            pytest.skip(f"No {lang} solution for {case['entrypoint']}")
+    
+        test_case = dict(case)
+        test_case["custom_solutions"] = solutions
+    
+        case_dir = generate_case_dir(tmp_path, test_case, "py")
+    
+        gen_cmd = entrypoint_argv + [
+            "generate",
+            str(case_dir),
+            "--entrypoint",
+            case["entrypoint"],
+            "--lang",
+            lang,
+        ]
+        gen_result = subprocess.run(
+            gen_cmd, capture_output=True, text=True, timeout=30
+        )
+        assert gen_result.returncode == 0
+    
+        solution = case_dir / f"solution.{LANG_EXT[lang]}"
+        test_result = run_test_with_flags(
+            entrypoint_argv,
+            solution,
+            case_dir,
+            lang,
+            extra_flags=["--total-timeout-ms", str(case["total_timeout_ms"])],
+        )
+    
+>       assert test_result["status"] == case["expected_status"]
+E       AssertionError: assert 'fail' == 'pass'
+E         
+E         - pass
+E         + fail
+
+.evaluation_tests/test_checkpoint_7.py:1020: AssertionError
 _____________ test_total_timeout_pass[total_timeout_fast_pass-cpp] _____________
 
 entrypoint_argv = ['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py']
@@ -32864,8 +32918,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:1' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c6b5180>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c6b5180> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb69f703c0>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb69f703c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 ______________ test_selection_combined_pass[run_select_loop-rust] ______________
@@ -32920,8 +32974,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:1' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c59c6c0>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c59c6c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb6a39c780>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb6a39c780> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 ___________ test_selection_combined_pass[run_select_mutation-python] ___________
@@ -32976,8 +33030,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:3' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c464600>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c464600> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb6a089040>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb6a089040> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 _________ test_selection_combined_pass[run_select_mutation-javascript] _________
@@ -33032,8 +33086,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:3' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c597f80>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c597f80> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb6a097400>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb6a097400> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 _________ test_selection_combined_pass[run_select_mutation-typescript] _________
@@ -33088,8 +33142,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:3' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c726ac0>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c726ac0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb6a3698c0>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb6a3698c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 ____________ test_selection_combined_pass[run_select_mutation-cpp] _____________
@@ -33144,8 +33198,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:3' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6c9caf40>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6c9caf40> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb6a32bf40>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb6a32bf40> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 ____________ test_selection_combined_pass[run_select_mutation-rust] ____________
@@ -33200,8 +33254,8 @@ tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-0/test_selection_combined_pass
         for expected_id in case["expected_passed"]:
 >           assert expected_id in test_result.get("passed", [])
 E           AssertionError: assert 'tests.py:3' in []
-E            +  where [] = <built-in method get of dict object at 0x779d6cbe2000>('passed', [])
-E            +    where <built-in method get of dict object at 0x779d6cbe2000> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+E            +  where [] = <built-in method get of dict object at 0x7bfb69f60880>('passed', [])
+E            +    where <built-in method get of dict object at 0x7bfb69f60880> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 
 .evaluation_tests/test_checkpoint_7.py:1166: AssertionError
 ________ test_edge_list_tests_empty_file[list_tests_empty_file-python] _________
@@ -36204,15 +36258,15 @@ assert {'tests.py:2'} == {'tests.py:3#1', 'tests.py:3#0'}
   ?               ^
   -     'tests.py:3#1',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[234_exact_line_numbers_nested-python] - AssertionError: Expected IDs {'sub/tests.py:7', 'sub/tests.py:3'}, got ['sub/tests.py:2', 'sub/tests.py:6']
-assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:3'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[234_exact_line_numbers_nested-python] - AssertionError: Expected IDs {'sub/tests.py:3', 'sub/tests.py:7'}, got ['sub/tests.py:2', 'sub/tests.py:6']
+assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:7'}
   
   Extra items in the left set:
   'sub/tests.py:6'
   'sub/tests.py:2'
   Extra items in the right set:
-  'sub/tests.py:7'
   'sub/tests.py:3'
+  'sub/tests.py:7'
   
   Full diff:
     {
@@ -36225,15 +36279,15 @@ assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:
   +     'sub/tests.py:6',
   ?                   ^
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[234_exact_line_numbers_nested-javascript] - AssertionError: Expected IDs {'sub/tests.py:7', 'sub/tests.py:3'}, got ['sub/tests.py:2', 'sub/tests.py:6']
-assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:3'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[234_exact_line_numbers_nested-javascript] - AssertionError: Expected IDs {'sub/tests.py:3', 'sub/tests.py:7'}, got ['sub/tests.py:2', 'sub/tests.py:6']
+assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:7'}
   
   Extra items in the left set:
   'sub/tests.py:6'
   'sub/tests.py:2'
   Extra items in the right set:
-  'sub/tests.py:7'
   'sub/tests.py:3'
+  'sub/tests.py:7'
   
   Full diff:
     {
@@ -36246,15 +36300,15 @@ assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:
   +     'sub/tests.py:6',
   ?                   ^
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[234_exact_line_numbers_nested-typescript] - AssertionError: Expected IDs {'sub/tests.py:7', 'sub/tests.py:3'}, got ['sub/tests.py:2', 'sub/tests.py:6']
-assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:3'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[234_exact_line_numbers_nested-typescript] - AssertionError: Expected IDs {'sub/tests.py:3', 'sub/tests.py:7'}, got ['sub/tests.py:2', 'sub/tests.py:6']
+assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:3', 'sub/tests.py:7'}
   
   Extra items in the left set:
   'sub/tests.py:6'
   'sub/tests.py:2'
   Extra items in the right set:
-  'sub/tests.py:7'
   'sub/tests.py:3'
+  'sub/tests.py:7'
   
   Full diff:
     {
@@ -36267,23 +36321,23 @@ assert {'sub/tests.py:6', 'sub/tests.py:2'} == {'sub/tests.py:7', 'sub/tests.py:
   +     'sub/tests.py:6',
   ?                   ^
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-python] - AssertionError: Expected IDs {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-python] - AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#5'
-  'tests.py:3#1'
-  'tests.py:3#8'
-  'tests.py:3#9'
-  'tests.py:3#3'
-  'tests.py:3#4'
   'tests.py:3#10'
+  'tests.py:3#9'
+  'tests.py:3#6'
   'tests.py:3#7'
   'tests.py:3#2'
-  'tests.py:3#6'
+  'tests.py:3#3'
+  'tests.py:3#5'
+  'tests.py:3#1'
   'tests.py:3#0'
+  'tests.py:3#8'
+  'tests.py:3#4'
   
   Full diff:
     {
@@ -36301,23 +36355,23 @@ assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests
   -     'tests.py:3#8',
   -     'tests.py:3#9',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-javascript] - AssertionError: Expected IDs {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-javascript] - AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#5'
-  'tests.py:3#1'
-  'tests.py:3#8'
-  'tests.py:3#9'
-  'tests.py:3#3'
-  'tests.py:3#4'
   'tests.py:3#10'
+  'tests.py:3#9'
+  'tests.py:3#6'
   'tests.py:3#7'
   'tests.py:3#2'
-  'tests.py:3#6'
+  'tests.py:3#3'
+  'tests.py:3#5'
+  'tests.py:3#1'
   'tests.py:3#0'
+  'tests.py:3#8'
+  'tests.py:3#4'
   
   Full diff:
     {
@@ -36335,23 +36389,23 @@ assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests
   -     'tests.py:3#8',
   -     'tests.py:3#9',
     }
-FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-typescript] - AssertionError: Expected IDs {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}, got ['tests.py:2']
-assert {'tests.py:2'} == {'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#8', 'tests.py:3#9', 'tests.py:3#3', 'tests.py:3#4', 'tests.py:3#10', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#6', 'tests.py:3#0'}
+FAILED .evaluation_tests/test_checkpoint_5.py::test_directory_test_id_exact[380_eleven_tests_same_line-typescript] - AssertionError: Expected IDs {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}, got ['tests.py:2']
+assert {'tests.py:2'} == {'tests.py:3#10', 'tests.py:3#9', 'tests.py:3#6', 'tests.py:3#7', 'tests.py:3#2', 'tests.py:3#3', 'tests.py:3#5', 'tests.py:3#1', 'tests.py:3#0', 'tests.py:3#8', 'tests.py:3#4'}
   
   Extra items in the left set:
   'tests.py:2'
   Extra items in the right set:
-  'tests.py:3#5'
-  'tests.py:3#1'
-  'tests.py:3#8'
-  'tests.py:3#9'
-  'tests.py:3#3'
-  'tests.py:3#4'
   'tests.py:3#10'
+  'tests.py:3#9'
+  'tests.py:3#6'
   'tests.py:3#7'
   'tests.py:3#2'
-  'tests.py:3#6'
+  'tests.py:3#3'
+  'tests.py:3#5'
+  'tests.py:3#1'
   'tests.py:3#0'
+  'tests.py:3#8'
+  'tests.py:3#4'
   
   Full diff:
     {
@@ -37402,17 +37456,17 @@ assert 'error' == 'pass'
   - pass
   + error
 FAILED .evaluation_tests/test_checkpoint_7.py::test_flag_run_selection[run_select_first-cpp] - AssertionError: assert 'tests.py:1' in []
- +  where [] = <built-in method get of dict object at 0x779d6c691f00>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c691f00> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb69dbe040>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb69dbe040> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_flag_run_selection[run_select_first-rust] - AssertionError: assert 'tests.py:1' in []
- +  where [] = <built-in method get of dict object at 0x779d6c5d12c0>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c5d12c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb69dbc500>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb69dbc500> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_flag_run_selection[run_select_second-cpp] - AssertionError: assert 'tests.py:2' in []
- +  where [] = <built-in method get of dict object at 0x779d6c905100>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c905100> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb6a56c780>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb6a56c780> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_flag_run_selection[run_select_second-rust] - AssertionError: assert 'tests.py:2' in []
- +  where [] = <built-in method get of dict object at 0x779d6c5fe300>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c5fe300> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb69dd0800>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb69dd0800> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_timeout_per_test_pass[timeout_fast_pass-python] - AssertionError: assert 'fail' == 'pass'
   
   - pass
@@ -37445,6 +37499,10 @@ FAILED .evaluation_tests/test_checkpoint_7.py::test_timeout_combined_pass[timeou
   
   - pass
   + error
+FAILED .evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-python] - AssertionError: assert 'fail' == 'pass'
+  
+  - pass
+  + fail
 FAILED .evaluation_tests/test_checkpoint_7.py::test_total_timeout_pass[total_timeout_fast_pass-cpp] - AssertionError: assert 'error' == 'pass'
   
   - pass
@@ -37470,26 +37528,26 @@ FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_timeout_fail[run_s
   - fail
   + error
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_loop-cpp] - AssertionError: assert 'tests.py:1' in []
- +  where [] = <built-in method get of dict object at 0x779d6c6b5180>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c6b5180> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb69f703c0>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb69f703c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_loop-rust] - AssertionError: assert 'tests.py:1' in []
- +  where [] = <built-in method get of dict object at 0x779d6c59c6c0>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c59c6c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb6a39c780>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb6a39c780> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_mutation-python] - AssertionError: assert 'tests.py:3' in []
- +  where [] = <built-in method get of dict object at 0x779d6c464600>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c464600> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb6a089040>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb6a089040> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_mutation-javascript] - AssertionError: assert 'tests.py:3' in []
- +  where [] = <built-in method get of dict object at 0x779d6c597f80>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c597f80> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb6a097400>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb6a097400> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_mutation-typescript] - AssertionError: assert 'tests.py:3' in []
- +  where [] = <built-in method get of dict object at 0x779d6c726ac0>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c726ac0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb6a3698c0>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb6a3698c0> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_mutation-cpp] - AssertionError: assert 'tests.py:3' in []
- +  where [] = <built-in method get of dict object at 0x779d6c9caf40>('passed', [])
- +    where <built-in method get of dict object at 0x779d6c9caf40> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb6a32bf40>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb6a32bf40> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_selection_combined_pass[run_select_mutation-rust] - AssertionError: assert 'tests.py:3' in []
- +  where [] = <built-in method get of dict object at 0x779d6cbe2000>('passed', [])
- +    where <built-in method get of dict object at 0x779d6cbe2000> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
+ +  where [] = <built-in method get of dict object at 0x7bfb69f60880>('passed', [])
+ +    where <built-in method get of dict object at 0x7bfb69f60880> = {'status': 'error', 'passed': [], 'failed': [], 'returncode': 2, 'stderr': ''}.get
 FAILED .evaluation_tests/test_checkpoint_7.py::test_edge_list_tests_empty_file[list_tests_empty_file-python] - AssertionError: assert 2 == 0
  +  where 2 = CompletedProcess(args=['uv', 'run', '--project', '/workspace', '/workspace/babel_code_goat.py', 'generate', '/tmp/pytest-of-agent/pytest-0/test_edge_list_tests_empty_fil0/case', '--entrypoint', 'async_add', '--lang', 'python'], returncode=2, stdout='', stderr='no tests discovered\n').returncode
 FAILED .evaluation_tests/test_checkpoint_7.py::test_edge_list_tests_empty_file[list_tests_empty_file-javascript] - AssertionError: assert 2 == 0
@@ -37583,4 +37641,4 @@ FAILED .evaluation_tests/test_checkpoint_7.py::test_edge_not_executed_in_failed[
   - fail
   + error
 FAILED .evaluation_tests/test_checkpoint_7.py::test_edge_concurrent_async[python] - AssertionError: assert 'generate_failed' not in {'generate_failed': True, 'generate_stderr': 'unsupported import at line 1\n', 'generate_stdout': '', 'generate_returncode': 2}
-================ 837 failed, 1123 passed in 1470.33s (0:24:30) =================
+================ 838 failed, 1122 passed in 1714.49s (0:28:34) =================

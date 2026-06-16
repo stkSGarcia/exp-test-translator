@@ -4,7 +4,7 @@
   "problem_version": 2,
   "checkpoint_name": "checkpoint_8",
   "checkpoint_version": 1,
-  "duration": 1476.6076803207397,
+  "duration": 1870.8422620296478,
   "entrypoint": "uv run babel_code_goat.py",
   "tests": {
     "checkpoint_1-Regression": {
@@ -761,7 +761,6 @@
         "test_advanced_loops[95_counter_in_loop-typescript]",
         "test_advanced_loops[96_exception_in_loop-python]",
         "test_advanced_loops[99_large_iteration-javascript]",
-        "test_advanced_loops[99_large_iteration-python]",
         "test_assertion_fail[50_wrong_expected-javascript]",
         "test_assertion_fail[50_wrong_expected-python]",
         "test_assertion_fail[50_wrong_expected-typescript]",
@@ -999,6 +998,7 @@
         "test_advanced_loops[98_walrus_in_condition-javascript]",
         "test_advanced_loops[98_walrus_in_condition-python]",
         "test_advanced_loops[98_walrus_in_condition-typescript]",
+        "test_advanced_loops[99_large_iteration-python]",
         "test_advanced_loops[99_large_iteration-typescript]",
         "test_loop_error[70_undefined_iterator-javascript]",
         "test_loop_error[70_undefined_iterator-python]",
@@ -2150,7 +2150,7 @@
   "pass_counts": {
     "Core": 27,
     "Functionality": 28,
-    "Regression": 1124,
+    "Regression": 1123,
     "Error": 12
   },
   "total_counts": {
