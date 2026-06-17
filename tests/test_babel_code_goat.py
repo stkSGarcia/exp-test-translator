@@ -154,6 +154,151 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual([case.kind for case in cases], ["eq", "ne", "truthy", "raises", "not", "eq"])
             self.assertEqual(cases[-1].args, [{"x": [1, (2,)]}])
 
+    def test_discovery_recurses_and_uses_relative_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            nested = tests_dir / "nested"
+            nested.mkdir()
+            write(tests_dir / "tests.py", "assert solve(1) == 2\n")
+            write(
+                nested / "test_foo.py",
+                """
+                assert solve(2) == 3; assert solve(3) == 4
+                for value in [4, 5]:
+                    assert solve(value) == value + 1
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            self.assertEqual(
+                [case.id for case in cases],
+                [
+                    "nested/test_foo.py:1#0",
+                    "nested/test_foo.py:1#1",
+                    "nested/test_foo.py:2",
+                    "nested/test_foo.py:3:0",
+                    "nested/test_foo.py:3:1",
+                    "tests.py:1",
+                ],
+            )
+
+    def test_discovery_rejects_test_like_non_python_files_and_empty_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "test_sample.txt", "assert solve(1) == 2\n")
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "helper.py", "value = 1\n")
+
+            with self.assertRaises(bcg.DiscoveryError):
+                bcg.discover_tests(tests_dir, "solve")
+
+    def test_discovery_supports_mutation_style_groups(self) -> None:
+        scenarios = [
+            (
+                "sort_colors",
+                """
+                a = [2, 0, 2, 1, 1, 0]
+                sort_colors(a)
+                assert a == [0, 0, 1, 1, 2, 2]
+                """,
+                "tests.py:2",
+                1,
+            ),
+            (
+                "dedupe",
+                """
+                items = [1, 1, 2]
+                dedupe(items)
+                assert items == [1, 2]
+                assert len(items) == 2
+                """,
+                "tests.py:2",
+                2,
+            ),
+            (
+                "normalize",
+                """
+                expected = [3]
+                result = normalize(expected)
+                assert result == expected
+                """,
+                "tests.py:2",
+                1,
+            ),
+        ]
+        for entrypoint, source, expected_id, expected_checks in scenarios:
+            with self.subTest(entrypoint=entrypoint), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", source)
+
+                cases = bcg.discover_tests(tests_dir, entrypoint)
+
+                self.assertEqual([case.kind for case in cases], ["mutation"])
+                self.assertEqual(cases[0].id, expected_id)
+                self.assertEqual(len(cases[0].mutation_checks), expected_checks)
+
+    def test_discovery_rejects_invalid_mutation_style_groups(self) -> None:
+        sources = [
+            """
+            a = [2, 1]
+            sort_colors(a)
+            assert other == [1, 2]
+            """,
+            """
+            a = [2, 1]
+            sort_colors(a)
+            value = 1
+            assert a == [1, 2]
+            """,
+            """
+            a = [2, 1]
+            b = [1, 2]
+            sort_colors(a)
+            sort_colors(b)
+            assert a == [1, 2]
+            """,
+        ]
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", source)
+
+                with self.assertRaises(bcg.DiscoveryError):
+                    bcg.discover_tests(tests_dir, "sort_colors")
+
+    def test_python_mutation_style_groups_execute_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                values = [2, 0, 2, 1, 1, 0]
+                solve(values)
+                assert values == [0, 0, 1, 1, 2, 2]
+                assert len(values) == 6
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "python").returncode, 0)
+            solution = tests_dir / "solution.py"
+            write(
+                solution,
+                """
+                def solve(values):
+                    values.sort()
+                """,
+            )
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "python")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc), {"status": "pass", "passed": ["tests.py:2"], "failed": []})
+
     def test_discovery_supports_rich_values_and_tolerance_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tests_dir = Path(tmp)

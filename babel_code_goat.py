@@ -118,6 +118,7 @@ def result_expr() -> dict[str, Any]:
 class PendingTest:
     line: int
     kind: str
+    source_path: str = "tests.py"
     args: list[Any] = field(default_factory=list)
     iteration_path: tuple[int, ...] = ()
     actual_expr: dict[str, Any] = field(default_factory=result_expr)
@@ -131,6 +132,7 @@ class PendingTest:
     message_pattern: str | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
+    mutation_checks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,7 @@ class TestCase:
     id: str
     line: int
     kind: str
+    source_path: str = "tests.py"
     args: list[Any] = field(default_factory=list)
     iteration_path: tuple[int, ...] = ()
     actual_expr: dict[str, Any] = field(default_factory=result_expr)
@@ -151,6 +154,7 @@ class TestCase:
     message_pattern: str | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
+    mutation_checks: list[dict[str, Any]] = field(default_factory=list)
 
 
 def tester_filename(lang: str) -> str:
@@ -340,9 +344,10 @@ def parse_expectation_value(raw: str, line_no: int) -> str:
 
 
 class TestDiscoverer:
-    def __init__(self, entrypoint: str, source_lines: list[str]) -> None:
+    def __init__(self, entrypoint: str, source_lines: list[str], source_path: str = "tests.py") -> None:
         self.entrypoint = entrypoint
         self.source_lines = source_lines
+        self.source_path = source_path
         self.module_aliases: dict[str, str] = {}
         self.constructor_aliases: dict[str, str] = {}
         self.env: dict[str, Any] = {}
@@ -356,11 +361,17 @@ class TestDiscoverer:
 
     def visit_body(self, body: list[ast.stmt]) -> None:
         self.collect_imports(body)
-        for stmt in body:
+        index = 0
+        while index < len(body):
+            stmt = body[index]
+            mutation_call = self.mutation_call_from_statement(stmt)
+            if mutation_call is not None:
+                index = self.visit_mutation_group(body, index, mutation_call)
+                continue
             if isinstance(stmt, ast.FunctionDef):
                 self.visit_function(stmt)
             elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                continue
+                pass
             elif isinstance(stmt, ast.Assert):
                 self.visit_assert(stmt)
             elif isinstance(stmt, ast.Try):
@@ -377,6 +388,7 @@ class TestDiscoverer:
                 raise DiscoveryError(
                     f"unsupported statement at line {getattr(stmt, 'lineno', '?')}"
                 )
+            index += 1
 
     def visit_function(self, stmt: ast.FunctionDef) -> None:
         if stmt.decorator_list:
@@ -396,6 +408,219 @@ class TestDiscoverer:
             raise DiscoveryError(f"multiple assignment targets are unsupported at line {stmt.lineno}")
         value = self.parse_value(stmt.value)
         self.bind_target(stmt.targets[0], value, stmt.lineno)
+
+    def mutation_call_from_statement(
+        self,
+        stmt: ast.stmt,
+    ) -> tuple[int, list[Any], dict[str, dict[str, Any]]] | None:
+        call: ast.Call | None = None
+        assigned_name: str | None = None
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+                return None
+            call = stmt.value
+            assigned_name = stmt.targets[0].id
+        if call is None or not (
+            isinstance(call.func, ast.Name) and call.func.id == self.entrypoint
+        ):
+            return None
+        if call.keywords:
+            raise DiscoveryError(f"keyword arguments are unsupported at line {stmt.lineno}")
+        args = self.parse_call_args(call.args, stmt.lineno)
+        tracked: dict[str, dict[str, Any]] = {}
+        arg_index = 0
+        for arg in call.args:
+            if isinstance(arg, ast.Starred):
+                value = self.parse_value(arg.value)
+                arg_count = len(as_iterable_items(value, stmt.lineno, "starred argument"))
+                arg_index += arg_count
+                continue
+            if isinstance(arg, ast.Name):
+                tracked[arg.id] = {"op": "arg", "index": arg_index}
+            arg_index += 1
+        if assigned_name is not None:
+            if assigned_name == self.entrypoint:
+                raise DiscoveryError(f"assignment to entrypoint is unsupported at line {stmt.lineno}")
+            tracked[assigned_name] = result_expr()
+        return stmt.lineno, args, tracked
+
+    def visit_mutation_group(
+        self,
+        body: list[ast.stmt],
+        index: int,
+        mutation_call: tuple[int, list[Any], dict[str, dict[str, Any]]],
+    ) -> int:
+        line_no, args, tracked = mutation_call
+        next_index = index + 1
+        checks: list[dict[str, Any]] = []
+        while next_index < len(body) and isinstance(body[next_index], ast.Assert):
+            checks.append(self.parse_mutation_assert(body[next_index], tracked))
+            next_index += 1
+        if not checks:
+            raise DiscoveryError(f"mutation call at line {line_no} must be immediately followed by assertions")
+        self.add_mutation_test(line_no, args, checks)
+        return next_index
+
+    def parse_mutation_assert(
+        self,
+        stmt: ast.Assert,
+        tracked: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        if stmt.msg is not None:
+            raise DiscoveryError(f"assert messages are unsupported at line {stmt.lineno}")
+        if self.count_entrypoint_calls(stmt.test):
+            raise DiscoveryError(f"mutation assertion must not call {self.entrypoint} at line {stmt.lineno}")
+        referenced = self.referenced_names(stmt.test)
+        if not (referenced & set(tracked)):
+            raise DiscoveryError(f"mutation assertion must reference mutated state at line {stmt.lineno}")
+        if isinstance(stmt.test, ast.UnaryOp) and isinstance(stmt.test.op, ast.Not):
+            return {
+                "kind": "not",
+                "actual_expr": self.parse_mutation_expression(stmt.test.operand, tracked),
+                "expected": None,
+                "comparison": "standard",
+                "abs_tol": None,
+                "rel_tol": None,
+            }
+        return {
+            "kind": "truthy",
+            "actual_expr": self.parse_mutation_expression(stmt.test, tracked),
+            "expected": None,
+            "comparison": "standard",
+            "abs_tol": None,
+            "rel_tol": None,
+        }
+
+    def referenced_names(self, node: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+
+    def parse_mutation_expression(
+        self,
+        node: ast.AST,
+        tracked: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        line_no = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Name) and node.id in tracked:
+            return tracked[node.id]
+        if isinstance(node, ast.Constant):
+            if is_supported_scalar(node.value):
+                return {"op": "value", "value": node.value}
+            raise DiscoveryError(f"unsupported literal value at line {line_no}")
+        if isinstance(node, ast.Name):
+            return {"op": "value", "value": self.resolve_name(node.id, line_no)}
+        if isinstance(node, ast.List):
+            return {
+                "op": "list",
+                "items": [self.parse_mutation_expression(item, tracked) for item in node.elts],
+            }
+        if isinstance(node, ast.Tuple):
+            return {
+                "op": "tuple",
+                "items": [self.parse_mutation_expression(item, tracked) for item in node.elts],
+            }
+        if isinstance(node, ast.Set):
+            return {
+                "op": "set",
+                "items": [self.parse_mutation_expression(item, tracked) for item in node.elts],
+            }
+        if isinstance(node, ast.Dict):
+            entries: list[list[dict[str, Any]]] = []
+            for key_node, value_node in zip(node.keys, node.values):
+                if key_node is None:
+                    raise DiscoveryError(f"dictionary unpacking is unsupported at line {line_no}")
+                entries.append(
+                    [
+                        self.parse_mutation_expression(key_node, tracked),
+                        self.parse_mutation_expression(value_node, tracked),
+                    ]
+                )
+            return {"op": "dict", "entries": entries}
+        if isinstance(node, ast.UnaryOp) and type(node.op) in UNARY_OPERATORS:
+            return {
+                "op": "unary",
+                "operator": UNARY_OPERATORS[type(node.op)],
+                "operand": self.parse_mutation_expression(node.operand, tracked),
+            }
+        if isinstance(node, ast.BinOp) and type(node.op) in BINARY_OPERATORS:
+            return {
+                "op": "binary",
+                "operator": BINARY_OPERATORS[type(node.op)],
+                "left": self.parse_mutation_expression(node.left, tracked),
+                "right": self.parse_mutation_expression(node.right, tracked),
+            }
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or len(node.comparators) != 1:
+                raise DiscoveryError(f"unsupported comparison at line {line_no}")
+            operator = node.ops[0]
+            if type(operator) not in COMPARE_OPERATORS:
+                raise DiscoveryError(f"unsupported comparison operator at line {line_no}")
+            return {
+                "op": "compare",
+                "operator": COMPARE_OPERATORS[type(operator)],
+                "left": self.parse_mutation_expression(node.left, tracked),
+                "right": self.parse_mutation_expression(node.comparators[0], tracked),
+            }
+        if isinstance(node, ast.Subscript):
+            value = self.parse_mutation_expression(node.value, tracked)
+            if isinstance(node.slice, ast.Slice):
+                return {
+                    "op": "slice",
+                    "value": value,
+                    "lower": self.parse_mutation_expression(node.slice.lower, tracked)
+                    if node.slice.lower is not None
+                    else None,
+                    "upper": self.parse_mutation_expression(node.slice.upper, tracked)
+                    if node.slice.upper is not None
+                    else None,
+                    "step": self.parse_mutation_expression(node.slice.step, tracked)
+                    if node.slice.step is not None
+                    else None,
+                }
+            return {
+                "op": "subscript",
+                "value": value,
+                "index": self.parse_mutation_expression(node.slice, tracked),
+            }
+        if isinstance(node, ast.Call):
+            return self.parse_mutation_call_expression(node, tracked)
+        raise DiscoveryError(f"unsupported expression at line {line_no}")
+
+    def parse_mutation_call_expression(
+        self,
+        node: ast.Call,
+        tracked: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        line_no = getattr(node, "lineno", 0)
+        if isinstance(node.func, ast.Name) and node.func.id in PRIMITIVE_FUNCTIONS:
+            if node.keywords:
+                raise DiscoveryError(f"primitive call keywords are unsupported at line {line_no}")
+            self.validate_primitive_call(node.func.id, len(node.args), line_no)
+            return {
+                "op": "call",
+                "name": node.func.id,
+                "args": [self.parse_mutation_expression(arg, tracked) for arg in node.args],
+            }
+        if isinstance(node.func, ast.Attribute) and node.func.attr in STRING_METHODS:
+            if node.keywords:
+                raise DiscoveryError(f"method call keywords are unsupported at line {line_no}")
+            self.validate_string_method_call(node.func.attr, len(node.args), line_no)
+            return {
+                "op": "method",
+                "name": node.func.attr,
+                "receiver": self.parse_mutation_expression(node.func.value, tracked),
+                "args": [self.parse_mutation_expression(arg, tracked) for arg in node.args],
+            }
+        name = self.call_name(node.func)
+        if name is not None:
+            value = self.parse_constructor_call(node)
+            return {"op": "value", "value": value}
+        raise DiscoveryError(f"unsupported function call at line {line_no}")
 
     def visit_aug_assign(self, stmt: ast.AugAssign) -> None:
         if not isinstance(stmt.target, ast.Name):
@@ -1272,6 +1497,7 @@ class TestDiscoverer:
             PendingTest(
                 line=line_no,
                 kind=kind,
+                source_path=self.source_path,
                 args=args,
                 iteration_path=self.active_path,
                 actual_expr=result_expr() if actual_expr is None else actual_expr,
@@ -1292,8 +1518,29 @@ class TestDiscoverer:
             PendingTest(
                 line=line_no,
                 kind="loop",
+                source_path=self.source_path,
                 iteration_path=self.active_path,
                 loop_pass=passed,
+            )
+        )
+
+    def add_mutation_test(
+        self,
+        line_no: int,
+        args: list[Any],
+        checks: list[dict[str, Any]],
+    ) -> None:
+        expectations = self.expectations_for(line_no)
+        self.pending.append(
+            PendingTest(
+                line=line_no,
+                kind="mutation",
+                source_path=self.source_path,
+                args=args,
+                iteration_path=self.active_path,
+                mutation_checks=checks,
+                expect_stdout=expectations.get("expect_stdout"),
+                expect_stderr=expectations.get("expect_stderr"),
             )
         )
 
@@ -1320,7 +1567,7 @@ class TestDiscoverer:
 
 
 def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
-    bases = [test_id_base(test.line, test.iteration_path) for test in pending]
+    bases = [test_id_base(test.source_path, test.line, test.iteration_path) for test in pending]
     counts = Counter(bases)
     seen: defaultdict[str, int] = defaultdict(int)
     cases: list[TestCase] = []
@@ -1334,6 +1581,7 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
         cases.append(
             TestCase(
                 id=test_id,
+                source_path=test.source_path,
                 line=test.line,
                 kind=test.kind,
                 args=test.args,
@@ -1349,26 +1597,83 @@ def assign_test_ids(pending: list[PendingTest]) -> list[TestCase]:
                 message_pattern=test.message_pattern,
                 expect_stdout=test.expect_stdout,
                 expect_stderr=test.expect_stderr,
+                mutation_checks=test.mutation_checks,
             )
         )
     return cases
 
 
-def test_id_base(line_no: int, iteration_path: tuple[int, ...]) -> str:
+def test_id_base(source_path: str, line_no: int, iteration_path: tuple[int, ...]) -> str:
     suffix = "".join(f":{index}" for index in iteration_path)
-    return f"tests.py:{line_no}{suffix}"
+    return f"{source_path}:{line_no}{suffix}"
 
 
-def discover_tests(tests_dir: Path | str, entrypoint: str) -> list[TestCase]:
-    tests_path = Path(tests_dir) / "tests.py"
-    if not tests_path.is_file():
-        raise DiscoveryError("tests.py is required")
+def relative_posix(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def is_generated_tester_path(path: Path) -> bool:
+    return path.name in set(SUPPORTED_LANGS.values())
+
+
+def is_internal_non_test_path(path: Path) -> bool:
+    return is_generated_tester_path(path) or path.name == "solution.py"
+
+
+def is_test_like_non_python(path: Path) -> bool:
+    if path.suffix == ".py" or not path.suffix:
+        return False
+    name = path.name
+    stem = path.stem
+    return (
+        name.startswith("test")
+        or stem.endswith("_test")
+        or stem == "tests"
+        or stem.endswith("_tests")
+    )
+
+
+def discover_tests(
+    tests_dir: Path | str,
+    entrypoint: str,
+    *,
+    exclude_paths: set[Path] | None = None,
+) -> list[TestCase]:
+    root = Path(tests_dir)
+    excluded = {path.resolve() for path in (exclude_paths or set())}
+    python_paths: list[Path] = []
     try:
-        source = tests_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename="tests.py")
-    except (OSError, SyntaxError) as exc:
-        raise DiscoveryError("cannot read or parse tests.py") from exc
-    return TestDiscoverer(entrypoint, source.splitlines()).discover(tree)
+        candidates = list(root.rglob("*"))
+    except OSError as exc:
+        raise DiscoveryError("cannot scan tests directory") from exc
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError as exc:
+            raise DiscoveryError("cannot scan tests directory") from exc
+        if resolved in excluded or is_internal_non_test_path(path):
+            continue
+        if is_test_like_non_python(path):
+            raise DiscoveryError(f"non-Python test-like file is unsupported: {relative_posix(path, root)}")
+        if path.suffix == ".py":
+            python_paths.append(path)
+
+    cases: list[TestCase] = []
+    for path in sorted(python_paths, key=lambda item: relative_posix(item, root)):
+        source_path = relative_posix(path, root)
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=source_path)
+        except (OSError, SyntaxError) as exc:
+            raise DiscoveryError(f"cannot read or parse {source_path}") from exc
+        cases.extend(TestDiscoverer(entrypoint, source.splitlines(), source_path).discover(tree))
+
+    if not cases:
+        raise DiscoveryError("no tests discovered")
+    return cases
 
 
 def tag_sort_key(value: Any) -> str:
@@ -1435,6 +1740,8 @@ def encode_expr(expr: dict[str, Any]) -> dict[str, Any]:
         return {"op": "value", "value": encode_value(expr["value"])}
     if op == "result":
         return {"op": "result"}
+    if op == "arg":
+        return {"op": "arg", "index": expr["index"]}
     if op in {"list", "tuple", "set"}:
         return {"op": op, "items": [encode_expr(item) for item in expr["items"]]}
     if op == "dict":
@@ -1495,6 +1802,17 @@ def encode_expr(expr: dict[str, Any]) -> dict[str, Any]:
     raise DiscoveryError(f"unsupported expression operation: {op}")
 
 
+def encode_mutation_check(check: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": check["kind"],
+        "comparison": check.get("comparison", "standard"),
+        "actual_expr": encode_expr(check["actual_expr"]),
+        "expected": encode_optional_value(check.get("expected")),
+        "abs_tol": encode_optional_value(check.get("abs_tol")),
+        "rel_tol": encode_optional_value(check.get("rel_tol")),
+    }
+
+
 def case_to_json(case: TestCase, default_abs_tol: float | None = None) -> dict[str, Any]:
     return {
         "id": case.id,
@@ -1511,6 +1829,7 @@ def case_to_json(case: TestCase, default_abs_tol: float | None = None) -> dict[s
         "message_pattern": case.message_pattern,
         "expect_stdout": case.expect_stdout,
         "expect_stderr": case.expect_stderr,
+        "mutation_checks": [encode_mutation_check(check) for check in case.mutation_checks],
     }
 
 
@@ -1613,6 +1932,8 @@ def _decode_expr(expr):
         return {"op": "value", "value": _decode_value(expr["value"])}
     if op == "result":
         return {"op": "result"}
+    if op == "arg":
+        return {"op": "arg", "index": expr["index"]}
     if op in {"list", "tuple", "set"}:
         return {"op": op, "items": [_decode_expr(item) for item in expr["items"]]}
     if op == "dict":
@@ -1666,6 +1987,15 @@ def _decode_case(case):
     decoded["abs_tol"] = _decode_value(case["abs_tol"])
     decoded["rel_tol"] = _decode_value(case["rel_tol"])
     decoded["default_abs_tol"] = _decode_value(case["default_abs_tol"])
+    decoded["mutation_checks"] = []
+    for check in case.get("mutation_checks", []):
+        decoded["mutation_checks"].append({
+            **check,
+            "actual_expr": _decode_expr(check["actual_expr"]),
+            "expected": _decode_value(check["expected"]),
+            "abs_tol": _decode_value(check["abs_tol"]),
+            "rel_tol": _decode_value(check["rel_tol"]),
+        })
     return decoded
 
 
@@ -1828,22 +2158,26 @@ def _eval_method(name, receiver, args):
     raise ValueError("unsupported string method")
 
 
-def _eval_expr(expr, result):
+def _eval_expr(expr, result, args=None):
+    if args is None:
+        args = []
     op = expr["op"]
     if op == "result":
         return result
+    if op == "arg":
+        return args[expr["index"]]
     if op == "value":
         return expr["value"]
     if op == "list":
-        return [_eval_expr(item, result) for item in expr["items"]]
+        return [_eval_expr(item, result, args) for item in expr["items"]]
     if op == "tuple":
-        return tuple(_eval_expr(item, result) for item in expr["items"])
+        return tuple(_eval_expr(item, result, args) for item in expr["items"])
     if op == "set":
-        return set(_eval_expr(item, result) for item in expr["items"])
+        return set(_eval_expr(item, result, args) for item in expr["items"])
     if op == "dict":
-        return {_eval_expr(key, result): _eval_expr(value, result) for key, value in expr["entries"]}
+        return {_eval_expr(key, result, args): _eval_expr(value, result, args) for key, value in expr["entries"]}
     if op == "unary":
-        operand = _eval_expr(expr["operand"], result)
+        operand = _eval_expr(expr["operand"], result, args)
         if expr["operator"] == "uadd":
             return +operand
         if expr["operator"] == "usub":
@@ -1851,8 +2185,8 @@ def _eval_expr(expr, result):
         if expr["operator"] == "not":
             return not operand
     if op == "binary":
-        left = _eval_expr(expr["left"], result)
-        right = _eval_expr(expr["right"], result)
+        left = _eval_expr(expr["left"], result, args)
+        right = _eval_expr(expr["right"], result, args)
         operator = expr["operator"]
         if operator == "add":
             return left + right
@@ -1869,8 +2203,8 @@ def _eval_expr(expr, result):
         if operator == "pow":
             return left ** right
     if op == "compare":
-        left = _eval_expr(expr["left"], result)
-        right = _eval_expr(expr["right"], result)
+        left = _eval_expr(expr["left"], result, args)
+        right = _eval_expr(expr["right"], result, args)
         operator = expr["operator"]
         if operator == "eq":
             return _deep_equal(left, right)
@@ -1889,18 +2223,18 @@ def _eval_expr(expr, result):
         if operator == "not_in":
             return not _contains(right, left)
     if op == "call":
-        return _eval_call(expr["name"], [_eval_expr(arg, result) for arg in expr["args"]])
+        return _eval_call(expr["name"], [_eval_expr(arg, result, args) for arg in expr["args"]])
     if op == "method":
-        receiver = _eval_expr(expr["receiver"], result)
-        args = [_eval_expr(arg, result) for arg in expr["args"]]
-        return _eval_method(expr["name"], receiver, args)
+        receiver = _eval_expr(expr["receiver"], result, args)
+        method_args = [_eval_expr(arg, result, args) for arg in expr["args"]]
+        return _eval_method(expr["name"], receiver, method_args)
     if op == "subscript":
-        return _eval_expr(expr["value"], result)[_eval_expr(expr["index"], result)]
+        return _eval_expr(expr["value"], result, args)[_eval_expr(expr["index"], result, args)]
     if op == "slice":
-        value = _eval_expr(expr["value"], result)
-        lower = _eval_expr(expr["lower"], result) if expr["lower"] is not None else None
-        upper = _eval_expr(expr["upper"], result) if expr["upper"] is not None else None
-        step = _eval_expr(expr["step"], result) if expr["step"] is not None else None
+        value = _eval_expr(expr["value"], result, args)
+        lower = _eval_expr(expr["lower"], result, args) if expr["lower"] is not None else None
+        upper = _eval_expr(expr["upper"], result, args) if expr["upper"] is not None else None
+        step = _eval_expr(expr["step"], result, args) if expr["step"] is not None else None
         return value[slice(lower, upper, step)]
     raise ValueError("unsupported expression operation")
 
@@ -1936,14 +2270,35 @@ def _exception_matches(case, raised):
     return _message_matches(case, raised)
 
 
+def _check_matches(check, value, args):
+    kind = check["kind"]
+    try:
+        actual = _eval_expr(check["actual_expr"], value, args)
+    except Exception:
+        return False
+    if kind == "eq":
+        return _deep_equal(actual, check["expected"], check["abs_tol"], check["rel_tol"])
+    if kind == "ne":
+        return not _deep_equal(actual, check["expected"], check["abs_tol"], check["rel_tol"])
+    if kind == "truthy":
+        return bool(actual)
+    if kind == "not":
+        return not bool(actual)
+    return False
+
+
 def _matches(case, value, raised):
     kind = case["kind"]
+    if kind == "mutation":
+        if raised is not None:
+            return False
+        return all(_check_matches(check, value, case["args"]) for check in case["mutation_checks"])
     if kind == "raises":
         return _exception_matches(case, raised)
     if raised is not None:
         return False
     try:
-        actual = _eval_expr(case["actual_expr"], value)
+        actual = _eval_expr(case["actual_expr"], value, case["args"])
     except Exception:
         return False
     if kind == "eq":
@@ -2189,6 +2544,9 @@ function decodeExpr(expr) {
   if (expr.op === "result") {
     return {op: "result"};
   }
+  if (expr.op === "arg") {
+    return {op: "arg", index: expr.index};
+  }
   if (expr.op === "list" || expr.op === "tuple" || expr.op === "set") {
     return {...expr, items: expr.items.map((item) => decodeExpr(item))};
   }
@@ -2231,6 +2589,13 @@ function decodeCase(testCase) {
     abs_tol: decodeValue(testCase.abs_tol),
     rel_tol: decodeValue(testCase.rel_tol),
     default_abs_tol: decodeValue(testCase.default_abs_tol),
+    mutation_checks: (testCase.mutation_checks || []).map((check) => ({
+      ...check,
+      actual_expr: decodeExpr(check.actual_expr),
+      expected: decodeValue(check.expected),
+      abs_tol: decodeValue(check.abs_tol),
+      rel_tol: decodeValue(check.rel_tol),
+    })),
   };
 }
 
@@ -2672,21 +3037,24 @@ function sliceValue(value, lower, upper, step) {
   return typeof value === "string" ? result.join("") : result;
 }
 
-function evalExpr(expr, result) {
+function evalExpr(expr, result, args = []) {
   if (expr.op === "result") {
     return result;
+  }
+  if (expr.op === "arg") {
+    return args[expr.index];
   }
   if (expr.op === "value") {
     return expr.value;
   }
   if (expr.op === "list" || expr.op === "tuple") {
-    return expr.items.map((item) => evalExpr(item, result));
+    return expr.items.map((item) => evalExpr(item, result, args));
   }
   if (expr.op === "set") {
-    return new Set(expr.items.map((item) => evalExpr(item, result)));
+    return new Set(expr.items.map((item) => evalExpr(item, result, args)));
   }
   if (expr.op === "dict") {
-    const entries = expr.entries.map(([key, value]) => [evalExpr(key, result), evalExpr(value, result)]);
+    const entries = expr.entries.map(([key, value]) => [evalExpr(key, result, args), evalExpr(value, result, args)]);
     if (entries.every(([key]) => typeof key === "string")) {
       const object = {};
       for (const [key, value] of entries) {
@@ -2697,7 +3065,7 @@ function evalExpr(expr, result) {
     return new Map(entries);
   }
   if (expr.op === "unary") {
-    const operand = evalExpr(expr.operand, result);
+    const operand = evalExpr(expr.operand, result, args);
     if (expr.operator === "uadd") {
       return +operand;
     }
@@ -2709,11 +3077,11 @@ function evalExpr(expr, result) {
     }
   }
   if (expr.op === "binary") {
-    return binaryValue(expr.operator, evalExpr(expr.left, result), evalExpr(expr.right, result));
+    return binaryValue(expr.operator, evalExpr(expr.left, result, args), evalExpr(expr.right, result, args));
   }
   if (expr.op === "compare") {
-    const left = evalExpr(expr.left, result);
-    const right = evalExpr(expr.right, result);
+    const left = evalExpr(expr.left, result, args);
+    const right = evalExpr(expr.right, result, args);
     if (expr.operator === "eq") {
       return deepEqual(left, right);
     }
@@ -2740,24 +3108,24 @@ function evalExpr(expr, result) {
     }
   }
   if (expr.op === "call") {
-    return callValue(expr.name, expr.args.map((arg) => evalExpr(arg, result)));
+    return callValue(expr.name, expr.args.map((arg) => evalExpr(arg, result, args)));
   }
   if (expr.op === "method") {
     return methodValue(
       expr.name,
-      evalExpr(expr.receiver, result),
-      expr.args.map((arg) => evalExpr(arg, result)),
+      evalExpr(expr.receiver, result, args),
+      expr.args.map((arg) => evalExpr(arg, result, args)),
     );
   }
   if (expr.op === "subscript") {
-    return subscriptValue(evalExpr(expr.value, result), evalExpr(expr.index, result));
+    return subscriptValue(evalExpr(expr.value, result, args), evalExpr(expr.index, result, args));
   }
   if (expr.op === "slice") {
     return sliceValue(
-      evalExpr(expr.value, result),
-      expr.lower === null ? null : evalExpr(expr.lower, result),
-      expr.upper === null ? null : evalExpr(expr.upper, result),
-      expr.step === null ? null : evalExpr(expr.step, result),
+      evalExpr(expr.value, result, args),
+      expr.lower === null ? null : evalExpr(expr.lower, result, args),
+      expr.upper === null ? null : evalExpr(expr.upper, result, args),
+      expr.step === null ? null : evalExpr(expr.step, result, args),
     );
   }
   throw new Error("unsupported expression operation");
@@ -2805,6 +3173,32 @@ function exceptionMatches(testCase, error) {
 }
 
 function assertionMatches(testCase, callResult) {
+  if (testCase.kind === "mutation") {
+    if (callResult.raised) {
+      return false;
+    }
+    return testCase.mutation_checks.every((check) => {
+      let actual;
+      try {
+        actual = evalExpr(check.actual_expr, callResult.value, testCase.args);
+      } catch (_) {
+        return false;
+      }
+      if (check.kind === "eq") {
+        return deepEqual(actual, check.expected, check.abs_tol, check.rel_tol);
+      }
+      if (check.kind === "ne") {
+        return !deepEqual(actual, check.expected, check.abs_tol, check.rel_tol);
+      }
+      if (check.kind === "truthy") {
+        return pyTruthy(actual);
+      }
+      if (check.kind === "not") {
+        return !pyTruthy(actual);
+      }
+      return false;
+    });
+  }
   if (testCase.kind === "raises") {
     return callResult.raised && exceptionMatches(testCase, callResult.error);
   }
@@ -2813,7 +3207,7 @@ function assertionMatches(testCase, callResult) {
   }
   let actual;
   try {
-    actual = evalExpr(testCase.actual_expr, callResult.value);
+    actual = evalExpr(testCase.actual_expr, callResult.value, testCase.args);
   } catch (_) {
     return false;
   }
@@ -3038,7 +3432,11 @@ def command_test(args: argparse.Namespace) -> int:
 
     entrypoint = metadata["entrypoint"]
     try:
-        cases = discover_tests(tests_dir, entrypoint)
+        cases = discover_tests(
+            tests_dir,
+            entrypoint,
+            exclude_paths={Path(args.solution_path), tester_path},
+        )
     except DiscoveryError:
         print_json_result(error_result())
         return 2
