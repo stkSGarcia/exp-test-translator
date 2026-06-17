@@ -1,0 +1,5 @@
+[
+  "babel-code-goat-cli/support-mutation-style-test-discovery",
+  "babel-code-goat-cli/support-single-call-traceability",
+  "babel-code-goat-cli/add-loop-as-test-support"
+]

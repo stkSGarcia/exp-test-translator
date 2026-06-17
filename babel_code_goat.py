@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections import Counter, defaultdict, deque
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
@@ -197,6 +198,35 @@ def parse_default_tolerance(raw: str | None) -> float | None:
     if value < 0 or not math.isfinite(value):
         raise DiscoveryError("invalid tolerance")
     return value
+
+
+def parse_timeout_ms(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise DiscoveryError("invalid timeout") from exc
+    if value < 0:
+        raise DiscoveryError("invalid timeout")
+    return value
+
+
+def timeout_seconds(timeout_ms: int | None) -> float | None:
+    return None if timeout_ms is None else timeout_ms / 1000.0
+
+
+def remaining_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def combine_timeouts(*values: float | None) -> float | None:
+    concrete = [value for value in values if value is not None]
+    if not concrete:
+        return None
+    return min(concrete)
 
 
 def render_tester(lang: str, entrypoint: str) -> str:
@@ -1886,6 +1916,7 @@ def run_python_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout: float | None,
 ) -> bool:
     payload = {
         "solution_path": str(solution_path),
@@ -1898,7 +1929,7 @@ def run_python_case(
             [sys.executable, "-c", harness],
             text=True,
             capture_output=True,
-            timeout=10,
+            timeout=10 if timeout is None else timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1906,6 +1937,7 @@ def run_python_case(
 
 
 PYTHON_CASE_RUNNER = r'''
+import asyncio
 import builtins
 import inspect
 import io
@@ -2391,6 +2423,8 @@ def run(payload):
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
             value = function(*case["args"])
+            if inspect.isawaitable(value):
+                value = asyncio.run(value)
     except BaseException as exc:
         raised = exc
 
@@ -3349,6 +3383,7 @@ def run_node_case(
     lang: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout: float | None,
 ) -> bool:
     node_path = shutil.which("node")
     if node_path is None:
@@ -3369,7 +3404,7 @@ def run_node_case(
             text=True,
             capture_output=True,
             env=env,
-            timeout=10,
+            timeout=10 if timeout is None else timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -3723,6 +3758,7 @@ def run_cpp_cases(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None,
+    run_timeout: float | None = None,
 ) -> set[str] | None:
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
@@ -3769,7 +3805,7 @@ def run_cpp_cases(
                 [str(binary)],
                 text=True,
                 capture_output=True,
-                timeout=10,
+                timeout=10 if run_timeout is None else run_timeout,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -4032,6 +4068,7 @@ def run_rust_cases(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None,
+    run_timeout: float | None = None,
 ) -> set[str] | None:
     compiler = shutil.which("rustc")
     if compiler is None:
@@ -4078,7 +4115,7 @@ def run_rust_cases(
                 [str(binary)],
                 text=True,
                 capture_output=True,
-                timeout=10,
+                timeout=10 if run_timeout is None else run_timeout,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -4117,13 +4154,14 @@ def execute_case(
     entrypoint: str,
     case: TestCase,
     default_abs_tol: float | None,
+    timeout: float | None = None,
 ) -> bool:
     if case.kind == "loop":
         return case.loop_pass is True
     if lang == "python":
-        return run_python_case(solution_path, entrypoint, case, default_abs_tol)
+        return run_python_case(solution_path, entrypoint, case, default_abs_tol, timeout)
     if lang in {"javascript", "typescript"}:
-        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol)
+        return run_node_case(solution_path, entrypoint, lang, case, default_abs_tol, timeout)
     return False
 
 
@@ -4133,12 +4171,24 @@ def aggregate_results(
     entrypoint: str,
     cases: list[TestCase],
     default_abs_tol: float | None = None,
+    per_test_timeout_ms: int | None = None,
+    total_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
+    per_case_timeout = timeout_seconds(per_test_timeout_ms)
+    deadline = None if total_timeout_ms is None else time.monotonic() + timeout_seconds(total_timeout_ms)
+
     if lang in {"cpp", "rust"}:
+        remaining = remaining_seconds(deadline)
+        if remaining == 0:
+            return {"status": "fail", "passed": [], "failed": [case.id for case in cases]}
+        non_loop_count = sum(1 for case in cases if case.kind != "loop")
+        compiled_timeout = remaining
+        if per_case_timeout is not None:
+            compiled_timeout = combine_timeouts(compiled_timeout, per_case_timeout * max(1, non_loop_count))
         compiled_passed = (
-            run_cpp_cases(solution_path, entrypoint, cases, default_abs_tol)
+            run_cpp_cases(solution_path, entrypoint, cases, default_abs_tol, compiled_timeout)
             if lang == "cpp"
-            else run_rust_cases(solution_path, entrypoint, cases, default_abs_tol)
+            else run_rust_cases(solution_path, entrypoint, cases, default_abs_tol, compiled_timeout)
         )
         if compiled_passed is None:
             compiled_passed = {case.id for case in cases if case.kind == "loop" and case.loop_pass is True}
@@ -4149,8 +4199,13 @@ def aggregate_results(
 
     passed: list[str] = []
     failed: list[str] = []
-    for case in cases:
-        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol):
+    for index, case in enumerate(cases):
+        remaining = remaining_seconds(deadline)
+        if remaining == 0:
+            failed.extend(item.id for item in cases[index:])
+            break
+        case_timeout = combine_timeouts(per_case_timeout, remaining)
+        if execute_case(solution_path, lang, entrypoint, case, default_abs_tol, case_timeout):
             passed.append(case.id)
         else:
             failed.append(case.id)
@@ -4194,6 +4249,8 @@ def command_test(args: argparse.Namespace) -> int:
         return 2
     try:
         default_abs_tol = parse_default_tolerance(args.tol)
+        per_test_timeout_ms = parse_timeout_ms(args.timeout_ms)
+        total_timeout_ms = parse_timeout_ms(args.total_timeout_ms)
     except DiscoveryError:
         print_json_result(error_result())
         return 2
@@ -4225,7 +4282,27 @@ def command_test(args: argparse.Namespace) -> int:
         print_json_result(error_result())
         return 2
 
-    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases, default_abs_tol)
+    if args.list_tests:
+        result = {"status": "pass", "passed": [case.id for case in cases], "failed": []}
+        print_json_result(result)
+        return status_exit_code(result["status"])
+
+    selected_cases = cases
+    if args.run is not None:
+        selected_cases = [case for case in cases if case.id == args.run]
+        if not selected_cases:
+            print_json_result(error_result())
+            return 2
+
+    result = aggregate_results(
+        Path(args.solution_path),
+        lang,
+        entrypoint,
+        selected_cases,
+        default_abs_tol,
+        per_test_timeout_ms,
+        total_timeout_ms,
+    )
     print_json_result(result)
     return status_exit_code(result["status"])
 
@@ -4245,6 +4322,10 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
     test.add_argument("--tol")
+    test.add_argument("--list-tests", action="store_true")
+    test.add_argument("--run")
+    test.add_argument("--timeout-ms")
+    test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
 
     return parser
