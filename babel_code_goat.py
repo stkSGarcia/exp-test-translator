@@ -160,6 +160,18 @@ class TestCase:
     mutation_checks: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PreparedRun:
+    solution_path: Path
+    lang: str
+    entrypoint: str
+    cases: list[TestCase]
+    all_cases: list[TestCase]
+    default_abs_tol: float | None
+    per_test_timeout_ms: int | None
+    total_timeout_ms: int | None
+
+
 def tester_filename(lang: str) -> str:
     return SUPPORTED_LANGS[lang]
 
@@ -209,6 +221,16 @@ def parse_timeout_ms(raw: str | None) -> int | None:
         raise DiscoveryError("invalid timeout") from exc
     if value < 0:
         raise DiscoveryError("invalid timeout")
+    return value
+
+
+def parse_nonnegative_int(raw: str, name: str) -> int:
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise DiscoveryError(f"invalid {name}") from exc
+    if value < 0:
+        raise DiscoveryError(f"invalid {name}")
     return value
 
 
@@ -4213,6 +4235,214 @@ def aggregate_results(
     return {"status": status, "passed": passed, "failed": failed}
 
 
+def numeric_stats(samples: list[float | int]) -> dict[str, float]:
+    mean = sum(samples) / len(samples)
+    variance = sum((sample - mean) ** 2 for sample in samples) / len(samples)
+    return {"mean": mean, "std": math.sqrt(variance)}
+
+
+def child_memory_kb() -> int:
+    try:
+        import resource
+    except ImportError:
+        return 0
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return max(0, int(getattr(usage, "ru_maxrss", 0)))
+
+
+def profile_compiled_trial(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    cases: list[TestCase],
+    default_abs_tol: float | None,
+    per_test_timeout_ms: int | None,
+    total_timeout_ms: int | None,
+    collect_memory: bool,
+) -> tuple[dict[str, Any], int, int]:
+    memory_before = child_memory_kb() if collect_memory else 0
+    started = time.perf_counter_ns()
+    result = aggregate_results(
+        solution_path,
+        lang,
+        entrypoint,
+        cases,
+        default_abs_tol,
+        per_test_timeout_ms,
+        total_timeout_ms,
+    )
+    runtime_ns = time.perf_counter_ns() - started
+    memory_after = child_memory_kb() if collect_memory else memory_before
+    return result, runtime_ns, max(0, memory_after - memory_before)
+
+
+def profile_interpreted_case(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+    timeout: float | None,
+    collect_memory: bool,
+) -> tuple[bool, int, int]:
+    memory_before = child_memory_kb() if collect_memory else 0
+    started = time.perf_counter_ns()
+    passed = execute_case(solution_path, lang, entrypoint, case, default_abs_tol, timeout)
+    runtime_ns = time.perf_counter_ns() - started
+    memory_after = child_memory_kb() if collect_memory else memory_before
+    return passed, runtime_ns, max(0, memory_after - memory_before)
+
+
+def timeout_sample_ns(total_timeout_ms: int | None, per_test_timeout_ms: int | None) -> int:
+    timeout_ms = total_timeout_ms if total_timeout_ms is not None else per_test_timeout_ms
+    return 0 if timeout_ms is None else timeout_ms * 1_000_000
+
+
+def profile_cases(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    cases: list[TestCase],
+    default_abs_tol: float | None = None,
+    per_test_timeout_ms: int | None = None,
+    total_timeout_ms: int | None = None,
+    trials: int = 1,
+    warmup: int = 0,
+    collect_memory: bool = False,
+) -> dict[str, Any]:
+    runtime_samples: list[int] = []
+    memory_samples: list[int] = []
+    failed_ids: set[str] = set()
+    passed_ids: set[str] = set()
+    per_case_timeout = timeout_seconds(per_test_timeout_ms)
+    deadline = None if total_timeout_ms is None else time.monotonic() + timeout_seconds(total_timeout_ms)
+
+    for trial_index in range(trials):
+        measured = trial_index >= warmup
+        if lang in {"cpp", "rust"}:
+            remaining = remaining_seconds(deadline)
+            if remaining == 0:
+                trial_result = {"status": "fail", "passed": [], "failed": [case.id for case in cases]}
+                runtime_ns = timeout_sample_ns(total_timeout_ms, per_test_timeout_ms)
+                memory_kb = 0
+            else:
+                trial_total_timeout_ms = None if remaining is None else int(remaining * 1000)
+                trial_result, runtime_ns, memory_kb = profile_compiled_trial(
+                    solution_path,
+                    lang,
+                    entrypoint,
+                    cases,
+                    default_abs_tol,
+                    per_test_timeout_ms,
+                    trial_total_timeout_ms,
+                    collect_memory,
+                )
+            passed_ids.update(str(case_id) for case_id in trial_result["passed"])
+            failed_ids.update(str(case_id) for case_id in trial_result["failed"])
+            if measured:
+                sample_count = max(1, len(cases))
+                runtime_samples.extend([runtime_ns] * sample_count)
+                if collect_memory:
+                    memory_samples.extend([memory_kb] * sample_count)
+            continue
+
+        for index, case in enumerate(cases):
+            remaining = remaining_seconds(deadline)
+            if remaining == 0:
+                remaining_cases = cases[index:]
+                failed_ids.update(item.id for item in remaining_cases)
+                if measured:
+                    sample_ns = timeout_sample_ns(total_timeout_ms, per_test_timeout_ms)
+                    runtime_samples.extend([sample_ns] * len(remaining_cases))
+                    if collect_memory:
+                        memory_samples.extend([0] * len(remaining_cases))
+                break
+            case_timeout = combine_timeouts(per_case_timeout, remaining)
+            passed, runtime_ns, memory_kb = profile_interpreted_case(
+                solution_path,
+                lang,
+                entrypoint,
+                case,
+                default_abs_tol,
+                case_timeout,
+                collect_memory,
+            )
+            if passed:
+                passed_ids.add(case.id)
+            else:
+                failed_ids.add(case.id)
+            if measured:
+                runtime_samples.append(runtime_ns)
+                if collect_memory:
+                    memory_samples.append(memory_kb)
+
+    passed = [case.id for case in cases if case.id in passed_ids and case.id not in failed_ids]
+    failed = [case.id for case in cases if case.id in failed_ids]
+    status = "pass" if not failed else "fail"
+    result: dict[str, Any] = {
+        "status": status,
+        "passed": passed,
+        "failed": failed,
+        "runtime_ns": numeric_stats(runtime_samples),
+    }
+    if collect_memory:
+        result["memory_kb"] = numeric_stats(memory_samples)
+    return result
+
+
+def prepare_run(args: argparse.Namespace) -> PreparedRun | None:
+    lang = args.lang
+    if not is_supported_lang(lang):
+        return None
+    try:
+        default_abs_tol = parse_default_tolerance(args.tol)
+        per_test_timeout_ms = parse_timeout_ms(args.timeout_ms)
+        total_timeout_ms = parse_timeout_ms(args.total_timeout_ms)
+    except DiscoveryError:
+        return None
+
+    tests_dir = Path(args.tests_dir)
+    tester_path = tests_dir / tester_filename(lang)
+    if not tester_path.is_file():
+        return None
+
+    try:
+        metadata = read_tester_metadata(tester_path)
+    except MetadataError:
+        return None
+    if metadata["lang"] != lang:
+        return None
+
+    entrypoint = metadata["entrypoint"]
+    solution_path = Path(args.solution_path)
+    try:
+        all_cases = discover_tests(
+            tests_dir,
+            entrypoint,
+            exclude_paths={solution_path, tester_path},
+            target_lang=lang,
+        )
+    except DiscoveryError:
+        return None
+
+    selected_cases = all_cases
+    if args.run is not None:
+        selected_cases = [case for case in all_cases if case.id == args.run]
+        if not selected_cases:
+            return None
+
+    return PreparedRun(
+        solution_path=solution_path,
+        lang=lang,
+        entrypoint=entrypoint,
+        cases=selected_cases,
+        all_cases=all_cases,
+        default_abs_tol=default_abs_tol,
+        per_test_timeout_ms=per_test_timeout_ms,
+        total_timeout_ms=total_timeout_ms,
+    )
+
+
 def command_generate(args: argparse.Namespace) -> int:
     lang = args.lang
     tests_dir = Path(args.tests_dir)
@@ -4243,65 +4473,61 @@ def command_generate(args: argparse.Namespace) -> int:
 
 
 def command_test(args: argparse.Namespace) -> int:
-    lang = args.lang
-    if not is_supported_lang(lang):
-        print_json_result(error_result())
-        return 2
-    try:
-        default_abs_tol = parse_default_tolerance(args.tol)
-        per_test_timeout_ms = parse_timeout_ms(args.timeout_ms)
-        total_timeout_ms = parse_timeout_ms(args.total_timeout_ms)
-    except DiscoveryError:
-        print_json_result(error_result())
-        return 2
-
-    tests_dir = Path(args.tests_dir)
-    tester_path = tests_dir / tester_filename(lang)
-    if not tester_path.is_file():
-        print_json_result(error_result())
-        return 2
-
-    try:
-        metadata = read_tester_metadata(tester_path)
-    except MetadataError:
-        print_json_result(error_result())
-        return 2
-    if metadata["lang"] != lang:
-        print_json_result(error_result())
-        return 2
-
-    entrypoint = metadata["entrypoint"]
-    try:
-        cases = discover_tests(
-            tests_dir,
-            entrypoint,
-            exclude_paths={Path(args.solution_path), tester_path},
-            target_lang=lang,
-        )
-    except DiscoveryError:
+    prepared = prepare_run(args)
+    if prepared is None:
         print_json_result(error_result())
         return 2
 
     if args.list_tests:
-        result = {"status": "pass", "passed": [case.id for case in cases], "failed": []}
+        result = {"status": "pass", "passed": [case.id for case in prepared.all_cases], "failed": []}
         print_json_result(result)
         return status_exit_code(result["status"])
 
-    selected_cases = cases
-    if args.run is not None:
-        selected_cases = [case for case in cases if case.id == args.run]
-        if not selected_cases:
-            print_json_result(error_result())
-            return 2
-
     result = aggregate_results(
-        Path(args.solution_path),
-        lang,
-        entrypoint,
-        selected_cases,
-        default_abs_tol,
-        per_test_timeout_ms,
-        total_timeout_ms,
+        prepared.solution_path,
+        prepared.lang,
+        prepared.entrypoint,
+        prepared.cases,
+        prepared.default_abs_tol,
+        prepared.per_test_timeout_ms,
+        prepared.total_timeout_ms,
+    )
+    print_json_result(result)
+    return status_exit_code(result["status"])
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    try:
+        trials = parse_nonnegative_int(args.trials, "trials")
+        warmup = parse_nonnegative_int(args.warmup, "warmup")
+    except DiscoveryError:
+        print_json_result(error_result())
+        return 2
+    if trials < 1 or warmup >= trials:
+        print_json_result(error_result())
+        return 2
+
+    prepared = prepare_run(args)
+    if prepared is None:
+        print_json_result(error_result())
+        return 2
+
+    if args.list_tests:
+        result = {"status": "pass", "passed": [case.id for case in prepared.cases], "failed": []}
+        print_json_result(result)
+        return status_exit_code(result["status"])
+
+    result = profile_cases(
+        prepared.solution_path,
+        prepared.lang,
+        prepared.entrypoint,
+        prepared.cases,
+        prepared.default_abs_tol,
+        prepared.per_test_timeout_ms,
+        prepared.total_timeout_ms,
+        trials,
+        warmup,
+        args.memory,
     )
     print_json_result(result)
     return status_exit_code(result["status"])
@@ -4327,6 +4553,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms")
     test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("-n", dest="trials", default="1")
+    profile.add_argument("--warmup", default="0")
+    profile.add_argument("--memory", action="store_true")
+    profile.add_argument("--tol")
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms")
+    profile.add_argument("--total-timeout-ms")
+    profile.set_defaults(func=command_profile)
 
     return parser
 
