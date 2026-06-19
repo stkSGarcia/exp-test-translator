@@ -67,6 +67,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 "python": "tester.py",
                 "javascript": "tester.js",
                 "typescript": "tester.ts",
+                "cpp": "tester.cpp",
+                "rust": "tester.rs",
             }
             for lang, filename in expected.items():
                 with self.subTest(lang=lang):
@@ -82,6 +84,8 @@ class BabelCodeGoatTests(unittest.TestCase):
                 tests_dir / "tester.py": "py sentinel",
                 tests_dir / "tester.js": "js sentinel",
                 tests_dir / "tester.ts": "ts sentinel",
+                tests_dir / "tester.cpp": "cpp sentinel",
+                tests_dir / "tester.rs": "rust sentinel",
             }
             for path, content in sentinels.items():
                 path.write_text(content, encoding="utf-8")
@@ -107,6 +111,8 @@ class BabelCodeGoatTests(unittest.TestCase):
             "python": "tester.py",
             "javascript": "tester.js",
             "typescript": "tester.ts",
+            "cpp": "tester.cpp",
+            "rust": "tester.rs",
         }
         for lang, filename in filenames.items():
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
@@ -203,6 +209,26 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(cases[3].exception_type, "ValueError")
             self.assertEqual(cases[3].message_match, "regex")
             self.assertEqual(cases[3].message_pattern, "bad")
+
+    def test_case_json_preserves_expected_none_and_detects_rust_deque_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                from collections import deque
+
+                assert solve(1) == None
+                assert solve(2) == deque([1, 2])
+                """,
+            )
+
+            cases = bcg.discover_tests(tests_dir, "solve")
+
+            encoded = bcg.case_to_json(cases[0])
+            self.assertEqual(encoded["expected"], {"type": "scalar", "value": None})
+            self.assertFalse(bcg.case_uses_deque(cases[0]))
+            self.assertTrue(bcg.case_uses_deque(cases[1]))
 
     def test_discovery_supports_single_call_expression_plans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1130,6 +1156,203 @@ class BabelCodeGoatTests(unittest.TestCase):
             self.assertEqual(self.generate(tests_dir, "typescript").returncode, 0)
 
             proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "typescript")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("g++") is None and shutil.which("clang++") is None, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("cpp", "solution.cpp")
+        write(
+            solution,
+            """
+            int solve(int value) {
+                return value + 1;
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("g++") is None and shutil.which("clang++") is None, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_rich_values_expressions_and_exceptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                assert solve(1) == [1, None, 3]
+                assert sorted(solve(2)) == [1, 2, 3]
+                try:
+                    solve(0)
+                    assert False
+                except ValueError as e:
+                    assert "bad" in str(e)
+                """,
+            )
+            solution = tests_dir / "solution.cpp"
+            write(
+                solution,
+                """
+                #include <optional>
+                #include <stdexcept>
+                #include <vector>
+
+                std::vector<std::optional<int>> solve(int value) {
+                    if (value == 1) {
+                        return std::vector<std::optional<int>>{1, std::nullopt, 3};
+                    }
+                    if (value == 2) {
+                        return std::vector<std::optional<int>>{3, 1, 2};
+                    }
+                    throw std::runtime_error("bad input");
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            result = self.json_stdout(proc)
+            self.assertEqual(result["passed"], ["tests.py:1", "tests.py:2", "tests.py:3"])
+
+    @unittest.skipIf(shutil.which("g++") is None and shutil.which("clang++") is None, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_mutation_style_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(
+                tests_dir / "tests.py",
+                """
+                a = [2, 0, 1]
+                solve(a)
+                assert a == [0, 1, 2]
+                """,
+            )
+            solution = tests_dir / "solution.cpp"
+            write(
+                solution,
+                """
+                #include <algorithm>
+                #include <vector>
+
+                void solve(std::vector<int>& items) {
+                    std::sort(items.begin(), items.end());
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("g++") is None and shutil.which("clang++") is None, "C++ compiler is required for C++ smoke tests")
+    def test_cpp_string_tolerance_map_and_class_resolution(self) -> None:
+        cases = [
+            (
+                "string",
+                'assert solve("abc").upper() == "ABC"\n',
+                """
+                #include <string>
+                std::string solve(std::string value) {
+                    return value;
+                }
+                """,
+            ),
+            (
+                "tolerance",
+                """
+                import math
+                assert math.isclose(solve(1), 1.0, abs_tol=0.01)
+                """,
+                """
+                long double solve(int value) {
+                    return 1.005L;
+                }
+                """,
+            ),
+            (
+                "map",
+                'assert solve("map") == {"x": 1}\n',
+                """
+                #include <map>
+                #include <string>
+                std::map<std::string, int> solve(std::string value) {
+                    return {{"x", 1}};
+                }
+                """,
+            ),
+            (
+                "class",
+                "assert solve(2) == 3\n",
+                """
+                class Solution {
+                public:
+                    int solve(int value) {
+                        return value + 1;
+                    }
+                };
+                """,
+            ),
+        ]
+        for name, tests_source, solution_source in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                tests_dir = Path(tmp)
+                write(tests_dir / "tests.py", tests_source)
+                solution = tests_dir / "solution.cpp"
+                write(solution, solution_source)
+                self.assertEqual(self.generate(tests_dir, "cpp").returncode, 0)
+
+                proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "cpp")
+
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_solution_execution(self) -> None:
+        tests_dir, solution = self.make_generated_case("rust", "solution.rs")
+        write(
+            solution,
+            """
+            pub fn solve(value: i64) -> i64 {
+                value + 1
+            }
+            """,
+        )
+        self.assertEqual(self.generate(tests_dir, "rust").returncode, 0)
+
+        proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "rust")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.json_stdout(proc)["status"], "pass")
+
+    @unittest.skipIf(shutil.which("rustc") is None, "rustc is required for Rust smoke tests")
+    def test_rust_owned_string_hash_map_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            write(tests_dir / "tests.py", 'assert solve("items")["items"] == [1, 2]\n')
+            solution = tests_dir / "solution.rs"
+            write(
+                solution,
+                """
+                use std::collections::HashMap;
+
+                pub fn solve(_value: String) -> HashMap<String, Vec<i64>> {
+                    let mut result = HashMap::new();
+                    result.insert(String::from("items"), vec![1, 2]);
+                    result
+                }
+                """,
+            )
+            self.assertEqual(self.generate(tests_dir, "rust").returncode, 0)
+
+            proc = self.run_cli("test", str(solution), str(tests_dir), "--lang", "rust")
 
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(self.json_stdout(proc)["status"], "pass")
