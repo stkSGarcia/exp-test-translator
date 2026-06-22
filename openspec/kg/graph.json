@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "updatedAt": "2026-06-22T13:45:11.002Z",
+  "updatedAt": "2026-06-22T14:21:21.171Z",
   "nodes": [
     {
       "id": "babel-code-goat-cli",
@@ -9,7 +9,7 @@
       "text": "babel-code-goat-cli",
       "type": "",
       "status": "ACTIVE",
-      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validFrom": "2026-06-22T14:21:21.156Z",
       "validTo": null,
       "embedding": null
     },
@@ -234,6 +234,294 @@
       "validTo": null,
       "embedding": null,
       "hasTag": true
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command",
+      "label": "DeltaSpec",
+      "name": "add-profile-command",
+      "text": "## ADDED Requirements\n\n### Requirement: Profile Command\nThe system SHALL provide `profile <tests_dir> <solution_path> --lang <target_lang> [flags...]` for every supported target language. The command MUST require the expected generated tester file for the selected language to already exist, MUST NOT create or modify tester files, and MUST use the same supported language set as `generate` and `test`.\n\n#### Scenario: Profile requires an existing tester\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang>` is invoked and the expected tester file for `<target_lang>` is missing from `<tests_dir>`\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2\n\n#### Scenario: Profile rejects an unsupported language\n- **WHEN** `profile <tests_dir> <solution_path> --lang nope` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2\n\n#### Scenario: Profile preserves the generated tester\n- **GIVEN** the expected tester file exists in `<tests_dir>`\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang>` exits\n- **THEN** the tester file content is unchanged\n\n### Requirement: Profile Trials and Warmups\nThe `profile` command SHALL accept `-n <trials>` with default `1` and `--warmup <k>` with default `0`. Trial counts MUST be positive integers. Warmup counts MUST be non-negative integers and MUST satisfy `k < n`. Warmup runs MUST execute before measured trials and MUST be excluded from reported runtime and memory statistics.\n\n#### Scenario: Default profile run measures one trial\n- **GIVEN** discovery succeeds and every in-scope test passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang>` is invoked without `-n` or `--warmup`\n- **THEN** each in-scope test is executed once as a measured trial\n\n#### Scenario: Warmup runs are excluded from statistics\n- **GIVEN** discovery succeeds and every in-scope test passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 3 --warmup 1` is invoked\n- **THEN** each in-scope test is executed once as an unmeasured warmup before the three measured trials and only the measured trials contribute to aggregate statistics\n\n#### Scenario: Trial and warmup values are validated\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 0`, `-n nope`, `--warmup -1`, or `-n 2 --warmup 2` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2\n\n### Requirement: Profile Selection, Tolerance, and Timeouts\nThe `profile` command SHALL accept `--list-tests`, `--run <test_id>`, `--timeout-ms <int>`, `--total-timeout-ms <int>`, and `--tol <float>` with the same validation and discovery semantics as `test` where applicable. Listing tests MUST perform normal validation and discovery without loading or executing the solution. Selecting a test MUST profile only the selected discovered test. `--list-tests` and `--run` MUST NOT be used together. Timeout values MUST be positive integer millisecond durations.\n\n#### Scenario: Profile list tests reports discovered IDs\n- **GIVEN** the expected tester file exists and discovery succeeds\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command prints exactly one JSON line with `status` set to `pass`, `passed` containing every discovered test ID in discovery order, `failed` set to an empty array, `runtime_ns` present with numeric `mean` and `std` values of `0`, and exits with code 0\n\n#### Scenario: Profile list tests does not execute the solution\n- **GIVEN** discovery succeeds and the supplied solution path is missing, invalid, or would fail if executed\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command reports the discovered IDs without loading or invoking the solution\n\n#### Scenario: Profile selected test reports only that ID\n- **GIVEN** discovery includes test IDs `tests.py:1` and `tests.py:2`\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --run tests.py:2` is invoked\n- **THEN** only `tests.py:2` appears in either `passed` or `failed`\n\n#### Scenario: Profile selected test accepts tolerance\n- **GIVEN** discovery includes a floating point assertion that passes under tolerance `0.01` and fails under the default tolerance\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --tol 0.01 --run tests.py:1` is invoked\n- **THEN** `tests.py:1` appears in `passed`\n\n#### Scenario: Profile rejects invalid selection or timeout flags\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --list-tests --run tests.py:1`, `--run missing.py:1`, `--timeout-ms 0`, or `--total-timeout-ms nope` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2\n\n### Requirement: Profile JSON Output and Exit Codes\nThe `profile` command MUST print exactly one line to stdout containing a JSON object with at least the keys `status`, `passed`, `failed`, and `runtime_ns`. The `runtime_ns` value MUST be an object containing numeric `mean` and `std` fields computed over measured profile attempts. The status MUST be one of `pass`, `fail`, or `error`; `passed` and `failed` MUST be arrays. The command MUST exit with code 0 for `pass`, code 1 for `fail`, and code 2 for `error`.\n\n#### Scenario: Profile all tests pass\n- **GIVEN** every in-scope measured test attempt passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 2` is invoked\n- **THEN** the command prints a single JSON line with `status` set to `pass`, all in-scope test IDs in `passed`, an empty `failed` array, `runtime_ns.mean` and `runtime_ns.std` as numbers, and exits with code 0\n\n#### Scenario: Profile reports failed tests\n- **GIVEN** at least one in-scope measured test attempt fails after successful discovery\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 2` is invoked\n- **THEN** the command prints a single JSON line with `status` set to `fail`, includes failed test IDs in `failed`, includes passing test IDs in `passed`, includes numeric runtime statistics for measured attempts, and exits with code 1\n\n#### Scenario: Profile command errors\n- **WHEN** `profile` encounters an error condition before successful profile execution\n- **THEN** `profile` prints a single JSON line with `status` set to `error`, `passed` set to an empty array, `failed` set to an empty array, no required profiling statistic keys, and exits with code 2\n\n### Requirement: Profile Memory Statistics\nThe `profile` command SHALL accept `--memory` to include memory statistics in the profile output. When `--memory` is provided and profiling reaches measured execution, the JSON output MUST include `memory_kb` as an object containing numeric `mean` and `std` fields computed over measured profile attempts. Warmup runs MUST be excluded from memory statistics.\n\n#### Scenario: Memory profiling adds memory statistics\n- **GIVEN** discovery succeeds and every in-scope measured test attempt passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --memory -n 2` is invoked\n- **THEN** the command prints a single JSON line with `memory_kb.mean` and `memory_kb.std` as numbers in addition to `runtime_ns`\n\n#### Scenario: Memory profiling excludes warmups\n- **GIVEN** discovery succeeds and every in-scope measured test attempt passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --memory -n 3 --warmup 1` is invoked\n- **THEN** `memory_kb.mean` and `memory_kb.std` are computed only from the three measured trials per in-scope test\n\n### Requirement: Profile Timeout Statistics\nThe `profile` command SHALL include timed out measured attempts in aggregate runtime and memory statistics. When an in-scope test times out via `--timeout-ms` or `--total-timeout-ms`, that test ID MUST appear in `failed`; any timing and memory data collected for the timeout attempt MUST contribute to the reported mean and standard deviation.\n\n#### Scenario: Per-test timeout contributes to profile statistics\n- **GIVEN** discovery includes `tests.py:1` and its entrypoint invocation does not complete within the requested per-test timeout\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --timeout-ms 50` is invoked\n- **THEN** `tests.py:1` appears in `failed`, the output status is `fail`, and `runtime_ns.mean` and `runtime_ns.std` include the timed out measured attempt\n\n#### Scenario: Total timeout contributes to profile statistics\n- **GIVEN** discovery includes `tests.py:1`, `tests.py:2`, and `tests.py:3`\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --total-timeout-ms 100` exhausts the total timeout before all in-scope measured attempts complete\n- **THEN** every timed out or not-yet-completed in-scope test ID appears in `failed`, already passed tests remain in `passed`, the output status is `fail`, and collected timeout timing data contributes to `runtime_ns`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null,
+      "hasTag": true
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-command",
+      "label": "Requirement",
+      "name": "Profile Command",
+      "text": "The system SHALL provide `profile <tests_dir> <solution_path> --lang <target_lang> [flags...]` for every supported target language. The command MUST require the expected generated tester file for the selected language to already exist, MUST NOT create or modify tester files, and MUST use the same supported language set as `generate` and `test`.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-requires-an-existing-tester",
+      "label": "Scenario",
+      "name": "Profile Command/profile-requires-an-existing-tester",
+      "text": "- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang>` is invoked and the expected tester file for `<target_lang>` is missing from `<tests_dir>`\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-rejects-an-unsupported-language",
+      "label": "Scenario",
+      "name": "Profile Command/profile-rejects-an-unsupported-language",
+      "text": "- **WHEN** `profile <tests_dir> <solution_path> --lang nope` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-preserves-the-generated-tester",
+      "label": "Scenario",
+      "name": "Profile Command/profile-preserves-the-generated-tester",
+      "text": "- **GIVEN** the expected tester file exists in `<tests_dir>`\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang>` exits\n- **THEN** the tester file content is unchanged",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups",
+      "label": "Requirement",
+      "name": "Profile Trials and Warmups",
+      "text": "The `profile` command SHALL accept `-n <trials>` with default `1` and `--warmup <k>` with default `0`. Trial counts MUST be positive integers. Warmup counts MUST be non-negative integers and MUST satisfy `k < n`. Warmup runs MUST execute before measured trials and MUST be excluded from reported runtime and memory statistics.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-default-profile-run-measures-one-trial",
+      "label": "Scenario",
+      "name": "Profile Trials and Warmups/default-profile-run-measures-one-trial",
+      "text": "- **GIVEN** discovery succeeds and every in-scope test passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang>` is invoked without `-n` or `--warmup`\n- **THEN** each in-scope test is executed once as a measured trial",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-warmup-runs-are-excluded-from-statistics",
+      "label": "Scenario",
+      "name": "Profile Trials and Warmups/warmup-runs-are-excluded-from-statistics",
+      "text": "- **GIVEN** discovery succeeds and every in-scope test passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 3 --warmup 1` is invoked\n- **THEN** each in-scope test is executed once as an unmeasured warmup before the three measured trials and only the measured trials contribute to aggregate statistics",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-trial-and-warmup-values-are-validated",
+      "label": "Scenario",
+      "name": "Profile Trials and Warmups/trial-and-warmup-values-are-validated",
+      "text": "- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 0`, `-n nope`, `--warmup -1`, or `-n 2 --warmup 2` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "label": "Requirement",
+      "name": "Profile Selection, Tolerance, and Timeouts",
+      "text": "The `profile` command SHALL accept `--list-tests`, `--run <test_id>`, `--timeout-ms <int>`, `--total-timeout-ms <int>`, and `--tol <float>` with the same validation and discovery semantics as `test` where applicable. Listing tests MUST perform normal validation and discovery without loading or executing the solution. Selecting a test MUST profile only the selected discovered test. `--list-tests` and `--run` MUST NOT be used together. Timeout values MUST be positive integer millisecond durations.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-list-tests-reports-discovered-ids",
+      "label": "Scenario",
+      "name": "Profile Selection, Tolerance, and Timeouts/profile-list-tests-reports-discovered-ids",
+      "text": "- **GIVEN** the expected tester file exists and discovery succeeds\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command prints exactly one JSON line with `status` set to `pass`, `passed` containing every discovered test ID in discovery order, `failed` set to an empty array, `runtime_ns` present with numeric `mean` and `std` values of `0`, and exits with code 0",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-list-tests-does-not-execute-the-solution",
+      "label": "Scenario",
+      "name": "Profile Selection, Tolerance, and Timeouts/profile-list-tests-does-not-execute-the-solution",
+      "text": "- **GIVEN** discovery succeeds and the supplied solution path is missing, invalid, or would fail if executed\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command reports the discovered IDs without loading or invoking the solution",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-selected-test-reports-only-that-id",
+      "label": "Scenario",
+      "name": "Profile Selection, Tolerance, and Timeouts/profile-selected-test-reports-only-that-id",
+      "text": "- **GIVEN** discovery includes test IDs `tests.py:1` and `tests.py:2`\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --run tests.py:2` is invoked\n- **THEN** only `tests.py:2` appears in either `passed` or `failed`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-selected-test-accepts-tolerance",
+      "label": "Scenario",
+      "name": "Profile Selection, Tolerance, and Timeouts/profile-selected-test-accepts-tolerance",
+      "text": "- **GIVEN** discovery includes a floating point assertion that passes under tolerance `0.01` and fails under the default tolerance\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --tol 0.01 --run tests.py:1` is invoked\n- **THEN** `tests.py:1` appears in `passed`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-rejects-invalid-selection-or-timeout-flags",
+      "label": "Scenario",
+      "name": "Profile Selection, Tolerance, and Timeouts/profile-rejects-invalid-selection-or-timeout-flags",
+      "text": "- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --list-tests --run tests.py:1`, `--run missing.py:1`, `--timeout-ms 0`, or `--total-timeout-ms nope` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes",
+      "label": "Requirement",
+      "name": "Profile JSON Output and Exit Codes",
+      "text": "The `profile` command MUST print exactly one line to stdout containing a JSON object with at least the keys `status`, `passed`, `failed`, and `runtime_ns`. The `runtime_ns` value MUST be an object containing numeric `mean` and `std` fields computed over measured profile attempts. The status MUST be one of `pass`, `fail`, or `error`; `passed` and `failed` MUST be arrays. The command MUST exit with code 0 for `pass`, code 1 for `fail`, and code 2 for `error`.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-all-tests-pass",
+      "label": "Scenario",
+      "name": "Profile JSON Output and Exit Codes/profile-all-tests-pass",
+      "text": "- **GIVEN** every in-scope measured test attempt passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 2` is invoked\n- **THEN** the command prints a single JSON line with `status` set to `pass`, all in-scope test IDs in `passed`, an empty `failed` array, `runtime_ns.mean` and `runtime_ns.std` as numbers, and exits with code 0",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-reports-failed-tests",
+      "label": "Scenario",
+      "name": "Profile JSON Output and Exit Codes/profile-reports-failed-tests",
+      "text": "- **GIVEN** at least one in-scope measured test attempt fails after successful discovery\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> -n 2` is invoked\n- **THEN** the command prints a single JSON line with `status` set to `fail`, includes failed test IDs in `failed`, includes passing test IDs in `passed`, includes numeric runtime statistics for measured attempts, and exits with code 1",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-command-errors",
+      "label": "Scenario",
+      "name": "Profile JSON Output and Exit Codes/profile-command-errors",
+      "text": "- **WHEN** `profile` encounters an error condition before successful profile execution\n- **THEN** `profile` prints a single JSON line with `status` set to `error`, `passed` set to an empty array, `failed` set to an empty array, no required profiling statistic keys, and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-memory-statistics",
+      "label": "Requirement",
+      "name": "Profile Memory Statistics",
+      "text": "The `profile` command SHALL accept `--memory` to include memory statistics in the profile output. When `--memory` is provided and profiling reaches measured execution, the JSON output MUST include `memory_kb` as an object containing numeric `mean` and `std` fields computed over measured profile attempts. Warmup runs MUST be excluded from memory statistics.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-memory-statistics/profile-memory-statistics-memory-profiling-adds-memory-statistics",
+      "label": "Scenario",
+      "name": "Profile Memory Statistics/memory-profiling-adds-memory-statistics",
+      "text": "- **GIVEN** discovery succeeds and every in-scope measured test attempt passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --memory -n 2` is invoked\n- **THEN** the command prints a single JSON line with `memory_kb.mean` and `memory_kb.std` as numbers in addition to `runtime_ns`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-memory-statistics/profile-memory-statistics-memory-profiling-excludes-warmups",
+      "label": "Scenario",
+      "name": "Profile Memory Statistics/memory-profiling-excludes-warmups",
+      "text": "- **GIVEN** discovery succeeds and every in-scope measured test attempt passes\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --memory -n 3 --warmup 1` is invoked\n- **THEN** `memory_kb.mean` and `memory_kb.std` are computed only from the three measured trials per in-scope test",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics",
+      "label": "Requirement",
+      "name": "Profile Timeout Statistics",
+      "text": "The `profile` command SHALL include timed out measured attempts in aggregate runtime and memory statistics. When an in-scope test times out via `--timeout-ms` or `--total-timeout-ms`, that test ID MUST appear in `failed`; any timing and memory data collected for the timeout attempt MUST contribute to the reported mean and standard deviation.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics/profile-timeout-statistics-per-test-timeout-contributes-to-profile-statistics",
+      "label": "Scenario",
+      "name": "Profile Timeout Statistics/per-test-timeout-contributes-to-profile-statistics",
+      "text": "- **GIVEN** discovery includes `tests.py:1` and its entrypoint invocation does not complete within the requested per-test timeout\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --timeout-ms 50` is invoked\n- **THEN** `tests.py:1` appears in `failed`, the output status is `fail`, and `runtime_ns.mean` and `runtime_ns.std` include the timed out measured attempt",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics/profile-timeout-statistics-total-timeout-contributes-to-profile-statistics",
+      "label": "Scenario",
+      "name": "Profile Timeout Statistics/total-timeout-contributes-to-profile-statistics",
+      "text": "- **GIVEN** discovery includes `tests.py:1`, `tests.py:2`, and `tests.py:3`\n- **WHEN** `profile <tests_dir> <solution_path> --lang <target_lang> --total-timeout-ms 100` exhausts the total timeout before all in-scope measured attempts complete\n- **THEN** every timed out or not-yet-completed in-scope test ID appears in `failed`, already passed tests remain in `passed`, the output status is `fail`, and collected timeout timing data contributes to `runtime_ns`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.156Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "add-profile-command",
+      "label": "Intent",
+      "name": "add-profile-command",
+      "text": "Users need a repeatable way to measure translated solution performance with the same generated tester files and test-selection controls already used for correctness runs. Adding a dedicated `profile` command makes timing and optional memory measurements first-class CLI output instead of ad hoc wrapper behavior.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T14:21:21.164Z",
+      "validTo": null,
+      "embedding": null,
+      "hasTag": true
     }
   ],
   "edges": [
@@ -375,6 +663,187 @@
       "type": "HAS_DELTA_SPEC",
       "from": "add-async-test-selection-timeouts",
       "to": "babel-code-goat-cli/add-async-test-selection-timeouts"
+    },
+    {
+      "id": "edge:babel-code-goat-cli:has_delta_spec:babel-code-goat-cli/add-profile-command",
+      "type": "HAS_DELTA_SPEC",
+      "from": "babel-code-goat-cli",
+      "to": "babel-code-goat-cli/add-profile-command",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command:has_requirement:babel-code-goat-cli/add-profile-command/profile-command",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-command",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-command:has_scenario:babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-requires-an-existing-tester",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-requires-an-existing-tester",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-command:has_scenario:babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-rejects-an-unsupported-language",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-rejects-an-unsupported-language",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-command:has_scenario:babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-preserves-the-generated-tester",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-command/profile-command-profile-preserves-the-generated-tester",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command:has_requirement:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups:has_scenario:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-default-profile-run-measures-one-trial",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups",
+      "to": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-default-profile-run-measures-one-trial",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups:has_scenario:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-warmup-runs-are-excluded-from-statistics",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups",
+      "to": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-warmup-runs-are-excluded-from-statistics",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups:has_scenario:babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-trial-and-warmup-values-are-validated",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups",
+      "to": "babel-code-goat-cli/add-profile-command/profile-trials-and-warmups/profile-trials-and-warmups-trial-and-warmup-values-are-validated",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command:has_requirement:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts:has_scenario:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-list-tests-reports-discovered-ids",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "to": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-list-tests-reports-discovered-ids",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts:has_scenario:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-list-tests-does-not-execute-the-solution",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "to": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-list-tests-does-not-execute-the-solution",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts:has_scenario:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-selected-test-reports-only-that-id",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "to": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-selected-test-reports-only-that-id",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts:has_scenario:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-selected-test-accepts-tolerance",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "to": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-selected-test-accepts-tolerance",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts:has_scenario:babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-rejects-invalid-selection-or-timeout-flags",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts",
+      "to": "babel-code-goat-cli/add-profile-command/profile-selection-tolerance-and-timeouts/profile-selection-tolerance-and-timeouts-profile-rejects-invalid-selection-or-timeout-flags",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command:has_requirement:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes:has_scenario:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-all-tests-pass",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes",
+      "to": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-all-tests-pass",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes:has_scenario:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-reports-failed-tests",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes",
+      "to": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-reports-failed-tests",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes:has_scenario:babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-command-errors",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes",
+      "to": "babel-code-goat-cli/add-profile-command/profile-json-output-and-exit-codes/profile-json-output-and-exit-codes-profile-command-errors",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command:has_requirement:babel-code-goat-cli/add-profile-command/profile-memory-statistics",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-memory-statistics",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-memory-statistics:has_scenario:babel-code-goat-cli/add-profile-command/profile-memory-statistics/profile-memory-statistics-memory-profiling-adds-memory-statistics",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-memory-statistics",
+      "to": "babel-code-goat-cli/add-profile-command/profile-memory-statistics/profile-memory-statistics-memory-profiling-adds-memory-statistics",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-memory-statistics:has_scenario:babel-code-goat-cli/add-profile-command/profile-memory-statistics/profile-memory-statistics-memory-profiling-excludes-warmups",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-memory-statistics",
+      "to": "babel-code-goat-cli/add-profile-command/profile-memory-statistics/profile-memory-statistics-memory-profiling-excludes-warmups",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command:has_requirement:babel-code-goat-cli/add-profile-command/profile-timeout-statistics",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-timeout-statistics:has_scenario:babel-code-goat-cli/add-profile-command/profile-timeout-statistics/profile-timeout-statistics-per-test-timeout-contributes-to-profile-statistics",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics",
+      "to": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics/profile-timeout-statistics-per-test-timeout-contributes-to-profile-statistics",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-profile-command/profile-timeout-statistics:has_scenario:babel-code-goat-cli/add-profile-command/profile-timeout-statistics/profile-timeout-statistics-total-timeout-contributes-to-profile-statistics",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics",
+      "to": "babel-code-goat-cli/add-profile-command/profile-timeout-statistics/profile-timeout-statistics-total-timeout-contributes-to-profile-statistics",
+      "confidence": 1
+    },
+    {
+      "id": "edge:add-profile-command:has_delta_spec:babel-code-goat-cli/add-profile-command",
+      "type": "HAS_DELTA_SPEC",
+      "from": "add-profile-command",
+      "to": "babel-code-goat-cli/add-profile-command"
     }
   ]
 }

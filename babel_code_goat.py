@@ -26,6 +26,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on Windows.
+    resource = None  # type: ignore[assignment]
+
 
 SUPPORTED_LANGS = {
     "python": "tester.py",
@@ -177,6 +182,24 @@ class ExecutionOptions:
     total_timeout_seconds: float | None = None
 
 
+@dataclass(frozen=True)
+class CommandExecutionContext:
+    lang: str
+    tests_dir: Path
+    solution_path: Path
+    entrypoint: str
+    cases: list[TestCase]
+    default_abs_tol: float | None
+    options: ExecutionOptions
+
+
+@dataclass(frozen=True)
+class ExecutionAttemptResult:
+    passed: bool
+    runtime_ns: int
+    memory_kb: int | None = None
+
+
 def tester_filename(lang: str) -> str:
     return SUPPORTED_LANGS[lang]
 
@@ -209,6 +232,12 @@ def list_tests_result(cases: list[TestCase]) -> dict[str, Any]:
     return {"status": "pass", "passed": [case.id for case in cases], "failed": []}
 
 
+def profile_list_tests_result(cases: list[TestCase]) -> dict[str, Any]:
+    result = list_tests_result(cases)
+    result["runtime_ns"] = {"mean": 0, "std": 0}
+    return result
+
+
 def parse_default_tolerance(raw: str | None) -> float | None:
     if raw is None:
         return None
@@ -231,6 +260,90 @@ def parse_positive_timeout_seconds(raw: str | None) -> float | None:
     if milliseconds <= 0:
         raise DiscoveryError("invalid timeout")
     return milliseconds / 1000.0
+
+
+def parse_positive_int(raw: str | None, name: str) -> int:
+    if raw is None:
+        raise DiscoveryError(f"missing {name}")
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise DiscoveryError(f"invalid {name}") from exc
+    if value <= 0:
+        raise DiscoveryError(f"invalid {name}")
+    return value
+
+
+def parse_non_negative_int(raw: str | None, name: str) -> int:
+    if raw is None:
+        raise DiscoveryError(f"missing {name}")
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise DiscoveryError(f"invalid {name}") from exc
+    if value < 0:
+        raise DiscoveryError(f"invalid {name}")
+    return value
+
+
+def parse_profile_trial_options(args: argparse.Namespace) -> tuple[int, int]:
+    trials = parse_positive_int(args.trials, "trials")
+    warmup = parse_non_negative_int(args.warmup, "warmup")
+    if warmup >= trials:
+        raise DiscoveryError("invalid warmup")
+    return trials, warmup
+
+
+def parse_shared_command_options(args: argparse.Namespace) -> tuple[float | None, ExecutionOptions]:
+    if not is_supported_lang(args.lang):
+        raise DiscoveryError("unsupported language")
+    if args.list_tests and args.run is not None:
+        raise DiscoveryError("invalid selection")
+    default_abs_tol = parse_default_tolerance(args.tol)
+    options = ExecutionOptions(
+        per_test_timeout_seconds=(
+            parse_positive_timeout_seconds(args.timeout_ms)
+            if args.timeout_ms is not None
+            else 10.0
+        ),
+        total_timeout_seconds=parse_positive_timeout_seconds(args.total_timeout_ms),
+    )
+    return default_abs_tol, options
+
+
+def load_command_context(args: argparse.Namespace) -> CommandExecutionContext:
+    default_abs_tol, options = parse_shared_command_options(args)
+    lang = args.lang
+    tests_dir = Path(args.tests_dir)
+    solution_path = Path(args.solution_path)
+    tester_path = tests_dir / tester_filename(lang)
+    if not tester_path.is_file():
+        raise MetadataError("tester missing")
+
+    metadata = read_tester_metadata(tester_path)
+    if metadata["lang"] != lang:
+        raise MetadataError("tester language mismatch")
+
+    entrypoint = metadata["entrypoint"]
+    cases = discover_tests(tests_dir, entrypoint, exclude_paths={solution_path})
+    if args.run is not None:
+        cases = select_cases(cases, args.run)
+    return CommandExecutionContext(
+        lang=lang,
+        tests_dir=tests_dir,
+        solution_path=solution_path,
+        entrypoint=entrypoint,
+        cases=cases,
+        default_abs_tol=default_abs_tol,
+        options=options,
+    )
+
+
+def select_cases(cases: list[TestCase], test_id: str) -> list[TestCase]:
+    selected = [case for case in cases if case.id == test_id]
+    if not selected:
+        raise DiscoveryError("unknown selected test")
+    return selected
 
 
 def render_tester(lang: str, entrypoint: str) -> str:
@@ -4263,6 +4376,33 @@ def execute_case(
     return False
 
 
+def child_memory_kb() -> int:
+    if resource is None:
+        return 0
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    value = int(getattr(usage, "ru_maxrss", 0))
+    return max(value, 0)
+
+
+def execute_case_attempt(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    case: TestCase,
+    default_abs_tol: float | None,
+    timeout_seconds: float | None,
+    measure_memory: bool = False,
+) -> ExecutionAttemptResult:
+    before_memory = child_memory_kb() if measure_memory else 0
+    started = time.perf_counter_ns()
+    passed = execute_case(solution_path, lang, entrypoint, case, default_abs_tol, timeout_seconds)
+    runtime_ns = max(time.perf_counter_ns() - started, 0)
+    memory_kb = None
+    if measure_memory:
+        memory_kb = max(child_memory_kb() - before_memory, 0)
+    return ExecutionAttemptResult(passed=passed, runtime_ns=runtime_ns, memory_kb=memory_kb)
+
+
 def effective_case_timeout(options: ExecutionOptions, total_deadline: float | None) -> float | None:
     timeout = options.per_test_timeout_seconds
     if total_deadline is not None:
@@ -4271,6 +4411,16 @@ def effective_case_timeout(options: ExecutionOptions, total_deadline: float | No
             return 0
         timeout = remaining if timeout is None else min(timeout, remaining)
     return timeout
+
+
+def stats_result(values: list[int]) -> dict[str, float | int]:
+    if not values:
+        return {"mean": 0, "std": 0}
+    mean = sum(values) / len(values)
+    if len(values) == 1:
+        return {"mean": mean, "std": 0}
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return {"mean": mean, "std": math.sqrt(variance)}
 
 
 def aggregate_results(
@@ -4307,6 +4457,77 @@ def aggregate_results(
     return {"status": status, "passed": passed, "failed": failed}
 
 
+def aggregate_profile_results(
+    solution_path: Path,
+    lang: str,
+    entrypoint: str,
+    cases: list[TestCase],
+    default_abs_tol: float | None,
+    options: ExecutionOptions,
+    trials: int,
+    warmup: int,
+    measure_memory: bool = False,
+) -> dict[str, Any]:
+    failed_ids: set[str] = set()
+    runtime_values: list[int] = []
+    memory_values: list[int] = []
+    total_deadline = (
+        time.monotonic() + options.total_timeout_seconds
+        if options.total_timeout_seconds is not None
+        else None
+    )
+    attempts = [False] * warmup + [True] * trials
+    stop = False
+
+    try:
+        for case_index, case in enumerate(cases):
+            for attempt_index, measured in enumerate(attempts):
+                timeout_seconds = effective_case_timeout(options, total_deadline)
+                if timeout_seconds == 0:
+                    failed_ids.update(remaining_case.id for remaining_case in cases[case_index:])
+                    stop = True
+                    break
+
+                attempt = execute_case_attempt(
+                    solution_path,
+                    lang,
+                    entrypoint,
+                    case,
+                    default_abs_tol,
+                    timeout_seconds,
+                    measure_memory=measure_memory and measured,
+                )
+                if not attempt.passed:
+                    failed_ids.add(case.id)
+                if measured:
+                    runtime_values.append(attempt.runtime_ns)
+                    if measure_memory:
+                        memory_values.append(attempt.memory_kb or 0)
+
+                if total_deadline is not None and time.monotonic() >= total_deadline:
+                    if attempt_index < len(attempts) - 1:
+                        failed_ids.add(case.id)
+                    failed_ids.update(remaining_case.id for remaining_case in cases[case_index + 1 :])
+                    stop = True
+                    break
+            if stop:
+                break
+    except ExecutionSetupError:
+        return error_result()
+
+    failed = [case.id for case in cases if case.id in failed_ids]
+    passed = [case.id for case in cases if case.id not in failed_ids]
+    result: dict[str, Any] = {
+        "status": "pass" if not failed else "fail",
+        "passed": passed,
+        "failed": failed,
+        "runtime_ns": stats_result(runtime_values),
+    }
+    if measure_memory:
+        result["memory_kb"] = stats_result(memory_values)
+    return result
+
+
 def command_generate(args: argparse.Namespace) -> int:
     lang = args.lang
     tests_dir = Path(args.tests_dir)
@@ -4337,62 +4558,53 @@ def command_generate(args: argparse.Namespace) -> int:
 
 
 def command_test(args: argparse.Namespace) -> int:
-    lang = args.lang
-    if not is_supported_lang(lang):
-        print_json_result(error_result())
-        return 2
-    if args.list_tests and args.run is not None:
-        print_json_result(error_result())
-        return 2
     try:
-        default_abs_tol = parse_default_tolerance(args.tol)
-        options = ExecutionOptions(
-            per_test_timeout_seconds=(
-                parse_positive_timeout_seconds(args.timeout_ms)
-                if args.timeout_ms is not None
-                else 10.0
-            ),
-            total_timeout_seconds=parse_positive_timeout_seconds(args.total_timeout_ms),
-        )
-    except DiscoveryError:
-        print_json_result(error_result())
-        return 2
-
-    tests_dir = Path(args.tests_dir)
-    tester_path = tests_dir / tester_filename(lang)
-    if not tester_path.is_file():
-        print_json_result(error_result())
-        return 2
-
-    try:
-        metadata = read_tester_metadata(tester_path)
-    except MetadataError:
-        print_json_result(error_result())
-        return 2
-    if metadata["lang"] != lang:
-        print_json_result(error_result())
-        return 2
-
-    entrypoint = metadata["entrypoint"]
-    try:
-        cases = discover_tests(tests_dir, entrypoint, exclude_paths={Path(args.solution_path)})
-    except DiscoveryError:
+        context = load_command_context(args)
+    except (DiscoveryError, MetadataError):
         print_json_result(error_result())
         return 2
 
     if args.list_tests:
-        result = list_tests_result(cases)
+        result = list_tests_result(context.cases)
         print_json_result(result)
         return status_exit_code(result["status"])
 
-    if args.run is not None:
-        selected = [case for case in cases if case.id == args.run]
-        if not selected:
-            print_json_result(error_result())
-            return 2
-        cases = selected
+    result = aggregate_results(
+        context.solution_path,
+        context.lang,
+        context.entrypoint,
+        context.cases,
+        context.default_abs_tol,
+        context.options,
+    )
+    print_json_result(result)
+    return status_exit_code(result["status"])
 
-    result = aggregate_results(Path(args.solution_path), lang, entrypoint, cases, default_abs_tol, options)
+
+def command_profile(args: argparse.Namespace) -> int:
+    try:
+        trials, warmup = parse_profile_trial_options(args)
+        context = load_command_context(args)
+    except (DiscoveryError, MetadataError):
+        print_json_result(error_result())
+        return 2
+
+    if args.list_tests:
+        result = profile_list_tests_result(context.cases)
+        print_json_result(result)
+        return status_exit_code(result["status"])
+
+    result = aggregate_profile_results(
+        context.solution_path,
+        context.lang,
+        context.entrypoint,
+        context.cases,
+        context.default_abs_tol,
+        context.options,
+        trials,
+        warmup,
+        measure_memory=args.memory,
+    )
     print_json_result(result)
     return status_exit_code(result["status"])
 
@@ -4417,6 +4629,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms")
     test.add_argument("--total-timeout-ms")
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("-n", dest="trials", default="1")
+    profile.add_argument("--warmup", default="0")
+    profile.add_argument("--memory", action="store_true")
+    profile.add_argument("--tol")
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms")
+    profile.add_argument("--total-timeout-ms")
+    profile.set_defaults(func=command_profile)
 
     return parser
 
