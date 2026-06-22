@@ -1,0 +1,380 @@
+{
+  "version": "1.0",
+  "updatedAt": "2026-06-22T13:45:11.002Z",
+  "nodes": [
+    {
+      "id": "babel-code-goat-cli",
+      "label": "Capability",
+      "name": "babel-code-goat-cli",
+      "text": "babel-code-goat-cli",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts",
+      "label": "DeltaSpec",
+      "name": "add-async-test-selection-timeouts",
+      "text": "## ADDED Requirements\n\n### Requirement: Async Entrypoint Execution\nThe system SHALL run each discovered entrypoint invocation to completion before evaluating the test result when the target language produces an async or awaitable result. Async completion MUST apply consistently for direct assertions, loop-discovered assertions, mutation-style tests, raw output expectations, and exception expectation blocks. If an async invocation does not complete before the effective timeout, the corresponding test ID MUST appear in `failed`.\n\n#### Scenario: Python awaitable result is awaited\n- **GIVEN** a generated Python tester and a Python solution whose configured entrypoint is `async def solve(...)`\n- **WHEN** `test <solution.py> <tests_dir> --lang python` runs a discovered assertion against that entrypoint\n- **THEN** the harness awaits the coroutine result before evaluating the assertion outcome\n\n#### Scenario: JavaScript promise result is awaited\n- **GIVEN** a generated JavaScript tester and a JavaScript solution whose configured entrypoint returns a `Promise`\n- **WHEN** `test <solution.js> <tests_dir> --lang javascript` runs a discovered assertion against that entrypoint\n- **THEN** the harness waits for the promise to settle before evaluating the assertion outcome\n\n#### Scenario: TypeScript promise result is awaited\n- **GIVEN** a generated TypeScript tester and a TypeScript solution whose configured entrypoint returns a `Promise`\n- **WHEN** `test <solution.ts> <tests_dir> --lang typescript` runs a discovered assertion against that entrypoint\n- **THEN** the harness waits for the promise to settle before evaluating the assertion outcome\n\n#### Scenario: C++ future-like result is completed\n- **GIVEN** a generated C++ tester and a C++ solution whose configured entrypoint returns a supported future-like result such as `std::future<T>`\n- **WHEN** `test <solution.cpp> <tests_dir> --lang cpp` runs a discovered assertion against that entrypoint\n- **THEN** the harness obtains the completed value before evaluating the assertion outcome\n\n#### Scenario: Rust future result is completed\n- **GIVEN** a generated Rust tester and a Rust solution whose configured entrypoint returns a supported future result\n- **WHEN** `test <solution.rs> <tests_dir> --lang rust` runs a discovered assertion against that entrypoint\n- **THEN** the harness drives the future to completion before evaluating the assertion outcome\n\n#### Scenario: Async exception expectation is evaluated after completion\n- **GIVEN** a discovered raise-any or typed exception expectation whose configured entrypoint raises, rejects, throws, or panics asynchronously\n- **WHEN** `test` runs the expectation for any supported target language\n- **THEN** the expectation passes only when the completed async outcome matches the expected exception behavior\n\n### Requirement: Test Listing and Selection\nThe `test` command SHALL accept `--list-tests` and `--run <test_id>` flags. Listing tests MUST perform normal validation and discovery but MUST NOT execute the solution entrypoint. Selecting a test MUST execute only the discovered test with the requested ID. `--list-tests` and `--run` MUST NOT be used together.\n\n#### Scenario: List tests reports discovered IDs\n- **GIVEN** the expected tester file exists and discovery succeeds\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command prints exactly one JSON line with `status` set to `pass`, `passed` containing every discovered test ID in discovery order, `failed` set to an empty array, and exits with code 0\n\n#### Scenario: List tests does not execute the solution\n- **GIVEN** discovery succeeds and the supplied solution path is missing, invalid, or would fail if executed\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command reports the discovered IDs without loading or invoking the solution\n\n#### Scenario: Run selected test reports only that ID\n- **GIVEN** discovery includes test IDs `tests.py:1` and `tests.py:2`\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --run tests.py:2` is invoked\n- **THEN** only `tests.py:2` appears in either `passed` or `failed`\n\n#### Scenario: Unknown selected test is an error\n- **GIVEN** discovery succeeds and does not include the requested test ID\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --run missing.py:1` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2\n\n#### Scenario: Listing and selection are mutually exclusive\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --list-tests --run tests.py:1` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2\n\n### Requirement: Test Execution Timeouts\nThe `test` command SHALL accept `--timeout-ms <int>` as the per-test execution timeout and `--total-timeout-ms <int>` as the whole-command execution timeout. Timeout values MUST be positive integer millisecond durations. Timed out tests and tests not executed because the total timeout has elapsed MUST appear in `failed` according to the coverage rule. Timeout failures after successful discovery MUST use `status` `fail` and exit code 1.\n\n#### Scenario: Per-test timeout fails the timed out test\n- **GIVEN** discovery includes `tests.py:1` and its entrypoint invocation does not complete within the requested per-test timeout\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --timeout-ms 50` is invoked\n- **THEN** `tests.py:1` appears in `failed`, does not appear in `passed`, the output status is `fail`, and the command exits with code 1\n\n#### Scenario: Total timeout marks remaining in-scope tests failed\n- **GIVEN** discovery includes `tests.py:1`, `tests.py:2`, and `tests.py:3`\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --total-timeout-ms 100` exhausts the total timeout before all in-scope tests execute\n- **THEN** every not-yet-executed in-scope test ID appears in `failed`, already passed tests remain in `passed`, the output status is `fail`, and the command exits with code 1\n\n#### Scenario: Total timeout respects selected test scope\n- **GIVEN** discovery includes `tests.py:1` and `tests.py:2`\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --run tests.py:2 --total-timeout-ms 100` times out before the selected test completes\n- **THEN** only `tests.py:2` appears in `failed`\n\n#### Scenario: Timeout values are validated\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --timeout-ms 0`, `--timeout-ms -1`, or `--total-timeout-ms nope` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null,
+      "hasTag": true
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "label": "Requirement",
+      "name": "Async Entrypoint Execution",
+      "text": "The system SHALL run each discovered entrypoint invocation to completion before evaluating the test result when the target language produces an async or awaitable result. Async completion MUST apply consistently for direct assertions, loop-discovered assertions, mutation-style tests, raw output expectations, and exception expectation blocks. If an async invocation does not complete before the effective timeout, the corresponding test ID MUST appear in `failed`.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-python-awaitable-result-is-awaited",
+      "label": "Scenario",
+      "name": "Async Entrypoint Execution/python-awaitable-result-is-awaited",
+      "text": "- **GIVEN** a generated Python tester and a Python solution whose configured entrypoint is `async def solve(...)`\n- **WHEN** `test <solution.py> <tests_dir> --lang python` runs a discovered assertion against that entrypoint\n- **THEN** the harness awaits the coroutine result before evaluating the assertion outcome",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-javascript-promise-result-is-awaited",
+      "label": "Scenario",
+      "name": "Async Entrypoint Execution/javascript-promise-result-is-awaited",
+      "text": "- **GIVEN** a generated JavaScript tester and a JavaScript solution whose configured entrypoint returns a `Promise`\n- **WHEN** `test <solution.js> <tests_dir> --lang javascript` runs a discovered assertion against that entrypoint\n- **THEN** the harness waits for the promise to settle before evaluating the assertion outcome",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-typescript-promise-result-is-awaited",
+      "label": "Scenario",
+      "name": "Async Entrypoint Execution/typescript-promise-result-is-awaited",
+      "text": "- **GIVEN** a generated TypeScript tester and a TypeScript solution whose configured entrypoint returns a `Promise`\n- **WHEN** `test <solution.ts> <tests_dir> --lang typescript` runs a discovered assertion against that entrypoint\n- **THEN** the harness waits for the promise to settle before evaluating the assertion outcome",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-c-future-like-result-is-completed",
+      "label": "Scenario",
+      "name": "Async Entrypoint Execution/c-future-like-result-is-completed",
+      "text": "- **GIVEN** a generated C++ tester and a C++ solution whose configured entrypoint returns a supported future-like result such as `std::future<T>`\n- **WHEN** `test <solution.cpp> <tests_dir> --lang cpp` runs a discovered assertion against that entrypoint\n- **THEN** the harness obtains the completed value before evaluating the assertion outcome",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-rust-future-result-is-completed",
+      "label": "Scenario",
+      "name": "Async Entrypoint Execution/rust-future-result-is-completed",
+      "text": "- **GIVEN** a generated Rust tester and a Rust solution whose configured entrypoint returns a supported future result\n- **WHEN** `test <solution.rs> <tests_dir> --lang rust` runs a discovered assertion against that entrypoint\n- **THEN** the harness drives the future to completion before evaluating the assertion outcome",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-async-exception-expectation-is-evaluated-after-completion",
+      "label": "Scenario",
+      "name": "Async Entrypoint Execution/async-exception-expectation-is-evaluated-after-completion",
+      "text": "- **GIVEN** a discovered raise-any or typed exception expectation whose configured entrypoint raises, rejects, throws, or panics asynchronously\n- **WHEN** `test` runs the expectation for any supported target language\n- **THEN** the expectation passes only when the completed async outcome matches the expected exception behavior",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "label": "Requirement",
+      "name": "Test Listing and Selection",
+      "text": "The `test` command SHALL accept `--list-tests` and `--run <test_id>` flags. Listing tests MUST perform normal validation and discovery but MUST NOT execute the solution entrypoint. Selecting a test MUST execute only the discovered test with the requested ID. `--list-tests` and `--run` MUST NOT be used together.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-list-tests-reports-discovered-ids",
+      "label": "Scenario",
+      "name": "Test Listing and Selection/list-tests-reports-discovered-ids",
+      "text": "- **GIVEN** the expected tester file exists and discovery succeeds\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command prints exactly one JSON line with `status` set to `pass`, `passed` containing every discovered test ID in discovery order, `failed` set to an empty array, and exits with code 0",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-list-tests-does-not-execute-the-solution",
+      "label": "Scenario",
+      "name": "Test Listing and Selection/list-tests-does-not-execute-the-solution",
+      "text": "- **GIVEN** discovery succeeds and the supplied solution path is missing, invalid, or would fail if executed\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --list-tests` is invoked\n- **THEN** the command reports the discovered IDs without loading or invoking the solution",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-run-selected-test-reports-only-that-id",
+      "label": "Scenario",
+      "name": "Test Listing and Selection/run-selected-test-reports-only-that-id",
+      "text": "- **GIVEN** discovery includes test IDs `tests.py:1` and `tests.py:2`\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --run tests.py:2` is invoked\n- **THEN** only `tests.py:2` appears in either `passed` or `failed`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-unknown-selected-test-is-an-error",
+      "label": "Scenario",
+      "name": "Test Listing and Selection/unknown-selected-test-is-an-error",
+      "text": "- **GIVEN** discovery succeeds and does not include the requested test ID\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --run missing.py:1` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-listing-and-selection-are-mutually-exclusive",
+      "label": "Scenario",
+      "name": "Test Listing and Selection/listing-and-selection-are-mutually-exclusive",
+      "text": "- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --list-tests --run tests.py:1` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "label": "Requirement",
+      "name": "Test Execution Timeouts",
+      "text": "The `test` command SHALL accept `--timeout-ms <int>` as the per-test execution timeout and `--total-timeout-ms <int>` as the whole-command execution timeout. Timeout values MUST be positive integer millisecond durations. Timed out tests and tests not executed because the total timeout has elapsed MUST appear in `failed` according to the coverage rule. Timeout failures after successful discovery MUST use `status` `fail` and exit code 1.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-per-test-timeout-fails-the-timed-out-test",
+      "label": "Scenario",
+      "name": "Test Execution Timeouts/per-test-timeout-fails-the-timed-out-test",
+      "text": "- **GIVEN** discovery includes `tests.py:1` and its entrypoint invocation does not complete within the requested per-test timeout\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --timeout-ms 50` is invoked\n- **THEN** `tests.py:1` appears in `failed`, does not appear in `passed`, the output status is `fail`, and the command exits with code 1",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-total-timeout-marks-remaining-in-scope-tests-failed",
+      "label": "Scenario",
+      "name": "Test Execution Timeouts/total-timeout-marks-remaining-in-scope-tests-failed",
+      "text": "- **GIVEN** discovery includes `tests.py:1`, `tests.py:2`, and `tests.py:3`\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --total-timeout-ms 100` exhausts the total timeout before all in-scope tests execute\n- **THEN** every not-yet-executed in-scope test ID appears in `failed`, already passed tests remain in `passed`, the output status is `fail`, and the command exits with code 1",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-total-timeout-respects-selected-test-scope",
+      "label": "Scenario",
+      "name": "Test Execution Timeouts/total-timeout-respects-selected-test-scope",
+      "text": "- **GIVEN** discovery includes `tests.py:1` and `tests.py:2`\n- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --run tests.py:2 --total-timeout-ms 100` times out before the selected test completes\n- **THEN** only `tests.py:2` appears in `failed`",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-timeout-values-are-validated",
+      "label": "Scenario",
+      "name": "Test Execution Timeouts/timeout-values-are-validated",
+      "text": "- **WHEN** `test <solution_path> <tests_dir> --lang <target_lang> --timeout-ms 0`, `--timeout-ms -1`, or `--total-timeout-ms nope` is invoked\n- **THEN** the command prints exactly `{\"status\":\"error\",\"passed\":[],\"failed\":[]}` as one stdout line and exits with code 2",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.992Z",
+      "validTo": null,
+      "embedding": null
+    },
+    {
+      "id": "add-async-test-selection-timeouts",
+      "label": "Intent",
+      "name": "add-async-test-selection-timeouts",
+      "text": "Async solutions and async-style tests should run to completion in every supported target instead of being treated like ordinary synchronous return values. The `test` command also needs explicit discovery listing, single-test selection, and timeout controls so callers can inspect, isolate, and bound harness execution.",
+      "type": "",
+      "status": "ACTIVE",
+      "validFrom": "2026-06-22T13:45:10.999Z",
+      "validTo": null,
+      "embedding": null,
+      "hasTag": true
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge:babel-code-goat-cli:has_delta_spec:babel-code-goat-cli/add-async-test-selection-timeouts",
+      "type": "HAS_DELTA_SPEC",
+      "from": "babel-code-goat-cli",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts:has_requirement:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-python-awaitable-result-is-awaited",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-python-awaitable-result-is-awaited",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-javascript-promise-result-is-awaited",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-javascript-promise-result-is-awaited",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-typescript-promise-result-is-awaited",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-typescript-promise-result-is-awaited",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-c-future-like-result-is-completed",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-c-future-like-result-is-completed",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-rust-future-result-is-completed",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-rust-future-result-is-completed",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-async-exception-expectation-is-evaluated-after-completion",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/async-entrypoint-execution/async-entrypoint-execution-async-exception-expectation-is-evaluated-after-completion",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts:has_requirement:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-list-tests-reports-discovered-ids",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-list-tests-reports-discovered-ids",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-list-tests-does-not-execute-the-solution",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-list-tests-does-not-execute-the-solution",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-run-selected-test-reports-only-that-id",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-run-selected-test-reports-only-that-id",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-unknown-selected-test-is-an-error",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-unknown-selected-test-is-an-error",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-listing-and-selection-are-mutually-exclusive",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-listing-and-selection/test-listing-and-selection-listing-and-selection-are-mutually-exclusive",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts:has_requirement:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "type": "HAS_REQUIREMENT",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-per-test-timeout-fails-the-timed-out-test",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-per-test-timeout-fails-the-timed-out-test",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-total-timeout-marks-remaining-in-scope-tests-failed",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-total-timeout-marks-remaining-in-scope-tests-failed",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-total-timeout-respects-selected-test-scope",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-total-timeout-respects-selected-test-scope",
+      "confidence": 1
+    },
+    {
+      "id": "edge:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts:has_scenario:babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-timeout-values-are-validated",
+      "type": "HAS_SCENARIO",
+      "from": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts/test-execution-timeouts/test-execution-timeouts-timeout-values-are-validated",
+      "confidence": 1
+    },
+    {
+      "id": "edge:add-async-test-selection-timeouts:has_delta_spec:babel-code-goat-cli/add-async-test-selection-timeouts",
+      "type": "HAS_DELTA_SPEC",
+      "from": "add-async-test-selection-timeouts",
+      "to": "babel-code-goat-cli/add-async-test-selection-timeouts"
+    }
+  ]
+}
