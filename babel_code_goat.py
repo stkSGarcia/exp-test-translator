@@ -44,6 +44,7 @@ class TestCase:
     tolerance: dict[str, Any] | None = None
     expected_exception: str | None = None
     message_match: dict[str, str] | None = None
+    expression: dict[str, Any] | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
 
@@ -57,6 +58,7 @@ class TestCase:
             "tolerance": self.tolerance,
             "expected_exception": self.expected_exception,
             "message_match": self.message_match,
+            "expression": self.expression,
             "expect_stdout": self.expect_stdout,
             "expect_stderr": self.expect_stderr,
         }
@@ -65,6 +67,13 @@ class TestCase:
 @dataclass
 class DiscoveryContext:
     names: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ExpressionBuild:
+    expression: dict[str, Any]
+    args: list[Any] | None
+    call_count: int
 
 
 ALLOWED_IMPORTS = {
@@ -278,6 +287,152 @@ def parse_entrypoint_call(node: ast.AST, entrypoint: str, context: DiscoveryCont
     return [value_from_node(arg, context) for arg in node.args]
 
 
+def entrypoint_call_count(node: ast.AST, entrypoint: str) -> int:
+    count = 0
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == entrypoint:
+            count += 1
+    return count
+
+
+def merge_expression_args(parts: list[ExpressionBuild]) -> tuple[list[Any] | None, int]:
+    args = None
+    call_count = 0
+    for part in parts:
+        call_count += part.call_count
+        if part.args is not None:
+            args = part.args
+    return args, call_count
+
+
+def const_expression(node: ast.AST, context: DiscoveryContext) -> ExpressionBuild:
+    return ExpressionBuild({"op": "const", "value": value_from_node(node, context)}, None, 0)
+
+
+def expression_from_node(node: ast.AST, entrypoint: str, context: DiscoveryContext) -> ExpressionBuild:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == entrypoint:
+        return ExpressionBuild({"op": "actual"}, parse_entrypoint_call(node, entrypoint, context), 1)
+
+    if isinstance(node, ast.Call):
+        callee = resolve_callee(node.func, context)
+        if callee in {"sorted", "abs"}:
+            if node.keywords or len(node.args) != 1:
+                raise DiscoveryError("unsupported primitive helper call")
+            operand = expression_from_node(node.args[0], entrypoint, context)
+            return ExpressionBuild(
+                {"op": "call", "function": callee, "args": [operand.expression]},
+                operand.args,
+                operand.call_count,
+            )
+        if entrypoint_call_count(node, entrypoint):
+            raise DiscoveryError("unsupported helper call")
+        return const_expression(node, context)
+
+    if isinstance(node, ast.Constant | ast.List | ast.Tuple | ast.Set | ast.Dict):
+        if entrypoint_call_count(node, entrypoint):
+            raise DiscoveryError("unsupported container expression")
+        return const_expression(node, context)
+
+    if isinstance(node, ast.UnaryOp):
+        unary_ops = {
+            ast.Not: "not",
+            ast.USub: "neg",
+            ast.UAdd: "pos",
+        }
+        operator = next((name for op_type, name in unary_ops.items() if isinstance(node.op, op_type)), None)
+        if operator is None:
+            raise DiscoveryError("unsupported unary expression")
+        operand = expression_from_node(node.operand, entrypoint, context)
+        return ExpressionBuild(
+            {"op": "unary", "operator": operator, "operand": operand.expression},
+            operand.args,
+            operand.call_count,
+        )
+
+    if isinstance(node, ast.BinOp):
+        binary_ops = {
+            ast.Add: "add",
+            ast.Sub: "sub",
+            ast.Mult: "mul",
+            ast.Div: "div",
+            ast.FloorDiv: "floordiv",
+            ast.Mod: "mod",
+            ast.Pow: "pow",
+        }
+        operator = next((name for op_type, name in binary_ops.items() if isinstance(node.op, op_type)), None)
+        if operator is None:
+            raise DiscoveryError("unsupported binary expression")
+        left = expression_from_node(node.left, entrypoint, context)
+        right = expression_from_node(node.right, entrypoint, context)
+        args, call_count = merge_expression_args([left, right])
+        return ExpressionBuild(
+            {"op": "binary", "operator": operator, "left": left.expression, "right": right.expression},
+            args,
+            call_count,
+        )
+
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            operator = "and"
+        elif isinstance(node.op, ast.Or):
+            operator = "or"
+        else:
+            raise DiscoveryError("unsupported boolean expression")
+        values = [expression_from_node(value, entrypoint, context) for value in node.values]
+        args, call_count = merge_expression_args(values)
+        return ExpressionBuild(
+            {"op": "bool", "operator": operator, "values": [value.expression for value in values]},
+            args,
+            call_count,
+        )
+
+    if isinstance(node, ast.Compare):
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise DiscoveryError("unsupported comparison expression")
+        compare_ops = {
+            ast.Eq: "eq",
+            ast.NotEq: "neq",
+            ast.In: "in",
+            ast.NotIn: "not_in",
+            ast.Lt: "lt",
+            ast.LtE: "lte",
+            ast.Gt: "gt",
+            ast.GtE: "gte",
+        }
+        operator = next((name for op_type, name in compare_ops.items() if isinstance(node.ops[0], op_type)), None)
+        if operator is None:
+            raise DiscoveryError("unsupported comparison expression")
+        left = expression_from_node(node.left, entrypoint, context)
+        right = expression_from_node(node.comparators[0], entrypoint, context)
+        args, call_count = merge_expression_args([left, right])
+        return ExpressionBuild(
+            {"op": "compare", "operator": operator, "left": left.expression, "right": right.expression},
+            args,
+            call_count,
+        )
+
+    if isinstance(node, ast.Subscript):
+        if isinstance(node.slice, ast.Slice):
+            raise DiscoveryError("unsupported slice expression")
+        value = expression_from_node(node.value, entrypoint, context)
+        index = expression_from_node(node.slice, entrypoint, context)
+        args, call_count = merge_expression_args([value, index])
+        return ExpressionBuild(
+            {"op": "index", "value": value.expression, "index": index.expression},
+            args,
+            call_count,
+        )
+
+    raise DiscoveryError("unsupported primitive expression")
+
+
+def parse_expression_assertion(test: ast.AST, entrypoint: str, context: DiscoveryContext) -> tuple[list[Any], dict[str, Any]]:
+    parsed = expression_from_node(test, entrypoint, context)
+    if parsed.call_count != 1 or parsed.args is None:
+        raise DiscoveryError("assertion must contain exactly one entrypoint call")
+    return parsed.args, parsed.expression
+
+
 def parse_math_isclose(test: ast.Call, entrypoint: str, context: DiscoveryContext) -> tuple[list[Any], Any, dict[str, Any]]:
     if resolve_callee(test.func, context) not in {"math.isclose", "isclose"}:
         raise DiscoveryError("unsupported function assertion")
@@ -327,6 +482,7 @@ def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str], context: D
     args: list[Any]
     expected: Any = None
     tolerance: dict[str, Any] | None = None
+    expression: dict[str, Any] | None = None
 
     if isinstance(test, ast.Call) and resolve_callee(test.func, context) in {"math.isclose", "isclose"}:
         kind = "eq"
@@ -338,21 +494,36 @@ def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str], context: D
     ):
         kind = "eq"
         args, expected, tolerance = parse_abs_difference(test, entrypoint, context)
-    elif isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
+    elif (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and len(test.comparators) == 1
+        and isinstance(test.ops[0], ast.Eq | ast.NotEq)
+    ):
         if isinstance(test.ops[0], ast.Eq):
             kind = "eq"
-        elif isinstance(test.ops[0], ast.NotEq):
-            kind = "neq"
         else:
-            raise DiscoveryError("unsupported comparison assertion")
-        args = parse_entrypoint_call(test.left, entrypoint, context)
-        expected = value_from_node(test.comparators[0], context)
+            kind = "neq"
+        try:
+            args = parse_entrypoint_call(test.left, entrypoint, context)
+            expected = value_from_node(test.comparators[0], context)
+        except DiscoveryError:
+            kind = "expr"
+            args, expression = parse_expression_assertion(test, entrypoint, context)
     elif isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        kind = "falsy"
-        args = parse_entrypoint_call(test.operand, entrypoint, context)
+        try:
+            kind = "falsy"
+            args = parse_entrypoint_call(test.operand, entrypoint, context)
+        except DiscoveryError:
+            kind = "expr"
+            args, expression = parse_expression_assertion(test, entrypoint, context)
     else:
-        kind = "truthy"
-        args = parse_entrypoint_call(test, entrypoint, context)
+        try:
+            kind = "truthy"
+            args = parse_entrypoint_call(test, entrypoint, context)
+        except DiscoveryError:
+            kind = "expr"
+            args, expression = parse_expression_assertion(test, entrypoint, context)
 
     expect_stdout, expect_stderr = parse_expectations(lines, node.lineno)
     return TestCase(
@@ -362,6 +533,7 @@ def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str], context: D
         args=args,
         expected=expected,
         tolerance=tolerance,
+        expression=expression,
         expect_stdout=expect_stdout,
         expect_stderr=expect_stderr,
     )
@@ -515,6 +687,7 @@ def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
                 tolerance=test_case.tolerance,
                 expected_exception=test_case.expected_exception,
                 message_match=test_case.message_match,
+                expression=test_case.expression,
                 expect_stdout=test_case.expect_stdout,
                 expect_stderr=test_case.expect_stderr,
             )
@@ -698,6 +871,129 @@ def decode_arg(value: Any) -> Any:
     return value
 
 
+def normalize_comparable(value: Any) -> Any:
+    if is_tagged(value):
+        return value
+    return normalize_runtime_value(value)
+
+
+def expression_contains(container: Any, needle: Any, tolerance: dict[str, Any]) -> bool:
+    if isinstance(container, str) and isinstance(needle, str):
+        return needle in container
+    normalized_needle = normalize_comparable(needle)
+    if is_tagged(container, "dict"):
+        return any(deep_compare(key, normalized_needle, tolerance) for key, _ in container["items"])
+    if is_tagged(container, "set") or is_tagged(container, "deque"):
+        return any(deep_compare(item, normalized_needle, tolerance) for item in container["items"])
+    if isinstance(container, dict):
+        return any(deep_compare(normalize_comparable(key), normalized_needle, tolerance) for key in container)
+    if isinstance(container, list | tuple | set | frozenset | deque):
+        return any(deep_compare(normalize_comparable(item), normalized_needle, tolerance) for item in container)
+    return False
+
+
+def expression_index(value: Any, index: Any) -> Any:
+    if is_tagged(value, "dict"):
+        for key, item in value["items"]:
+            if deep_compare(key, normalize_comparable(index), {"mode": "default", "abs": 0.0, "rel": 0.0}):
+                return item
+        raise KeyError(index)
+    if is_tagged(value, "deque"):
+        return value["items"][index]
+    return value[index]
+
+
+def expression_sorted(value: Any) -> Any:
+    if isinstance(value, str):
+        return sorted(value)
+    if is_tagged(value, "set") or is_tagged(value, "deque"):
+        return sort_tagged_values(list(value["items"]))
+    return sorted(value)
+
+
+def evaluate_expression(expression: dict[str, Any], actual: Any, tolerance: dict[str, Any]) -> Any:
+    op = expression.get("op")
+    if op == "const":
+        return expression.get("value")
+    if op == "actual":
+        return actual
+    if op == "unary":
+        operand = evaluate_expression(expression["operand"], actual, tolerance)
+        operator = expression.get("operator")
+        if operator == "not":
+            return not bool(operand)
+        if operator == "neg":
+            return -operand
+        if operator == "pos":
+            return +operand
+    if op == "binary":
+        left = evaluate_expression(expression["left"], actual, tolerance)
+        right = evaluate_expression(expression["right"], actual, tolerance)
+        operator = expression.get("operator")
+        if operator == "add":
+            return left + right
+        if operator == "sub":
+            return left - right
+        if operator == "mul":
+            return left * right
+        if operator == "div":
+            return left / right
+        if operator == "floordiv":
+            return left // right
+        if operator == "mod":
+            return left % right
+        if operator == "pow":
+            return left**right
+    if op == "bool":
+        values = [evaluate_expression(value, actual, tolerance) for value in expression["values"]]
+        if expression.get("operator") == "and":
+            return all(bool(value) for value in values)
+        if expression.get("operator") == "or":
+            return any(bool(value) for value in values)
+    if op == "compare":
+        left = evaluate_expression(expression["left"], actual, tolerance)
+        right = evaluate_expression(expression["right"], actual, tolerance)
+        operator = expression.get("operator")
+        if operator == "eq":
+            return deep_compare(normalize_comparable(left), normalize_comparable(right), tolerance)
+        if operator == "neq":
+            return not deep_compare(normalize_comparable(left), normalize_comparable(right), tolerance)
+        if operator == "in":
+            return expression_contains(right, left, tolerance)
+        if operator == "not_in":
+            return not expression_contains(right, left, tolerance)
+        left_num = numeric_decimal(normalize_comparable(left))
+        right_num = numeric_decimal(normalize_comparable(right))
+        if left_num is not None and right_num is not None:
+            if operator == "lt":
+                return left_num < right_num
+            if operator == "lte":
+                return left_num <= right_num
+            if operator == "gt":
+                return left_num > right_num
+            if operator == "gte":
+                return left_num >= right_num
+        if operator == "lt":
+            return left < right
+        if operator == "lte":
+            return left <= right
+        if operator == "gt":
+            return left > right
+        if operator == "gte":
+            return left >= right
+    if op == "index":
+        value = evaluate_expression(expression["value"], actual, tolerance)
+        index = evaluate_expression(expression["index"], actual, tolerance)
+        return expression_index(value, index)
+    if op == "call":
+        args = [evaluate_expression(arg, actual, tolerance) for arg in expression["args"]]
+        if expression.get("function") == "sorted":
+            return expression_sorted(args[0])
+        if expression.get("function") == "abs":
+            return abs(args[0])
+    raise RuntimeError("unsupported expression")
+
+
 def resolve_python_callable(solution_path: Path, entrypoint: str) -> Any:
     spec = importlib.util.spec_from_file_location("babel_code_goat_solution", solution_path)
     if spec is None or spec.loader is None:
@@ -755,11 +1051,13 @@ def execute_python_tests(
                     )
                 elif raised:
                     ok = False
+                elif test["kind"] == "expr":
+                    ok = bool(evaluate_expression(test["expression"], actual, tolerance_policy(test, default_tol)))
                 elif test["kind"] == "eq":
-                    ok = deep_compare(test["expected"], normalize_runtime_value(actual), tolerance_policy(test, default_tol))
+                    ok = deep_compare(test["expected"], normalize_comparable(actual), tolerance_policy(test, default_tol))
                 elif test["kind"] == "neq":
                     ok = not deep_compare(
-                        test["expected"], normalize_runtime_value(actual), tolerance_policy(test, default_tol)
+                        test["expected"], normalize_comparable(actual), tolerance_policy(test, default_tol)
                     )
                 elif test["kind"] == "truthy":
                     ok = bool(actual)
@@ -960,6 +1258,94 @@ function messageMatches(error, matcher) {{
   return false;
 }}
 
+function containsValue(container, needle, tolerance) {{
+  if (typeof container === "string" && typeof needle === "string") return container.includes(needle);
+  const normalizedNeedle = normalize(needle);
+  if (isTagged(container, "dict")) return container.items.some(([key]) => deepEqual(key, normalizedNeedle, tolerance));
+  if (isTagged(container, "set") || isTagged(container, "deque")) return container.items.some(item => deepEqual(item, normalizedNeedle, tolerance));
+  if (Array.isArray(container)) return container.some(item => deepEqual(normalize(item), normalizedNeedle, tolerance));
+  if (container instanceof Set) return Array.from(container).some(item => deepEqual(normalize(item), normalizedNeedle, tolerance));
+  if (container instanceof Map) return Array.from(container.keys()).some(key => deepEqual(normalize(key), normalizedNeedle, tolerance));
+  if (container && typeof container === "object") return Object.keys(container).some(key => deepEqual(key, normalizedNeedle, tolerance));
+  return false;
+}}
+
+function expressionIndex(value, index) {{
+  if (isTagged(value, "dict")) {{
+    for (const [key, item] of value.items) {{
+      if (deepEqual(key, normalize(index), {{mode: "default", abs: 0, rel: 0}})) return item;
+    }}
+    throw new Error("missing key");
+  }}
+  if (isTagged(value, "deque")) return value.items[index];
+  if (value instanceof Map) return value.get(index);
+  return value[index];
+}}
+
+function expressionSorted(value) {{
+  const items = typeof value === "string" ? value.split("") :
+    isTagged(value, "set") || isTagged(value, "deque") ? value.items.slice() :
+    Array.from(value);
+  return items.sort((a, b) => {{
+    const aNum = numericValue(a);
+    const bNum = numericValue(b);
+    if (aNum !== null && bNum !== null) return aNum - bNum;
+    return stable(normalize(a)).localeCompare(stable(normalize(b)));
+  }});
+}}
+
+function evaluateExpression(expression, actual, tolerance) {{
+  if (expression.op === "const") return expression.value;
+  if (expression.op === "actual") return actual;
+  if (expression.op === "unary") {{
+    const operand = evaluateExpression(expression.operand, actual, tolerance);
+    if (expression.operator === "not") return !operand;
+    if (expression.operator === "neg") return -operand;
+    if (expression.operator === "pos") return +operand;
+  }}
+  if (expression.op === "binary") {{
+    const left = evaluateExpression(expression.left, actual, tolerance);
+    const right = evaluateExpression(expression.right, actual, tolerance);
+    if (expression.operator === "add") return left + right;
+    if (expression.operator === "sub") return left - right;
+    if (expression.operator === "mul") return left * right;
+    if (expression.operator === "div") return left / right;
+    if (expression.operator === "floordiv") return Math.floor(left / right);
+    if (expression.operator === "mod") return left % right;
+    if (expression.operator === "pow") return left ** right;
+  }}
+  if (expression.op === "bool") {{
+    const values = expression.values.map(value => evaluateExpression(value, actual, tolerance));
+    if (expression.operator === "and") return values.every(Boolean);
+    if (expression.operator === "or") return values.some(Boolean);
+  }}
+  if (expression.op === "compare") {{
+    const left = evaluateExpression(expression.left, actual, tolerance);
+    const right = evaluateExpression(expression.right, actual, tolerance);
+    if (expression.operator === "eq") return deepEqual(normalize(left), normalize(right), tolerance);
+    if (expression.operator === "neq") return !deepEqual(normalize(left), normalize(right), tolerance);
+    if (expression.operator === "in") return containsValue(right, left, tolerance);
+    if (expression.operator === "not_in") return !containsValue(right, left, tolerance);
+    const leftNum = numericValue(normalize(left));
+    const rightNum = numericValue(normalize(right));
+    const comparableLeft = leftNum === null ? left : leftNum;
+    const comparableRight = rightNum === null ? right : rightNum;
+    if (expression.operator === "lt") return comparableLeft < comparableRight;
+    if (expression.operator === "lte") return comparableLeft <= comparableRight;
+    if (expression.operator === "gt") return comparableLeft > comparableRight;
+    if (expression.operator === "gte") return comparableLeft >= comparableRight;
+  }}
+  if (expression.op === "index") {{
+    return expressionIndex(evaluateExpression(expression.value, actual, tolerance), evaluateExpression(expression.index, actual, tolerance));
+  }}
+  if (expression.op === "call") {{
+    const args = expression.args.map(arg => evaluateExpression(arg, actual, tolerance));
+    if (expression.function === "sorted") return expressionSorted(args[0]);
+    if (expression.function === "abs") return Math.abs(args[0]);
+  }}
+  throw new Error("unsupported expression");
+}}
+
 function findCallable(moduleValue, entrypoint) {{
   if (typeof moduleValue === "function" && moduleValue.name === entrypoint) return moduleValue;
   if (typeof moduleValue === "function") {{
@@ -1034,6 +1420,7 @@ async function main() {{
       }}
       if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
       else if (raised) ok = false;
+      else if (test.kind === "expr") ok = !!evaluateExpression(test.expression, actual, tolerancePolicy(test));
       else if (test.kind === "eq") ok = deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
       else if (test.kind === "neq") ok = !deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
       else if (test.kind === "truthy") ok = !!actual;

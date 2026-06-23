@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "babel_code_goat.py"
 sys.path.insert(0, str(ROOT))
 
-from babel_code_goat import DiscoveryError, discover_tests
+from babel_code_goat import DiscoveryError, discover_tests  # noqa: E402
 
 
 def run_cli(*args, cwd=None):
@@ -142,6 +142,57 @@ def test_discovery_rejects_unsupported_constructs_and_literals(tmp_path):
         discover_tests(unsupported_literal, "solve")
 
 
+def test_discovery_accepts_single_call_primitive_expressions(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert 3 == solve(1, 2)
+    assert solve(1, 2) in [1, 2, 3]
+    assert solve(2) + 1 == 4
+    assert solve("items")[0] == "first"
+    assert sorted(solve([3, 1, 2])) == [1, 2, 3]
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.kind for test in discovered] == ["expr", "expr", "expr", "expr", "expr"]
+    assert [test.args for test in discovered] == [
+        [1, 2],
+        [1, 2],
+        [2],
+        ["items"],
+        [[3, 1, 2]],
+    ]
+    assert discovered[0].expression["op"] == "compare"
+    assert discovered[1].expression["operator"] == "in"
+    assert discovered[2].expression["left"]["op"] == "binary"
+    assert discovered[3].expression["left"]["op"] == "index"
+    assert discovered[4].expression["left"]["function"] == "sorted"
+
+
+def test_discovery_rejects_untraceable_or_multi_call_expressions(tmp_path):
+    multiple_calls = write_tests(
+        tmp_path / "multiple",
+        "def cases():\n    assert solve(1) == solve(2)\n",
+    )
+    no_entrypoint = write_tests(
+        tmp_path / "none",
+        "def cases():\n    assert 3 == 3\n",
+    )
+    unsupported_helper = write_tests(
+        tmp_path / "helper",
+        "def cases():\n    assert normalize(solve(1)) == 1\n",
+    )
+
+    with pytest.raises(DiscoveryError):
+        discover_tests(multiple_calls, "solve")
+    with pytest.raises(DiscoveryError):
+        discover_tests(no_entrypoint, "solve")
+    with pytest.raises(DiscoveryError):
+        discover_tests(unsupported_helper, "solve")
+
+
 def test_discovery_accepts_rich_python_values_and_metadata(tmp_path):
     tests_dir = write_tests(
         tmp_path,
@@ -233,6 +284,54 @@ def solve(*args):
     }
 
 
+def test_python_execution_evaluates_primitive_expressions_once(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert 3 == solve("rhs")
+    assert solve("member") in [1, 2, 3]
+    assert solve("num") + 1 == 4
+    assert solve("items")[0] == "first"
+    assert sorted(solve("sort")) == [1, 2, 3]
+    assert solve("fail") + 1 == 4
+    assert solve("count") + 0 == 1
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """calls = {}
+
+def solve(kind):
+    calls[kind] = calls.get(kind, 0) + 1
+    if kind == "rhs":
+        return 3
+    if kind == "member":
+        return 2
+    if kind == "num":
+        return 3
+    if kind == "items":
+        return ["first", "second"]
+    if kind == "sort":
+        return [3, 1, 2]
+    if kind == "fail":
+        return 2
+    if kind == "count":
+        return calls[kind]
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+
+    assert parse_result(completed) == {
+        "status": "fail",
+        "passed": ["tests.py:2", "tests.py:3", "tests.py:4", "tests.py:5", "tests.py:6", "tests.py:8"],
+        "failed": ["tests.py:7"],
+    }
+    assert completed.returncode == 1
+
+
 def test_python_execution_compares_rich_containers_and_default_tolerance(tmp_path):
     tests_dir = write_tests(
         tmp_path,
@@ -314,6 +413,43 @@ module.exports = {solve};
         assert parse_result(completed) == {
             "status": "pass",
             "passed": ["tests.py:2", "tests.py:3", "tests.py:4"],
+            "failed": [],
+        }
+        assert completed.returncode == 0
+
+
+def test_javascript_and_typescript_execution_evaluate_primitive_expressions(tmp_path):
+    for lang in ("javascript", "typescript"):
+        tests_dir = write_tests(
+            tmp_path / lang,
+            """def cases():
+    assert 3 == solve("rhs")
+    assert solve("member") in [1, 2, 3]
+    assert sorted(solve("sort")) == [1, 2, 3]
+    assert solve("num") + 1 == 4
+    assert solve("items")[0] == "first"
+""",
+        )
+        solution = tmp_path / lang / "solution.js"
+        solution.write_text(
+            """function solve(kind) {
+  if (kind === "rhs") return 3;
+  if (kind === "member") return 2;
+  if (kind === "sort") return [3, 1, 2];
+  if (kind === "num") return 3;
+  if (kind === "items") return ["first", "second"];
+}
+module.exports = {solve};
+""",
+            encoding="utf-8",
+        )
+
+        assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+        completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+        assert parse_result(completed) == {
+            "status": "pass",
+            "passed": ["tests.py:2", "tests.py:3", "tests.py:4", "tests.py:5", "tests.py:6"],
             "failed": [],
         }
         assert completed.returncode == 0
