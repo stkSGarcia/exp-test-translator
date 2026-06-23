@@ -130,7 +130,7 @@ assert solve("io") == "ok"
 
 
 def test_discovery_rejects_unsupported_constructs_and_literals(tmp_path):
-    unsupported_code = write_tests(tmp_path / "code", "value = 1\n")
+    unsupported_code = write_tests(tmp_path / "code", "print('nope')\n")
     unsupported_literal = write_tests(
         tmp_path / "literal",
         "def cases():\n    assert solve(object()) == 1\n",
@@ -189,6 +189,135 @@ def test_discovery_rejects_untraceable_or_multi_call_expressions(tmp_path):
         discover_tests(multiple_calls, "solve")
     with pytest.raises(DiscoveryError):
         discover_tests(no_entrypoint, "solve")
+    with pytest.raises(DiscoveryError):
+        discover_tests(unsupported_helper, "solve")
+
+
+def test_discovery_expands_non_empty_for_loop_tests(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    cases = [((1, 2), 3), ((2, 3), 5)]
+    for args, exp in cases:
+        assert solve(*args) == exp
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.kind for test in discovered] == ["loop", "eq", "eq"]
+    assert [test.id for test in discovered] == ["tests.py:3", "tests.py:4:0", "tests.py:4:1"]
+    assert discovered[0].expected is True
+    assert [test.args for test in discovered[1:]] == [[1, 2], [2, 3]]
+    assert [test.expected for test in discovered[1:]] == [3, 5]
+
+
+@pytest.mark.parametrize(
+    ("source", "loop_id"),
+    [
+        ("def cases():\n    for x in []:\n        assert solve(x) == x\n", "tests.py:2"),
+        ("def cases():\n    for i in range(0):\n        assert solve(i) == i\n", "tests.py:2"),
+        ("def cases():\n    for ch in \"\":\n        assert solve(ch) == ch\n", "tests.py:2"),
+    ],
+)
+def test_zero_iteration_loops_report_fail_without_body_tests(tmp_path, source, loop_id):
+    tests_dir = write_tests(tmp_path, source)
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+
+    assert parse_result(completed) == {"status": "fail", "passed": [], "failed": [loop_id]}
+    assert completed.returncode == 1
+
+
+def test_loop_parameterization_patterns_execute(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    cases = [(1, 2, 3), (3, 4, 7)]
+    for a, b, exp in cases:
+        assert solve(a, b) == exp
+    for _, (a, b, exp) in enumerate(cases):
+        assert solve(a, b) == exp
+    for i in range(len(cases)):
+        a, b, exp = cases[i]
+        assert solve(a, b) == exp
+    i = 0
+    while i < len(cases):
+        a, b, exp = cases[i]
+        assert solve(a, b) == exp
+        i += 1
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(a, b):\n    return a + b\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+    result = parse_result(completed)
+
+    assert completed.returncode == 0
+    assert result["status"] == "pass"
+    assert result["failed"] == []
+    assert result["passed"] == [
+        "tests.py:3",
+        "tests.py:4:0",
+        "tests.py:4:1",
+        "tests.py:5",
+        "tests.py:6:0",
+        "tests.py:6:1",
+        "tests.py:7",
+        "tests.py:9:0",
+        "tests.py:9:1",
+        "tests.py:11",
+        "tests.py:13:0",
+        "tests.py:13:1",
+    ]
+
+
+def test_nested_loops_report_loop_levels_and_nested_assertion_ids(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    groups = [[1, 2, 3]]
+    for group in groups:
+        for x in group:
+            assert solve(x) == x
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.kind for test in discovered] == ["loop", "loop", "eq", "eq", "eq"]
+    assert [test.id for test in discovered] == [
+        "tests.py:3",
+        "tests.py:4",
+        "tests.py:5:0",
+        "tests.py:5:1",
+        "tests.py:5:2",
+    ]
+
+
+def test_loop_body_traceability_rejections(tmp_path):
+    zero_calls = write_tests(
+        tmp_path / "zero",
+        "def cases():\n    for exp in [3]:\n        assert exp == 3\n",
+    )
+    multiple_calls = write_tests(
+        tmp_path / "multiple",
+        "def cases():\n    for a, b in [(1, 2)]:\n        assert solve(a, b) == solve(b, a)\n",
+    )
+    unsupported_helper = write_tests(
+        tmp_path / "helper",
+        "def cases():\n    for x in [1]:\n        assert normalize(solve(x)) == x\n",
+    )
+
+    with pytest.raises(DiscoveryError):
+        discover_tests(zero_calls, "solve")
+    with pytest.raises(DiscoveryError):
+        discover_tests(multiple_calls, "solve")
     with pytest.raises(DiscoveryError):
         discover_tests(unsupported_helper, "solve")
 
@@ -453,6 +582,38 @@ module.exports = {solve};
             "failed": [],
         }
         assert completed.returncode == 0
+
+
+def test_javascript_and_typescript_execution_handle_loop_tests(tmp_path):
+    for lang in ("javascript", "typescript"):
+        tests_dir = write_tests(
+            tmp_path / lang,
+            """def cases():
+    for x in [1, 2]:
+        assert solve(x) == x
+    for y in []:
+        assert solve(y) == y
+""",
+        )
+        solution = tmp_path / lang / "solution.js"
+        solution.write_text(
+            """function solve(x) {
+  return x;
+}
+module.exports = {solve};
+""",
+            encoding="utf-8",
+        )
+
+        assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+        completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+        assert parse_result(completed) == {
+            "status": "fail",
+            "passed": ["tests.py:2", "tests.py:3:0", "tests.py:3:1"],
+            "failed": ["tests.py:4"],
+        }
+        assert completed.returncode == 1
 
 
 def test_test_tol_does_not_change_nonnumeric_equality(tmp_path):

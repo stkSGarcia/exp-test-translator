@@ -47,6 +47,7 @@ class TestCase:
     expression: dict[str, Any] | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
+    in_loop: bool = False
 
     def to_jsonable(self) -> dict[str, Any]:
         return {
@@ -67,6 +68,10 @@ class TestCase:
 @dataclass
 class DiscoveryContext:
     names: dict[str, str]
+    values: dict[str, Any]
+
+    def child(self) -> "DiscoveryContext":
+        return DiscoveryContext(names=self.names.copy(), values=self.values.copy())
 
 
 @dataclass(frozen=True)
@@ -161,7 +166,65 @@ def parse_tolerance_value(node: ast.AST, context: DiscoveryContext) -> float:
     return float(value)
 
 
+def index_value(container: Any, index: Any) -> Any:
+    if isinstance(index, bool) or not isinstance(index, int | str):
+        raise DiscoveryError("unsupported index value")
+    if isinstance(container, dict) and container.get(TAG_KEY) == "dict":
+        exact_tolerance = {"mode": "default", "abs": 0.0, "rel": 0.0}
+        normalized_index = normalize_runtime_value(index)
+        for key, item in container["items"]:
+            if deep_compare(key, normalized_index, exact_tolerance):
+                return item
+        raise DiscoveryError("missing indexed value")
+    if isinstance(container, dict) and container.get(TAG_KEY) == "deque":
+        return container["items"][index]
+    try:
+        return container[index]
+    except Exception as exc:
+        raise DiscoveryError("unsupported indexed value") from exc
+
+
+def eval_binary(operator: ast.operator, left: Any, right: Any) -> Any:
+    if isinstance(operator, ast.Add):
+        return left + right
+    if isinstance(operator, ast.Sub):
+        return left - right
+    if isinstance(operator, ast.Mult):
+        return left * right
+    if isinstance(operator, ast.Div):
+        return left / right
+    if isinstance(operator, ast.FloorDiv):
+        return left // right
+    if isinstance(operator, ast.Mod):
+        return left % right
+    raise DiscoveryError("unsupported binary value expression")
+
+
+def eval_compare(operator: ast.cmpop, left: Any, right: Any) -> bool:
+    if isinstance(operator, ast.Eq):
+        return left == right
+    if isinstance(operator, ast.NotEq):
+        return left != right
+    if isinstance(operator, ast.Lt):
+        return left < right
+    if isinstance(operator, ast.LtE):
+        return left <= right
+    if isinstance(operator, ast.Gt):
+        return left > right
+    if isinstance(operator, ast.GtE):
+        return left >= right
+    if isinstance(operator, ast.In):
+        return left in right
+    if isinstance(operator, ast.NotIn):
+        return left not in right
+    raise DiscoveryError("unsupported comparison value expression")
+
+
 def value_from_node(node: ast.AST, context: DiscoveryContext) -> Any:
+    if isinstance(node, ast.Name):
+        if node.id in context.values:
+            return context.values[node.id]
+        raise DiscoveryError("unsupported name")
     if isinstance(node, ast.Constant):
         return normalize_runtime_value(node.value)
     if isinstance(node, ast.List | ast.Tuple):
@@ -182,8 +245,38 @@ def value_from_node(node: ast.AST, context: DiscoveryContext) -> Any:
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise DiscoveryError("unsupported unary literal")
         return -value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        value = value_from_node(node.operand, context)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise DiscoveryError("unsupported unary literal")
+        return value
+    if isinstance(node, ast.Subscript):
+        return normalize_runtime_value(index_value(value_from_node(node.value, context), value_from_node(node.slice, context)))
+    if isinstance(node, ast.BinOp):
+        return normalize_runtime_value(
+            eval_binary(node.op, value_from_node(node.left, context), value_from_node(node.right, context))
+        )
+    if isinstance(node, ast.Compare):
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise DiscoveryError("unsupported comparison value expression")
+        return eval_compare(node.ops[0], value_from_node(node.left, context), value_from_node(node.comparators[0], context))
     if isinstance(node, ast.Call):
         callee = resolve_callee(node.func, context)
+        if callee == "len":
+            if node.keywords or len(node.args) != 1:
+                raise DiscoveryError("unsupported len call")
+            return len(value_from_node(node.args[0], context))
+        if callee == "range":
+            if node.keywords or len(node.args) not in {1, 2, 3}:
+                raise DiscoveryError("unsupported range call")
+            args = [value_from_node(arg, context) for arg in node.args]
+            if any(isinstance(arg, bool) or not isinstance(arg, int) for arg in args):
+                raise DiscoveryError("range requires integer arguments")
+            return list(range(*args))
+        if callee == "enumerate":
+            if node.keywords or len(node.args) != 1:
+                raise DiscoveryError("unsupported enumerate call")
+            return [[index, item] for index, item in enumerate(iterable_from_node(node.args[0], context))]
         if callee in {"set", "frozenset"}:
             if node.keywords or len(node.args) > 1:
                 raise DiscoveryError("unsupported set constructor")
@@ -284,7 +377,16 @@ def parse_entrypoint_call(node: ast.AST, entrypoint: str, context: DiscoveryCont
         raise DiscoveryError("assertion must call the configured entrypoint")
     if node.keywords:
         raise DiscoveryError("keyword arguments are unsupported")
-    return [value_from_node(arg, context) for arg in node.args]
+    args: list[Any] = []
+    for arg in node.args:
+        if isinstance(arg, ast.Starred):
+            expanded = value_from_node(arg.value, context)
+            if not isinstance(expanded, list):
+                raise DiscoveryError("starred arguments require iterable literal")
+            args.extend(expanded)
+        else:
+            args.append(value_from_node(arg, context))
+    return args
 
 
 def entrypoint_call_count(node: ast.AST, entrypoint: str) -> int:
@@ -328,7 +430,7 @@ def expression_from_node(node: ast.AST, entrypoint: str, context: DiscoveryConte
             raise DiscoveryError("unsupported helper call")
         return const_expression(node, context)
 
-    if isinstance(node, ast.Constant | ast.List | ast.Tuple | ast.Set | ast.Dict):
+    if isinstance(node, ast.Name | ast.Constant | ast.List | ast.Tuple | ast.Set | ast.Dict):
         if entrypoint_call_count(node, entrypoint):
             raise DiscoveryError("unsupported container expression")
         return const_expression(node, context)
@@ -412,6 +514,8 @@ def expression_from_node(node: ast.AST, entrypoint: str, context: DiscoveryConte
         )
 
     if isinstance(node, ast.Subscript):
+        if entrypoint_call_count(node, entrypoint) == 0:
+            return const_expression(node, context)
         if isinstance(node.slice, ast.Slice):
             raise DiscoveryError("unsupported slice expression")
         value = expression_from_node(node.value, entrypoint, context)
@@ -644,17 +748,151 @@ def handle_import(stmt: ast.stmt, context: DiscoveryContext) -> bool:
     return False
 
 
+def bind_target(target: ast.AST, value: Any, context: DiscoveryContext) -> None:
+    if isinstance(target, ast.Name):
+        context.values[target.id] = value
+        return
+    if isinstance(target, ast.Tuple | ast.List):
+        if not isinstance(value, list) or len(target.elts) != len(value):
+            raise DiscoveryError("unsupported assignment target")
+        for child_target, child_value in zip(target.elts, value, strict=True):
+            bind_target(child_target, child_value, context)
+        return
+    raise DiscoveryError("unsupported assignment target")
+
+
+def iterable_from_node(node: ast.AST, context: DiscoveryContext) -> list[Any]:
+    value = value_from_node(node, context)
+    if isinstance(value, str):
+        return list(value)
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict) and value.get(TAG_KEY) in {"set", "deque"}:
+        return list(value["items"])
+    raise DiscoveryError("unsupported loop iterable")
+
+
+def handle_assignment(stmt: ast.stmt, context: DiscoveryContext) -> bool:
+    if isinstance(stmt, ast.Assign):
+        if len(stmt.targets) != 1:
+            raise DiscoveryError("unsupported assignment")
+        bind_target(stmt.targets[0], value_from_node(stmt.value, context), context)
+        return True
+    if isinstance(stmt, ast.AnnAssign):
+        if stmt.value is None:
+            raise DiscoveryError("unsupported assignment")
+        bind_target(stmt.target, value_from_node(stmt.value, context), context)
+        return True
+    return False
+
+
+def handle_aug_assignment(stmt: ast.stmt, context: DiscoveryContext) -> bool:
+    if not isinstance(stmt, ast.AugAssign):
+        return False
+    if not isinstance(stmt.target, ast.Name) or stmt.target.id not in context.values:
+        raise DiscoveryError("unsupported augmented assignment")
+    context.values[stmt.target.id] = normalize_runtime_value(
+        eval_binary(stmt.op, context.values[stmt.target.id], value_from_node(stmt.value, context))
+    )
+    return True
+
+
+def loop_case(node: ast.stmt, executed: bool) -> TestCase:
+    return TestCase(id="", line=node.lineno, kind="loop", args=[], expected=executed)
+
+
+def discover_for_loop(
+    stmt: ast.For, entrypoint: str, lines: list[str], context: DiscoveryContext, in_loop: bool
+) -> list[TestCase]:
+    if stmt.orelse:
+        raise DiscoveryError("unsupported loop else block")
+    try:
+        iterable = iterable_from_node(stmt.iter, context)
+    except DiscoveryError:
+        return [loop_case(stmt, False)]
+    if not iterable:
+        return [loop_case(stmt, False)]
+
+    discovered = [loop_case(stmt, True)]
+    for item in iterable:
+        iteration_context = context.child()
+        bind_target(stmt.target, item, iteration_context)
+        discovered.extend(discover_in_body(stmt.body, entrypoint, lines, iteration_context, True))
+    return discovered
+
+
+def discover_while_loop(
+    stmt: ast.While, entrypoint: str, lines: list[str], context: DiscoveryContext, in_loop: bool
+) -> list[TestCase]:
+    if stmt.orelse:
+        raise DiscoveryError("unsupported loop else block")
+    working_context = context.child()
+    discovered: list[TestCase] = []
+    executed = False
+    max_iterations = 10_000
+
+    for _ in range(max_iterations):
+        try:
+            condition = bool(value_from_node(stmt.test, working_context))
+        except DiscoveryError:
+            return [loop_case(stmt, False)]
+        if not condition:
+            return [loop_case(stmt, True), *discovered] if executed else [loop_case(stmt, False)]
+        executed = True
+        discovered.extend(discover_in_body(stmt.body, entrypoint, lines, working_context, True))
+
+    return [loop_case(stmt, False)]
+
+
 def discover_in_body(
-    body: list[ast.stmt], entrypoint: str, lines: list[str], context: DiscoveryContext
+    body: list[ast.stmt], entrypoint: str, lines: list[str], context: DiscoveryContext, in_loop: bool = False
 ) -> list[TestCase]:
     discovered: list[TestCase] = []
     for stmt in body:
         if isinstance(stmt, ast.FunctionDef):
-            discovered.extend(discover_in_body(stmt.body, entrypoint, lines, context))
+            discovered.extend(discover_in_body(stmt.body, entrypoint, lines, context.child(), in_loop))
         elif isinstance(stmt, ast.Assert):
-            discovered.append(parse_assert(stmt, entrypoint, lines, context))
+            test_case = parse_assert(stmt, entrypoint, lines, context)
+            discovered.append(
+                TestCase(
+                    id=test_case.id,
+                    line=test_case.line,
+                    kind=test_case.kind,
+                    args=test_case.args,
+                    expected=test_case.expected,
+                    tolerance=test_case.tolerance,
+                    expected_exception=test_case.expected_exception,
+                    message_match=test_case.message_match,
+                    expression=test_case.expression,
+                    expect_stdout=test_case.expect_stdout,
+                    expect_stderr=test_case.expect_stderr,
+                    in_loop=in_loop,
+                )
+            )
         elif isinstance(stmt, ast.Try):
-            discovered.append(parse_raise_any(stmt, entrypoint, lines, context))
+            test_case = parse_raise_any(stmt, entrypoint, lines, context)
+            discovered.append(
+                TestCase(
+                    id=test_case.id,
+                    line=test_case.line,
+                    kind=test_case.kind,
+                    args=test_case.args,
+                    expected=test_case.expected,
+                    tolerance=test_case.tolerance,
+                    expected_exception=test_case.expected_exception,
+                    message_match=test_case.message_match,
+                    expression=test_case.expression,
+                    expect_stdout=test_case.expect_stdout,
+                    expect_stderr=test_case.expect_stderr,
+                    in_loop=in_loop,
+                )
+            )
+        elif isinstance(stmt, ast.For):
+            discovered.extend(discover_for_loop(stmt, entrypoint, lines, context, in_loop))
+        elif isinstance(stmt, ast.While):
+            discovered.extend(discover_while_loop(stmt, entrypoint, lines, context, in_loop))
+        elif handle_assignment(stmt, context) or handle_aug_assignment(stmt, context):
+            continue
         elif isinstance(stmt, ast.Pass):
             continue
         elif handle_import(stmt, context):
@@ -667,16 +905,23 @@ def discover_in_body(
 def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
     counts: dict[int, int] = {}
     for test_case in test_cases:
-        counts[test_case.line] = counts.get(test_case.line, 0) + 1
+        if not test_case.in_loop:
+            counts[test_case.line] = counts.get(test_case.line, 0) + 1
 
     seen: dict[int, int] = {}
+    loop_seen: dict[int, int] = {}
     assigned: list[TestCase] = []
     for test_case in test_cases:
-        line_seen = seen.get(test_case.line, 0)
-        seen[test_case.line] = line_seen + 1
-        test_id = f"tests.py:{test_case.line}"
-        if counts[test_case.line] > 1:
-            test_id = f"{test_id}#{line_seen}"
+        if test_case.in_loop:
+            line_seen = loop_seen.get(test_case.line, 0)
+            loop_seen[test_case.line] = line_seen + 1
+            test_id = f"tests.py:{test_case.line}:{line_seen}"
+        else:
+            line_seen = seen.get(test_case.line, 0)
+            seen[test_case.line] = line_seen + 1
+            test_id = f"tests.py:{test_case.line}"
+            if counts.get(test_case.line, 0) > 1:
+                test_id = f"{test_id}#{line_seen}"
         assigned.append(
             TestCase(
                 id=test_id,
@@ -690,6 +935,7 @@ def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
                 expression=test_case.expression,
                 expect_stdout=test_case.expect_stdout,
                 expect_stderr=test_case.expect_stderr,
+                in_loop=test_case.in_loop,
             )
         )
     return assigned
@@ -706,7 +952,7 @@ def discover_tests(tests_dir: Path, entrypoint: str) -> list[TestCase]:
     except SyntaxError as exc:
         raise DiscoveryError("could not parse tests.py") from exc
     lines = source.splitlines()
-    context = DiscoveryContext(names={})
+    context = DiscoveryContext(names={}, values={})
     return assign_ids(discover_in_body(tree.body, entrypoint, lines, context))
 
 
@@ -1021,10 +1267,12 @@ def resolve_python_callable(solution_path: Path, entrypoint: str) -> Any:
 def execute_python_tests(
     solution_path: Path, entrypoint: str, tests: list[dict[str, Any]], default_tol: float = 0.0
 ) -> dict[str, Any]:
-    try:
-        callable_under_test = resolve_python_callable(solution_path, entrypoint)
-    except Exception:
-        return make_result("fail", [], [test["id"] for test in tests])
+    callable_under_test = None
+    if any(test["kind"] != "loop" for test in tests):
+        try:
+            callable_under_test = resolve_python_callable(solution_path, entrypoint)
+        except Exception:
+            return make_result("fail", [], [test["id"] for test in tests])
 
     passed: list[str] = []
     failed: list[str] = []
@@ -1034,15 +1282,23 @@ def execute_python_tests(
         ok = False
         try:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-                raised = False
-                raised_exc = None
-                try:
-                    actual = callable_under_test(*[decode_arg(arg) for arg in test["args"]])
-                except Exception as exc:
-                    raised = True
-                    raised_exc = exc
+                if test["kind"] == "loop":
+                    ok = bool(test.get("expected"))
                     actual = None
-                if test["kind"] == "raises":
+                    raised = False
+                    raised_exc = None
+                else:
+                    raised = False
+                    raised_exc = None
+                    try:
+                        actual = callable_under_test(*[decode_arg(arg) for arg in test["args"]])
+                    except Exception as exc:
+                        raised = True
+                        raised_exc = exc
+                        actual = None
+                if test["kind"] == "loop":
+                    pass
+                elif test["kind"] == "raises":
                     ok = (
                         raised
                         and raised_exc is not None
@@ -1390,11 +1646,14 @@ async function main() {{
   }}
   const solutionPath = path.resolve(process.argv[2]);
   let fn;
-  try {{
-    fn = findCallable(await loadSolution(solutionPath), payload.entrypoint);
-  }} catch (error) {{
-    console.log(JSON.stringify({{status: "fail", passed: [], failed: payload.tests.map(test => test.id)}}));
-    return 1;
+  const hasExecutableTests = payload.tests.some(test => test.kind !== "loop");
+  if (hasExecutableTests) {{
+    try {{
+      fn = findCallable(await loadSolution(solutionPath), payload.entrypoint);
+    }} catch (error) {{
+      console.log(JSON.stringify({{status: "fail", passed: [], failed: payload.tests.map(test => test.id)}}));
+      return 1;
+    }}
   }}
 
   const passed = [];
@@ -1411,14 +1670,19 @@ async function main() {{
       let actual;
       let raised = false;
       let raisedError = null;
-      try {{
-        actual = fn(...test.args.map(decodeArg));
-        if (actual && typeof actual.then === "function") actual = await actual;
-      }} catch (error) {{
-        raised = true;
-        raisedError = error;
+      if (test.kind === "loop") {{
+        ok = !!test.expected;
+      }} else {{
+        try {{
+          actual = fn(...test.args.map(decodeArg));
+          if (actual && typeof actual.then === "function") actual = await actual;
+        }} catch (error) {{
+          raised = true;
+          raisedError = error;
+        }}
       }}
-      if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
+      if (test.kind === "loop") {{}}
+      else if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
       else if (raised) ok = false;
       else if (test.kind === "expr") ok = !!evaluateExpression(test.expression, actual, tolerancePolicy(test));
       else if (test.kind === "eq") ok = deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
