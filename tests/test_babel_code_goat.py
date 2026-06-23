@@ -133,13 +133,50 @@ def test_discovery_rejects_unsupported_constructs_and_literals(tmp_path):
     unsupported_code = write_tests(tmp_path / "code", "value = 1\n")
     unsupported_literal = write_tests(
         tmp_path / "literal",
-        "def cases():\n    assert solve({1: 'bad'}) == 1\n",
+        "def cases():\n    assert solve(object()) == 1\n",
     )
 
     with pytest.raises(DiscoveryError):
         discover_tests(unsupported_code, "solve")
     with pytest.raises(DiscoveryError):
         discover_tests(unsupported_literal, "solve")
+
+
+def test_discovery_accepts_rich_python_values_and_metadata(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """from collections import Counter, deque, defaultdict
+from decimal import Decimal
+import math
+import re
+
+def cases():
+    assert solve({1: "one", (2, 3): set([Decimal("1.5")])}) == defaultdict(int, {Decimal("2.0"): Counter(["a", "a"]), "items": deque([1, 2]), "frozen": frozenset([3, 2])})
+    assert math.isclose(solve("near"), Decimal("1.0"), abs_tol=0.01, rel_tol=0.0)
+    assert abs(solve("strict") - 1.0) < 0.01
+    try:
+        solve("typed")
+        assert False
+    except ValueError as e:
+        assert "bad" in str(e)
+    try:
+        solve("regex")
+        assert False
+    except ValueError as e:
+        assert re.search(r"b.d", str(e))
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.kind for test in discovered] == ["eq", "eq", "eq", "raises", "raises"]
+    assert discovered[0].args[0]["__bcg_type__"] == "dict"
+    assert discovered[0].expected["__bcg_type__"] == "dict"
+    assert discovered[1].tolerance == {"mode": "isclose", "abs": 0.01, "rel": 0.0}
+    assert discovered[2].tolerance == {"mode": "absdiff", "abs": 0.01, "strict": True}
+    assert discovered[3].expected_exception == "ValueError"
+    assert discovered[3].message_match == {"mode": "contains", "pattern": "bad"}
+    assert discovered[4].message_match == {"mode": "regex", "pattern": "b.d"}
 
 
 def test_python_execution_reports_pass_fail_error_and_stream_expectations(tmp_path):
@@ -194,6 +231,207 @@ def solve(*args):
         "tests.py:6",
         "tests.py:13",
     }
+
+
+def test_python_execution_compares_rich_containers_and_default_tolerance(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """from collections import Counter, deque, defaultdict
+from decimal import Decimal
+
+def cases():
+    assert solve("dict") == {1: "one", (2, 3): {"nested"}}
+    assert solve("set") == frozenset([3, 1, 2])
+    assert solve("counter") == Counter(["a", "b", "a"])
+    assert solve("deque") == deque([1, 2, 3])
+    assert solve("defaultdict") == defaultdict(int, {"x": 2})
+    assert solve("decimal") == Decimal("1.00")
+    assert solve("nested-floats") == {"values": [1.0, Decimal("2.0")]}
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """from collections import Counter, deque, defaultdict
+from decimal import Decimal
+
+def solve(kind):
+    if kind == "dict":
+        return {(2, 3): {"nested"}, 1: "one"}
+    if kind == "set":
+        return {2, 1, 3}
+    if kind == "counter":
+        return Counter({"a": 2, "b": 1})
+    if kind == "deque":
+        return deque([1, 2, 3])
+    if kind == "defaultdict":
+        return defaultdict(str, {"x": 2})
+    if kind == "decimal":
+        return Decimal("1.0")
+    if kind == "nested-floats":
+        return {"values": [1.0005, Decimal("2.0005")]}
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    without_tol = run_cli("test", solution, tests_dir, "--lang", "python")
+    with_tol = run_cli("test", solution, tests_dir, "--lang", "python", "--tol", "0.001")
+
+    assert parse_result(without_tol)["failed"] == ["tests.py:11"]
+    assert parse_result(with_tol) == {
+        "status": "pass",
+        "passed": [f"tests.py:{line}" for line in range(5, 12)],
+        "failed": [],
+    }
+    assert with_tol.returncode == 0
+
+
+def test_javascript_and_typescript_execution_compare_map_set_and_tolerance(tmp_path):
+    for lang in ("javascript", "typescript"):
+        tests_dir = write_tests(
+            tmp_path / lang,
+            """def cases():
+    assert solve("set") == set([3, 1, 2])
+    assert solve("dict") == {1: "one", "two": 2}
+    assert solve("nested") == {"values": [1.0]}
+""",
+        )
+        solution = tmp_path / lang / "solution.js"
+        solution.write_text(
+            """function solve(kind) {
+  if (kind === "set") return new Set([2, 3, 1]);
+  if (kind === "dict") return new Map([[1, "one"], ["two", 2]]);
+  if (kind === "nested") return {values: [1.0005]};
+}
+module.exports = {solve};
+""",
+            encoding="utf-8",
+        )
+
+        assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+        completed = run_cli("test", solution, tests_dir, "--lang", lang, "--tol", "0.001")
+
+        assert parse_result(completed) == {
+            "status": "pass",
+            "passed": ["tests.py:2", "tests.py:3", "tests.py:4"],
+            "failed": [],
+        }
+        assert completed.returncode == 0
+
+
+def test_test_tol_does_not_change_nonnumeric_equality(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve("num") == {"x": [1.0]}
+    assert solve("str") == "same"
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """def solve(kind):
+    if kind == "num":
+        return {"x": [1.0005]}
+    if kind == "str":
+        return "sane"
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python", "--tol", "0.001")
+
+    assert parse_result(completed) == {"status": "fail", "passed": ["tests.py:2"], "failed": ["tests.py:3"]}
+    assert completed.returncode == 1
+
+
+def test_per_assert_tolerance_overrides(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """import math
+
+def cases():
+    assert math.isclose(solve("isclose"), 1.0, abs_tol=0.01, rel_tol=0.0)
+    assert abs(solve("strict-pass") - 1.0) < 0.01
+    assert abs(solve("strict-fail") - 1.0) < 0.01
+    assert abs(solve("inclusive") - 1.0) <= 0.01
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """def solve(kind):
+    return {
+        "isclose": 1.009,
+        "strict-pass": 1.009,
+        "strict-fail": 1.01,
+        "inclusive": 1.01,
+    }[kind]
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+
+    assert parse_result(completed) == {
+        "status": "fail",
+        "passed": ["tests.py:4", "tests.py:5", "tests.py:7"],
+        "failed": ["tests.py:6"],
+    }
+    assert completed.returncode == 1
+
+
+def test_typed_raises_and_message_matching(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """import re
+
+def cases():
+    try:
+        solve("typed-pass")
+        assert False
+    except ValueError as e:
+        assert "bad" in str(e)
+    try:
+        solve("wrong-type")
+        assert False
+    except ValueError:
+        pass
+    try:
+        solve("message-miss")
+        assert False
+    except ValueError as e:
+        assert "bad" in str(e)
+    try:
+        solve("regex-pass")
+        assert False
+    except ValueError as e:
+        assert re.search(r"b.d", str(e))
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """def solve(kind):
+    if kind == "typed-pass":
+        raise ValueError("bad input")
+    if kind == "wrong-type":
+        raise TypeError("bad input")
+    if kind == "message-miss":
+        raise ValueError("plain input")
+    if kind == "regex-pass":
+        raise ValueError("bed input")
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+    result = parse_result(completed)
+
+    assert result["status"] == "fail"
+    assert result["passed"] == ["tests.py:4", "tests.py:19"]
+    assert result["failed"] == ["tests.py:9", "tests.py:14"]
+    assert completed.returncode == 1
 
 
 def test_python_class_method_solution_and_passing_exit_code(tmp_path):

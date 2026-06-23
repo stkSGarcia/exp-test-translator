@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter, defaultdict, deque
 import contextlib
+from decimal import Decimal, InvalidOperation
 import importlib.util
 import inspect
 import io
@@ -25,6 +27,7 @@ SUPPORTED_LANGS = {
 }
 RESULT_ERROR = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"^\s*#\s*expect_(stdout|stderr):\s*(.+?)\s*$")
+TAG_KEY = "__bcg_type__"
 
 
 class DiscoveryError(Exception):
@@ -38,6 +41,9 @@ class TestCase:
     kind: str
     args: list[Any]
     expected: Any = None
+    tolerance: dict[str, Any] | None = None
+    expected_exception: str | None = None
+    message_match: dict[str, str] | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
 
@@ -48,32 +54,188 @@ class TestCase:
             "kind": self.kind,
             "args": self.args,
             "expected": self.expected,
+            "tolerance": self.tolerance,
+            "expected_exception": self.expected_exception,
+            "message_match": self.message_match,
             "expect_stdout": self.expect_stdout,
             "expect_stderr": self.expect_stderr,
         }
 
 
-def normalize_value(value: Any) -> Any:
+@dataclass
+class DiscoveryContext:
+    names: dict[str, str]
+
+
+ALLOWED_IMPORTS = {
+    "math": "math",
+    "re": "re",
+    "collections": "collections",
+    "decimal": "decimal",
+}
+ALLOWED_FROM_IMPORTS = {
+    "collections": {"Counter", "deque", "defaultdict"},
+    "decimal": {"Decimal"},
+    "math": {"isclose"},
+    "re": {"search"},
+}
+
+
+def tagged(type_name: str, **values: Any) -> dict[str, Any]:
+    return {TAG_KEY: type_name, **values}
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def sort_tagged_values(values: list[Any]) -> list[Any]:
+    return sorted(values, key=stable_json)
+
+
+def normalize_runtime_value(value: Any) -> Any:
     if value is None or isinstance(value, bool | int | float | str):
         return value
-    if isinstance(value, tuple | list):
-        return [normalize_value(item) for item in value]
+    if isinstance(value, Decimal):
+        return tagged("decimal", value=str(value))
+    if isinstance(value, Counter):
+        items = [
+            [normalize_runtime_value(key), normalize_runtime_value(count)]
+            for key, count in value.items()
+            if count != 0
+        ]
+        items.sort(key=lambda pair: stable_json(pair[0]))
+        return tagged("counter", items=items)
+    if isinstance(value, deque):
+        return tagged("deque", items=[normalize_runtime_value(item) for item in value])
+    if isinstance(value, defaultdict):
+        return normalize_mapping(value)
     if isinstance(value, dict):
-        normalized: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise DiscoveryError("dictionary keys must be strings")
-            normalized[key] = normalize_value(item)
-        return normalized
+        return normalize_mapping(value)
+    if isinstance(value, tuple | list):
+        return [normalize_runtime_value(item) for item in value]
+    if isinstance(value, set | frozenset):
+        return tagged("set", items=sort_tagged_values([normalize_runtime_value(item) for item in value]))
     raise DiscoveryError(f"unsupported literal value: {type(value).__name__}")
 
 
-def literal_from_node(node: ast.AST) -> Any:
+def normalize_mapping(value: dict[Any, Any]) -> Any:
+    items = [[normalize_runtime_value(key), normalize_runtime_value(item)] for key, item in value.items()]
+    items.sort(key=lambda pair: stable_json(pair[0]))
+    return tagged("dict", items=items)
+
+
+def literal_fallback(node: ast.AST) -> Any:
     try:
         value = ast.literal_eval(node)
     except Exception as exc:
         raise DiscoveryError("unsupported literal expression") from exc
-    return normalize_value(value)
+    return normalize_runtime_value(value)
+
+
+def resolve_callee(node: ast.AST, context: DiscoveryContext) -> str | None:
+    if isinstance(node, ast.Name):
+        return context.names.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        parent = resolve_callee(node.value, context)
+        if parent:
+            return f"{parent}.{node.attr}"
+    return None
+
+
+def parse_tolerance_value(node: ast.AST, context: DiscoveryContext) -> float:
+    value = value_from_node(node, context)
+    if isinstance(value, dict) and value.get(TAG_KEY) == "decimal":
+        return float(value["value"])
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise DiscoveryError("tolerance must be numeric")
+    return float(value)
+
+
+def value_from_node(node: ast.AST, context: DiscoveryContext) -> Any:
+    if isinstance(node, ast.Constant):
+        return normalize_runtime_value(node.value)
+    if isinstance(node, ast.List | ast.Tuple):
+        return [value_from_node(item, context) for item in node.elts]
+    if isinstance(node, ast.Set):
+        return tagged("set", items=sort_tagged_values([value_from_node(item, context) for item in node.elts]))
+    if isinstance(node, ast.Dict):
+        if any(key is None for key in node.keys):
+            raise DiscoveryError("dictionary unpacking is unsupported")
+        items = [
+            [value_from_node(key, context), value_from_node(item, context)]
+            for key, item in zip(node.keys, node.values, strict=True)
+        ]
+        items.sort(key=lambda pair: stable_json(pair[0]))
+        return tagged("dict", items=items)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        value = value_from_node(node.operand, context)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise DiscoveryError("unsupported unary literal")
+        return -value
+    if isinstance(node, ast.Call):
+        callee = resolve_callee(node.func, context)
+        if callee in {"set", "frozenset"}:
+            if node.keywords or len(node.args) > 1:
+                raise DiscoveryError("unsupported set constructor")
+            source = [] if not node.args else value_from_node(node.args[0], context)
+            if not isinstance(source, list):
+                raise DiscoveryError("set constructor requires iterable literal")
+            return tagged("set", items=sort_tagged_values(source))
+        if callee in {"collections.Counter", "Counter"}:
+            if node.keywords or len(node.args) > 1:
+                raise DiscoveryError("unsupported Counter constructor")
+            if not node.args:
+                items: list[Any] = []
+            else:
+                source = value_from_node(node.args[0], context)
+                if isinstance(source, dict) and source.get(TAG_KEY) == "dict":
+                    items = source["items"]
+                elif isinstance(source, list):
+                    counts: dict[str, list[Any]] = {}
+                    for item in source:
+                        key = stable_json(item)
+                        if key not in counts:
+                            counts[key] = [item, 0]
+                        counts[key][1] += 1
+                    items = [[item, count] for item, count in counts.values()]
+                else:
+                    raise DiscoveryError("unsupported Counter source")
+            items.sort(key=lambda pair: stable_json(pair[0]))
+            return tagged("counter", items=items)
+        if callee in {"collections.deque", "deque"}:
+            if node.keywords or len(node.args) > 1:
+                raise DiscoveryError("unsupported deque constructor")
+            items = [] if not node.args else value_from_node(node.args[0], context)
+            if not isinstance(items, list):
+                raise DiscoveryError("deque constructor requires iterable literal")
+            return tagged("deque", items=items)
+        if callee in {"collections.defaultdict", "defaultdict"}:
+            if len(node.args) > 2:
+                raise DiscoveryError("unsupported defaultdict constructor")
+            if node.keywords:
+                raise DiscoveryError("unsupported defaultdict keywords")
+            mapping_arg = node.args[1] if len(node.args) == 2 else None
+            if mapping_arg is None:
+                items = []
+            else:
+                mapping = value_from_node(mapping_arg, context)
+                if not (isinstance(mapping, dict) and mapping.get(TAG_KEY) == "dict"):
+                    raise DiscoveryError("defaultdict requires mapping literal")
+                items = mapping["items"]
+            return tagged("dict", items=items)
+        if callee in {"decimal.Decimal", "Decimal"}:
+            if node.keywords or len(node.args) != 1:
+                raise DiscoveryError("Decimal requires one literal")
+            raw = value_from_node(node.args[0], context)
+            if isinstance(raw, dict):
+                raise DiscoveryError("Decimal requires scalar literal")
+            try:
+                decimal_value = Decimal(str(raw))
+            except InvalidOperation as exc:
+                raise DiscoveryError("invalid Decimal literal") from exc
+            return tagged("decimal", value=str(decimal_value))
+    return literal_fallback(node)
 
 
 def parse_expectations(lines: list[str], test_line: int) -> tuple[str | None, str | None]:
@@ -106,37 +268,91 @@ def parse_expectations(lines: list[str], test_line: int) -> tuple[str | None, st
     return stdout, stderr
 
 
-def parse_entrypoint_call(node: ast.AST, entrypoint: str) -> list[Any]:
+def parse_entrypoint_call(node: ast.AST, entrypoint: str, context: DiscoveryContext) -> list[Any]:
     if not isinstance(node, ast.Call):
         raise DiscoveryError("expected entrypoint call")
     if not isinstance(node.func, ast.Name) or node.func.id != entrypoint:
         raise DiscoveryError("assertion must call the configured entrypoint")
     if node.keywords:
         raise DiscoveryError("keyword arguments are unsupported")
-    return [literal_from_node(arg) for arg in node.args]
+    return [value_from_node(arg, context) for arg in node.args]
 
 
-def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str]) -> TestCase:
+def parse_math_isclose(test: ast.Call, entrypoint: str, context: DiscoveryContext) -> tuple[list[Any], Any, dict[str, Any]]:
+    if resolve_callee(test.func, context) not in {"math.isclose", "isclose"}:
+        raise DiscoveryError("unsupported function assertion")
+    if len(test.args) != 2:
+        raise DiscoveryError("math.isclose requires actual and expected values")
+    if test.args[0].__class__ is ast.Starred:
+        raise DiscoveryError("unsupported math.isclose arguments")
+    args = parse_entrypoint_call(test.args[0], entrypoint, context)
+    expected = value_from_node(test.args[1], context)
+    tolerance = {"mode": "isclose", "abs": 0.0, "rel": 1e-09}
+    for keyword in test.keywords:
+        if keyword.arg not in {"abs_tol", "rel_tol"}:
+            raise DiscoveryError("unsupported math.isclose keyword")
+        tolerance["abs" if keyword.arg == "abs_tol" else "rel"] = parse_tolerance_value(keyword.value, context)
+    return args, expected, tolerance
+
+
+def parse_abs_difference(
+    test: ast.Compare, entrypoint: str, context: DiscoveryContext
+) -> tuple[list[Any], Any, dict[str, Any]]:
+    if len(test.ops) != 1 or len(test.comparators) != 1:
+        raise DiscoveryError("unsupported absolute difference assertion")
+    strict: bool
+    if isinstance(test.ops[0], ast.Lt):
+        strict = True
+    elif isinstance(test.ops[0], ast.LtE):
+        strict = False
+    else:
+        raise DiscoveryError("unsupported absolute difference comparison")
+    if not isinstance(test.left, ast.Call) or resolve_callee(test.left.func, context) != "abs" or len(test.left.args) != 1:
+        raise DiscoveryError("unsupported absolute difference assertion")
+    diff = test.left.args[0]
+    if not isinstance(diff, ast.BinOp) or not isinstance(diff.op, ast.Sub):
+        raise DiscoveryError("unsupported absolute difference assertion")
+    try:
+        args = parse_entrypoint_call(diff.left, entrypoint, context)
+        expected = value_from_node(diff.right, context)
+    except DiscoveryError:
+        args = parse_entrypoint_call(diff.right, entrypoint, context)
+        expected = value_from_node(diff.left, context)
+    return args, expected, {"mode": "absdiff", "abs": parse_tolerance_value(test.comparators[0], context), "strict": strict}
+
+
+def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str], context: DiscoveryContext) -> TestCase:
     test = node.test
     kind: str
     args: list[Any]
     expected: Any = None
+    tolerance: dict[str, Any] | None = None
 
-    if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
+    if isinstance(test, ast.Call) and resolve_callee(test.func, context) in {"math.isclose", "isclose"}:
+        kind = "eq"
+        args, expected, tolerance = parse_math_isclose(test, entrypoint, context)
+    elif (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Call)
+        and resolve_callee(test.left.func, context) == "abs"
+    ):
+        kind = "eq"
+        args, expected, tolerance = parse_abs_difference(test, entrypoint, context)
+    elif isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
         if isinstance(test.ops[0], ast.Eq):
             kind = "eq"
         elif isinstance(test.ops[0], ast.NotEq):
             kind = "neq"
         else:
             raise DiscoveryError("unsupported comparison assertion")
-        args = parse_entrypoint_call(test.left, entrypoint)
-        expected = literal_from_node(test.comparators[0])
+        args = parse_entrypoint_call(test.left, entrypoint, context)
+        expected = value_from_node(test.comparators[0], context)
     elif isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         kind = "falsy"
-        args = parse_entrypoint_call(test.operand, entrypoint)
+        args = parse_entrypoint_call(test.operand, entrypoint, context)
     else:
         kind = "truthy"
-        args = parse_entrypoint_call(test, entrypoint)
+        args = parse_entrypoint_call(test, entrypoint, context)
 
     expect_stdout, expect_stderr = parse_expectations(lines, node.lineno)
     return TestCase(
@@ -145,18 +361,68 @@ def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str]) -> TestCas
         kind=kind,
         args=args,
         expected=expected,
+        tolerance=tolerance,
         expect_stdout=expect_stdout,
         expect_stderr=expect_stderr,
     )
 
 
-def parse_raise_any(node: ast.Try, entrypoint: str, lines: list[str]) -> TestCase:
+def exception_name(node: ast.AST | None, context: DiscoveryContext) -> str | None:
+    if node is None:
+        return None
+    resolved = resolve_callee(node, context)
+    if not resolved:
+        raise DiscoveryError("unsupported exception type")
+    return resolved.rsplit(".", 1)[-1]
+
+
+def parse_str_exception_call(node: ast.AST, handler_name: str | None) -> bool:
+    return (
+        handler_name is not None
+        and isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "str"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == handler_name
+        and not node.keywords
+    )
+
+
+def parse_message_match(stmt: ast.stmt, handler_name: str | None, context: DiscoveryContext) -> dict[str, str]:
+    if not isinstance(stmt, ast.Assert):
+        raise DiscoveryError("unsupported exception handler body")
+    test = stmt.test
+    if (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.In)
+        and len(test.comparators) == 1
+        and isinstance(test.left, ast.Constant)
+        and isinstance(test.left.value, str)
+        and parse_str_exception_call(test.comparators[0], handler_name)
+    ):
+        return {"mode": "contains", "pattern": test.left.value}
+    if (
+        isinstance(test, ast.Call)
+        and resolve_callee(test.func, context) in {"re.search", "search"}
+        and len(test.args) == 2
+        and not test.keywords
+        and isinstance(test.args[0], ast.Constant)
+        and isinstance(test.args[0].value, str)
+        and parse_str_exception_call(test.args[1], handler_name)
+    ):
+        return {"mode": "regex", "pattern": test.args[0].value}
+    raise DiscoveryError("unsupported exception message assertion")
+
+
+def parse_raise_any(node: ast.Try, entrypoint: str, lines: list[str], context: DiscoveryContext) -> TestCase:
     if node.orelse or node.finalbody or len(node.body) != 2 or len(node.handlers) != 1:
         raise DiscoveryError("unsupported try block")
     call_stmt, assert_stmt = node.body
     if not isinstance(call_stmt, ast.Expr):
         raise DiscoveryError("raise-any block must call entrypoint first")
-    args = parse_entrypoint_call(call_stmt.value, entrypoint)
+    args = parse_entrypoint_call(call_stmt.value, entrypoint, context)
     if (
         not isinstance(assert_stmt, ast.Assert)
         or not isinstance(assert_stmt.test, ast.Constant)
@@ -164,35 +430,62 @@ def parse_raise_any(node: ast.Try, entrypoint: str, lines: list[str]) -> TestCas
     ):
         raise DiscoveryError("raise-any block must assert False after entrypoint call")
     handler = node.handlers[0]
-    catches_exception = (
-        isinstance(handler.type, ast.Name)
-        and handler.type.id == "Exception"
-        and len(handler.body) == 1
-        and isinstance(handler.body[0], ast.Pass)
-    )
-    if not catches_exception:
-        raise DiscoveryError("raise-any block must catch Exception and pass")
+    expected_exception = exception_name(handler.type, context)
+    if not expected_exception:
+        raise DiscoveryError("raise block must catch an exception type")
+    message_match = None
+    if len(handler.body) != 1:
+        raise DiscoveryError("unsupported exception handler body")
+    if isinstance(handler.body[0], ast.Pass):
+        if expected_exception == "Exception":
+            expected_exception = None
+    else:
+        message_match = parse_message_match(handler.body[0], handler.name, context)
     expect_stdout, expect_stderr = parse_expectations(lines, node.lineno)
     return TestCase(
         id="",
         line=node.lineno,
         kind="raises",
         args=args,
+        expected_exception=expected_exception,
+        message_match=message_match,
         expect_stdout=expect_stdout,
         expect_stderr=expect_stderr,
     )
 
 
-def discover_in_body(body: list[ast.stmt], entrypoint: str, lines: list[str]) -> list[TestCase]:
+def handle_import(stmt: ast.stmt, context: DiscoveryContext) -> bool:
+    if isinstance(stmt, ast.Import):
+        for alias in stmt.names:
+            if alias.name not in ALLOWED_IMPORTS:
+                raise DiscoveryError("unsupported import")
+            context.names[alias.asname or alias.name] = ALLOWED_IMPORTS[alias.name]
+        return True
+    if isinstance(stmt, ast.ImportFrom):
+        if stmt.module not in ALLOWED_FROM_IMPORTS or stmt.level != 0:
+            raise DiscoveryError("unsupported import")
+        for alias in stmt.names:
+            if alias.name not in ALLOWED_FROM_IMPORTS[stmt.module]:
+                raise DiscoveryError("unsupported import")
+            context.names[alias.asname or alias.name] = f"{stmt.module}.{alias.name}"
+        return True
+    return False
+
+
+def discover_in_body(
+    body: list[ast.stmt], entrypoint: str, lines: list[str], context: DiscoveryContext
+) -> list[TestCase]:
     discovered: list[TestCase] = []
     for stmt in body:
         if isinstance(stmt, ast.FunctionDef):
-            discovered.extend(discover_in_body(stmt.body, entrypoint, lines))
+            discovered.extend(discover_in_body(stmt.body, entrypoint, lines, context))
         elif isinstance(stmt, ast.Assert):
-            discovered.append(parse_assert(stmt, entrypoint, lines))
+            discovered.append(parse_assert(stmt, entrypoint, lines, context))
         elif isinstance(stmt, ast.Try):
-            discovered.append(parse_raise_any(stmt, entrypoint, lines))
+            discovered.append(parse_raise_any(stmt, entrypoint, lines, context))
         elif isinstance(stmt, ast.Pass):
+            continue
+        elif handle_import(stmt, context):
             continue
         else:
             raise DiscoveryError(f"unsupported code at line {getattr(stmt, 'lineno', '?')}")
@@ -219,6 +512,9 @@ def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
                 kind=test_case.kind,
                 args=test_case.args,
                 expected=test_case.expected,
+                tolerance=test_case.tolerance,
+                expected_exception=test_case.expected_exception,
+                message_match=test_case.message_match,
                 expect_stdout=test_case.expect_stdout,
                 expect_stderr=test_case.expect_stderr,
             )
@@ -237,7 +533,8 @@ def discover_tests(tests_dir: Path, entrypoint: str) -> list[TestCase]:
     except SyntaxError as exc:
         raise DiscoveryError("could not parse tests.py") from exc
     lines = source.splitlines()
-    return assign_ids(discover_in_body(tree.body, entrypoint, lines))
+    context = DiscoveryContext(names={})
+    return assign_ids(discover_in_body(tree.body, entrypoint, lines, context))
 
 
 def make_result(status: str, passed: list[str] | None = None, failed: list[str] | None = None) -> dict[str, Any]:
@@ -249,13 +546,155 @@ def print_result(result: dict[str, Any]) -> int:
     return {"pass": 0, "fail": 1, "error": 2}[result["status"]]
 
 
-def normalize_for_compare(value: Any) -> Any:
-    if value is None or isinstance(value, bool | int | float | str):
+def is_tagged(value: Any, type_name: str | None = None) -> bool:
+    return isinstance(value, dict) and TAG_KEY in value and (type_name is None or value[TAG_KEY] == type_name)
+
+
+def numeric_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if is_tagged(value, "decimal"):
+        return Decimal(value["value"])
+    return None
+
+
+def tolerance_policy(test: dict[str, Any], default_tol: float) -> dict[str, Any]:
+    tolerance = test.get("tolerance")
+    if isinstance(tolerance, dict):
+        return tolerance
+    return {"mode": "default", "abs": default_tol, "rel": 0.0}
+
+
+def numeric_equal(expected: Any, actual: Any, tolerance: dict[str, Any]) -> bool:
+    expected_num = numeric_decimal(expected)
+    actual_num = numeric_decimal(actual)
+    if expected_num is None or actual_num is None:
+        return False
+    diff = abs(actual_num - expected_num)
+    abs_tol = Decimal(str(tolerance.get("abs", 0.0)))
+    if tolerance.get("mode") == "absdiff" and tolerance.get("strict"):
+        return diff < abs_tol
+    rel_tol = Decimal(str(tolerance.get("rel", 0.0)))
+    limit = max(abs_tol, rel_tol * max(abs(actual_num), abs(expected_num)))
+    return diff <= limit
+
+
+def tag_type(value: Any) -> str | None:
+    return value.get(TAG_KEY) if isinstance(value, dict) else None
+
+
+def compare_items_unordered(expected_items: list[Any], actual_items: list[Any], tolerance: dict[str, Any]) -> bool:
+    if len(expected_items) != len(actual_items):
+        return False
+    used: set[int] = set()
+    for expected_item in expected_items:
+        matched = False
+        for index, actual_item in enumerate(actual_items):
+            if index in used:
+                continue
+            if deep_compare(expected_item, actual_item, tolerance):
+                used.add(index)
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def compare_dict_items(expected_items: list[Any], actual_items: list[Any], tolerance: dict[str, Any]) -> bool:
+    if len(expected_items) != len(actual_items):
+        return False
+    used: set[int] = set()
+    exact_tolerance = {"mode": "default", "abs": 0.0, "rel": 0.0}
+    for expected_key, expected_value in expected_items:
+        matched = False
+        for index, (actual_key, actual_value) in enumerate(actual_items):
+            if index in used:
+                continue
+            if deep_compare(expected_key, actual_key, exact_tolerance) and deep_compare(
+                expected_value, actual_value, tolerance
+            ):
+                used.add(index)
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def deep_compare(expected: Any, actual: Any, tolerance: dict[str, Any]) -> bool:
+    if numeric_decimal(expected) is not None and numeric_decimal(actual) is not None:
+        return numeric_equal(expected, actual, tolerance)
+    if type(expected) is not type(actual) and not (isinstance(expected, list) and isinstance(actual, list)):
+        if not (is_tagged(expected) and is_tagged(actual)):
+            return False
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(
+            deep_compare(expected_item, actual_item, tolerance)
+            for expected_item, actual_item in zip(expected, actual, strict=True)
+        )
+    if is_tagged(expected) or is_tagged(actual):
+        if not (is_tagged(expected) and is_tagged(actual)):
+            return False
+        expected_type = tag_type(expected)
+        actual_type = tag_type(actual)
+        if expected_type == "decimal" or actual_type == "decimal":
+            return numeric_equal(expected, actual, tolerance)
+        if expected_type == "dict" and actual_type == "dict":
+            return compare_dict_items(expected["items"], actual["items"], tolerance)
+        if expected_type == "set" and actual_type == "set":
+            return compare_items_unordered(expected["items"], actual["items"], tolerance)
+        if expected_type == "counter" and actual_type == "counter":
+            return compare_dict_items(expected["items"], actual["items"], tolerance)
+        if expected_type == "deque" and actual_type == "deque":
+            return len(expected["items"]) == len(actual["items"]) and all(
+                deep_compare(expected_item, actual_item, tolerance)
+                for expected_item, actual_item in zip(expected["items"], actual["items"], strict=True)
+            )
+        return False
+    return expected == actual
+
+
+def exception_matches(exc: Exception, expected_exception: str | None) -> bool:
+    if expected_exception is None:
+        return True
+    return expected_exception in {cls.__name__ for cls in type(exc).mro()}
+
+
+def message_matches(exc: Exception, matcher: dict[str, str] | None) -> bool:
+    if not matcher:
+        return True
+    message = str(exc)
+    if matcher.get("mode") == "contains":
+        return matcher.get("pattern", "") in message
+    if matcher.get("mode") == "regex":
+        return re.search(matcher.get("pattern", ""), message) is not None
+    return False
+
+
+def decode_arg(value: Any) -> Any:
+    if isinstance(value, list):
+        return [decode_arg(item) for item in value]
+    if not is_tagged(value):
         return value
-    if isinstance(value, tuple | list):
-        return [normalize_for_compare(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): normalize_for_compare(item) for key, item in value.items()}
+    type_name = value[TAG_KEY]
+    if type_name == "decimal":
+        return Decimal(value["value"])
+    if type_name == "dict":
+        return {decode_arg(key): decode_arg(item) for key, item in value["items"]}
+    if type_name == "set":
+        return {decode_arg(item) for item in value["items"]}
+    if type_name == "counter":
+        counter = Counter()
+        for key, count in value["items"]:
+            counter[decode_arg(key)] = decode_arg(count)
+        return counter
+    if type_name == "deque":
+        return deque(decode_arg(item) for item in value["items"])
     return value
 
 
@@ -283,7 +722,9 @@ def resolve_python_callable(solution_path: Path, entrypoint: str) -> Any:
     raise RuntimeError("entrypoint not found")
 
 
-def execute_python_tests(solution_path: Path, entrypoint: str, tests: list[dict[str, Any]]) -> dict[str, Any]:
+def execute_python_tests(
+    solution_path: Path, entrypoint: str, tests: list[dict[str, Any]], default_tol: float = 0.0
+) -> dict[str, Any]:
     try:
         callable_under_test = resolve_python_callable(solution_path, entrypoint)
     except Exception:
@@ -298,19 +739,28 @@ def execute_python_tests(solution_path: Path, entrypoint: str, tests: list[dict[
         try:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
                 raised = False
+                raised_exc = None
                 try:
-                    actual = callable_under_test(*test["args"])
-                except Exception:
+                    actual = callable_under_test(*[decode_arg(arg) for arg in test["args"]])
+                except Exception as exc:
                     raised = True
+                    raised_exc = exc
                     actual = None
                 if test["kind"] == "raises":
-                    ok = raised
+                    ok = (
+                        raised
+                        and raised_exc is not None
+                        and exception_matches(raised_exc, test.get("expected_exception"))
+                        and message_matches(raised_exc, test.get("message_match"))
+                    )
                 elif raised:
                     ok = False
                 elif test["kind"] == "eq":
-                    ok = normalize_for_compare(actual) == test["expected"]
+                    ok = deep_compare(test["expected"], normalize_runtime_value(actual), tolerance_policy(test, default_tol))
                 elif test["kind"] == "neq":
-                    ok = normalize_for_compare(actual) != test["expected"]
+                    ok = not deep_compare(
+                        test["expected"], normalize_runtime_value(actual), tolerance_policy(test, default_tol)
+                    )
                 elif test["kind"] == "truthy":
                     ok = bool(actual)
                 elif test["kind"] == "falsy":
@@ -351,7 +801,7 @@ def main():
     if len(sys.argv) != 2:
         return print_result({{"status": "error", "passed": [], "failed": []}})
     data = json.loads(PAYLOAD)
-    result = execute_python_tests(Path(sys.argv[1]), data["entrypoint"], data["tests"])
+    result = execute_python_tests(Path(sys.argv[1]), data["entrypoint"], data["tests"], float(os.environ.get("BABEL_CODE_GOAT_TOL", "0")))
     return print_result(result)
 
 if __name__ == "__main__":
@@ -368,20 +818,146 @@ def javascript_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
 const path = require("path");
 const {{ pathToFileURL }} = require("url");
 const payload = {payload};
+const TAG = "{TAG_KEY}";
+const defaultTol = Number(process.env.BABEL_CODE_GOAT_TOL || "0");
+
+function isTagged(value, typeName) {{
+  return value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, TAG) && (!typeName || value[TAG] === typeName);
+}}
+
+function stable(value) {{
+  return JSON.stringify(value, (key, inner) => {{
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) return inner;
+    const out = {{}};
+    for (const objectKey of Object.keys(inner).sort()) out[objectKey] = inner[objectKey];
+    return out;
+  }});
+}}
+
+function sortValues(values) {{
+  return values.sort((a, b) => stable(a).localeCompare(stable(b)));
+}}
 
 function normalize(value) {{
   if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (isTagged(value)) return value;
   if (Array.isArray(value)) return value.map(normalize);
+  if (value instanceof Set) return {{[TAG]: "set", items: sortValues(Array.from(value, normalize))}};
+  if (value instanceof Map) {{
+    const items = Array.from(value.entries(), ([key, item]) => [normalize(key), normalize(item)]);
+    items.sort((a, b) => stable(a[0]).localeCompare(stable(b[0])));
+    return {{[TAG]: "dict", items}};
+  }}
   if (typeof value === "object") {{
-    const out = {{}};
-    for (const key of Object.keys(value).sort()) out[key] = normalize(value[key]);
-    return out;
+    const items = Object.keys(value).sort().map(key => [key, normalize(value[key])]);
+    return {{[TAG]: "dict", items}};
   }}
   return value;
 }}
 
-function deepEqual(a, b) {{
-  return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b));
+function numericValue(value) {{
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (isTagged(value, "decimal")) return Number(value.value);
+  return null;
+}}
+
+function tolerancePolicy(test) {{
+  return test.tolerance || {{mode: "default", abs: defaultTol, rel: 0}};
+}}
+
+function numericEqual(expected, actual, tolerance) {{
+  const expectedNum = numericValue(expected);
+  const actualNum = numericValue(actual);
+  if (expectedNum === null || actualNum === null) return false;
+  const diff = Math.abs(actualNum - expectedNum);
+  const absTol = Number(tolerance.abs || 0);
+  if (tolerance.mode === "absdiff" && tolerance.strict) return diff < absTol;
+  const relTol = Number(tolerance.rel || 0);
+  return diff <= Math.max(absTol, relTol * Math.max(Math.abs(expectedNum), Math.abs(actualNum)));
+}}
+
+function compareUnordered(expectedItems, actualItems, tolerance) {{
+  if (expectedItems.length !== actualItems.length) return false;
+  const used = new Set();
+  for (const expectedItem of expectedItems) {{
+    let matched = false;
+    for (let index = 0; index < actualItems.length; index++) {{
+      if (used.has(index)) continue;
+      if (deepEqual(expectedItem, actualItems[index], tolerance)) {{
+        used.add(index);
+        matched = true;
+        break;
+      }}
+    }}
+    if (!matched) return false;
+  }}
+  return true;
+}}
+
+function compareDictItems(expectedItems, actualItems, tolerance) {{
+  if (expectedItems.length !== actualItems.length) return false;
+  const used = new Set();
+  const exact = {{mode: "default", abs: 0, rel: 0}};
+  for (const [expectedKey, expectedValue] of expectedItems) {{
+    let matched = false;
+    for (let index = 0; index < actualItems.length; index++) {{
+      if (used.has(index)) continue;
+      const [actualKey, actualValue] = actualItems[index];
+      if (deepEqual(expectedKey, actualKey, exact) && deepEqual(expectedValue, actualValue, tolerance)) {{
+        used.add(index);
+        matched = true;
+        break;
+      }}
+    }}
+    if (!matched) return false;
+  }}
+  return true;
+}}
+
+function deepEqual(expected, actual, tolerance) {{
+  if (numericValue(expected) !== null && numericValue(actual) !== null) return numericEqual(expected, actual, tolerance);
+  if (Array.isArray(expected) || Array.isArray(actual)) {{
+    return Array.isArray(expected) && Array.isArray(actual) && expected.length === actual.length &&
+      expected.every((item, index) => deepEqual(item, actual[index], tolerance));
+  }}
+  if (isTagged(expected) || isTagged(actual)) {{
+    if (!isTagged(expected) || !isTagged(actual)) return false;
+    const expectedType = expected[TAG];
+    const actualType = actual[TAG];
+    if (expectedType === "decimal" || actualType === "decimal") return numericEqual(expected, actual, tolerance);
+    if (expectedType === "dict" && actualType === "dict") return compareDictItems(expected.items, actual.items, tolerance);
+    if (expectedType === "set" && actualType === "set") return compareUnordered(expected.items, actual.items, tolerance);
+    if ((expectedType === "counter" && actualType === "counter") || (expectedType === "counter" && actualType === "dict") || (expectedType === "dict" && actualType === "counter")) return compareDictItems(expected.items, actual.items, tolerance);
+    if (expectedType === "deque" && actualType === "deque") return expected.items.length === actual.items.length && expected.items.every((item, index) => deepEqual(item, actual.items[index], tolerance));
+    return false;
+  }}
+  return Object.is(expected, actual);
+}}
+
+function decodeArg(value) {{
+  if (Array.isArray(value)) return value.map(decodeArg);
+  if (!isTagged(value)) return value;
+  if (value[TAG] === "decimal") return Number(value.value);
+  if (value[TAG] === "dict") return new Map(value.items.map(([key, item]) => [decodeArg(key), decodeArg(item)]));
+  if (value[TAG] === "set") return new Set(value.items.map(decodeArg));
+  if (value[TAG] === "counter") return new Map(value.items.map(([key, count]) => [decodeArg(key), decodeArg(count)]));
+  if (value[TAG] === "deque") return value.items.map(decodeArg);
+  return value;
+}}
+
+function exceptionMatches(error, expectedException) {{
+  if (!expectedException) return true;
+  const names = new Set([error && error.name, error && error.constructor && error.constructor.name].filter(Boolean));
+  return names.has(expectedException);
+}}
+
+function messageMatches(error, matcher) {{
+  if (!matcher) return true;
+  const message = String(error && error.message !== undefined ? error.message : error);
+  if (matcher.mode === "contains") return message.includes(matcher.pattern || "");
+  if (matcher.mode === "regex") return new RegExp(matcher.pattern || "").test(message);
+  return false;
 }}
 
 function findCallable(moduleValue, entrypoint) {{
@@ -448,16 +1024,18 @@ async function main() {{
     try {{
       let actual;
       let raised = false;
+      let raisedError = null;
       try {{
-        actual = fn(...test.args);
+        actual = fn(...test.args.map(decodeArg));
         if (actual && typeof actual.then === "function") actual = await actual;
       }} catch (error) {{
         raised = true;
+        raisedError = error;
       }}
-      if (test.kind === "raises") ok = raised;
+      if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
       else if (raised) ok = false;
-      else if (test.kind === "eq") ok = deepEqual(actual, test.expected);
-      else if (test.kind === "neq") ok = !deepEqual(actual, test.expected);
+      else if (test.kind === "eq") ok = deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
+      else if (test.kind === "neq") ok = !deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
       else if (test.kind === "truthy") ok = !!actual;
       else if (test.kind === "falsy") ok = !actual;
     }} catch (error) {{
@@ -556,6 +1134,7 @@ def command_test(args: argparse.Namespace) -> int:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
         env["BABEL_CODE_GOAT_ROOT"] = root
+        env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
         completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
     except Exception:
@@ -594,6 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("solution_path")
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
+    test.add_argument("--tol", type=float, default=0.0)
     test.set_defaults(func=command_test)
     return parser
 
