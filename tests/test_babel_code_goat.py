@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,10 @@ CLI = ROOT / "babel_code_goat.py"
 sys.path.insert(0, str(ROOT))
 
 from babel_code_goat import DiscoveryError, discover_tests  # noqa: E402
+
+
+CPP_AVAILABLE = shutil.which("g++") is not None or shutil.which("clang++") is not None
+RUST_AVAILABLE = shutil.which("rustc") is not None
 
 
 def run_cli(*args, cwd=None):
@@ -43,6 +48,8 @@ def test_supported_languages_generate_expected_files(tmp_path):
         "python": "tester.py",
         "javascript": "tester.js",
         "typescript": "tester.ts",
+        "cpp": "tester.cpp",
+        "rust": "tester.rs",
     }.items():
         tests_dir = write_tests(tmp_path / lang, "def cases():\n    assert solve(1) == 1\n")
 
@@ -66,7 +73,7 @@ def test_unsupported_language_handling(tmp_path):
 def test_failed_generate_preserves_existing_tester_files(tmp_path):
     tests_dir = write_tests(tmp_path, "import os\n")
     preserved = {}
-    for filename in ("tester.py", "tester.js", "tester.ts"):
+    for filename in ("tester.py", "tester.js", "tester.ts", "tester.cpp", "tester.rs"):
         path = tests_dir / filename
         path.write_text(f"old {filename}", encoding="utf-8")
         preserved[filename] = path.read_text(encoding="utf-8")
@@ -78,16 +85,26 @@ def test_failed_generate_preserves_existing_tester_files(tmp_path):
         assert (tests_dir / filename).read_text(encoding="utf-8") == content
 
 
-def test_missing_tester_errors_and_does_not_create_tester(tmp_path):
+@pytest.mark.parametrize(
+    ("lang", "solution_name", "solution_source", "tester_name"),
+    [
+        ("python", "solution.py", "def solve(x):\n    return x\n", "tester.py"),
+        ("javascript", "solution.js", "function solve(x) { return x; }\nmodule.exports = {solve};\n", "tester.js"),
+        ("typescript", "solution.js", "function solve(x) { return x; }\nmodule.exports = {solve};\n", "tester.ts"),
+        ("cpp", "solution.cpp", "long long solve(long long x) { return x; }\n", "tester.cpp"),
+        ("rust", "solution.rs", "fn solve(x: i64) -> i64 { x }\n", "tester.rs"),
+    ],
+)
+def test_missing_tester_errors_and_does_not_create_tester(tmp_path, lang, solution_name, solution_source, tester_name):
     tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
-    solution = tmp_path / "solution.py"
-    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+    solution = tmp_path / solution_name
+    solution.write_text(solution_source, encoding="utf-8")
 
-    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+    completed = run_cli("test", solution, tests_dir, "--lang", lang)
 
     assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
     assert completed.returncode == 2
-    assert not (tests_dir / "tester.py").exists()
+    assert not (tests_dir / tester_name).exists()
 
 
 def test_discovery_accepts_allowed_constructs_and_duplicate_line_ids(tmp_path):
@@ -708,6 +725,222 @@ module.exports = {solve};
             "failed": ["tests.py:4"],
         }
         assert completed.returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("lang", "available", "solution_name", "solution_source"),
+    [
+        (
+            "cpp",
+            CPP_AVAILABLE,
+            "solution.cpp",
+            """#include <optional>
+
+std::optional<long long> solve(std::optional<long long> value) {
+    return value;
+}
+""",
+        ),
+        (
+            "rust",
+            RUST_AVAILABLE,
+            "solution.rs",
+            """fn solve(value: Option<i64>) -> Option<i64> {
+    value
+}
+""",
+        ),
+    ],
+)
+def test_cpp_and_rust_execution_support_nullable_values(tmp_path, lang, available, solution_name, solution_source):
+    if not available:
+        pytest.skip(f"{lang} toolchain is unavailable")
+    tests_dir = write_tests(
+        tmp_path / lang,
+        """def cases():
+    assert solve(None) == None
+    assert solve(3) == 3
+""",
+    )
+    solution = tmp_path / lang / solution_name
+    solution.write_text(solution_source, encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+    assert parse_result(completed) == {
+        "status": "pass",
+        "passed": ["tests.py:2", "tests.py:3"],
+        "failed": [],
+    }
+    assert completed.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("lang", "available", "solution_name", "solution_source"),
+    [
+        (
+            "cpp",
+            CPP_AVAILABLE,
+            "solution.cpp",
+            """#include <algorithm>
+#include <vector>
+
+void normalize(std::vector<long long>& values) {
+    std::sort(values.begin(), values.end());
+}
+""",
+        ),
+        (
+            "rust",
+            RUST_AVAILABLE,
+            "solution.rs",
+            """fn normalize(values: &mut Vec<i64>) {
+    values.sort();
+}
+""",
+        ),
+    ],
+)
+def test_cpp_and_rust_execution_support_mutation_tests(tmp_path, lang, available, solution_name, solution_source):
+    if not available:
+        pytest.skip(f"{lang} toolchain is unavailable")
+    tests_dir = write_tests(
+        tmp_path / lang,
+        """values = [3, 1, 2]
+normalize(values)
+assert values == [1, 2, 3]
+""",
+    )
+    solution = tmp_path / lang / solution_name
+    solution.write_text(solution_source, encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "normalize", "--lang", lang).returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+    assert parse_result(completed) == {
+        "status": "pass",
+        "passed": ["tests.py:3"],
+        "failed": [],
+    }
+    assert completed.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("case_name", "test_source", "cpp_source"),
+    [
+        (
+            "map-null",
+            """def cases():
+    assert solve("items") == {"a": 1, "b": None}
+""",
+            """#include <map>
+#include <optional>
+#include <string>
+
+std::map<std::string, std::optional<long long>> solve(std::string) {
+    return {{"b", std::nullopt}, {"a", 1}};
+}
+""",
+        ),
+        (
+            "set",
+            """def cases():
+    assert solve("items") == set([3, 1, 2])
+""",
+            """#include <set>
+#include <string>
+
+std::set<long long> solve(std::string) {
+    return {2, 3, 1};
+}
+""",
+        ),
+        (
+            "tolerance",
+            """def cases():
+    assert solve("near") == 1.0
+""",
+            """#include <string>
+
+long double solve(std::string) {
+    return 1.0005L;
+}
+""",
+        ),
+        (
+            "expression",
+            """def cases():
+    assert sorted(solve("items")) == [1, 2, 3]
+    assert solve("items")[0] == 3
+""",
+            """#include <string>
+#include <vector>
+
+std::vector<long long> solve(std::string) {
+    return {3, 1, 2};
+}
+""",
+        ),
+        (
+            "raises",
+            """def cases():
+    try:
+        solve("bad")
+        assert False
+    except ValueError as e:
+        assert "bad" in str(e)
+""",
+            """#include <stdexcept>
+#include <string>
+
+long long solve(std::string) {
+    throw std::runtime_error("bad input");
+}
+""",
+        ),
+    ],
+)
+@pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ toolchain is unavailable")
+def test_cpp_execution_parity_cases(tmp_path, case_name, test_source, cpp_source):
+    tests_dir = write_tests(tmp_path / case_name, test_source)
+    solution = tmp_path / case_name / "solution.cpp"
+    solution.write_text(cpp_source, encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "cpp").returncode == 0
+    command = ["test", solution, tests_dir, "--lang", "cpp"]
+    if case_name == "tolerance":
+        command.extend(["--tol", "0.001"])
+    completed = run_cli(*command)
+
+    assert parse_result(completed)["status"] == "pass"
+    assert completed.returncode == 0
+
+
+@pytest.mark.skipif(True, reason="Rust deque translation is intentionally skipped")
+def test_rust_deque_behavior_is_skipped():
+    pass
+
+
+@pytest.mark.parametrize(
+    ("lang", "available", "solution_name", "solution_source"),
+    [
+        ("cpp", CPP_AVAILABLE, "solution.cpp", "long long solve(long long x) { return x }\n"),
+        ("rust", RUST_AVAILABLE, "solution.rs", "fn solve(x: i64) -> i64 { x \n"),
+    ],
+)
+def test_cpp_and_rust_compile_failures_report_error_json(tmp_path, lang, available, solution_name, solution_source):
+    if not available:
+        pytest.skip(f"{lang} toolchain is unavailable")
+    tests_dir = write_tests(tmp_path / lang, "def cases():\n    assert solve(1) == 1\n")
+    solution = tmp_path / lang / solution_name
+    solution.write_text(solution_source, encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+    assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
+    assert completed.returncode == 2
 
 
 def test_cli_discovers_nested_python_test_files_for_all_targets(tmp_path):
