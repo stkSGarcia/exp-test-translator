@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -2989,6 +2990,18 @@ def run_compiled_tester(
 class TesterRun:
     completed: subprocess.CompletedProcess[str] | None = None
     timed_out: bool = False
+    runtime_ns: int = 0
+    memory_kb: int = 0
+
+
+@dataclass(frozen=True)
+class CommandContext:
+    tests_dir: Path
+    tester: Path
+    payload: dict[str, Any]
+    discovered: list[dict[str, Any]]
+    in_scope: list[dict[str, Any]]
+    env: dict[str, str]
 
 
 def test_case_from_jsonable(test: dict[str, Any]) -> TestCase:
@@ -3035,6 +3048,8 @@ def run_tester_process(
     env: dict[str, str],
     timeout: float | None = None,
 ) -> TesterRun:
+    start_ns = time.perf_counter_ns()
+    start_usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     try:
         if lang == "python":
             command = [sys.executable, str(tester), str(solution_path)]
@@ -3044,9 +3059,13 @@ def run_tester_process(
             completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout)
         else:
             completed = run_compiled_tester(lang, tester, solution_path, env, timeout=timeout)
-        return TesterRun(completed=completed)
+        runtime_ns = time.perf_counter_ns() - start_ns
+        memory_kb = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss - start_usage, 0)
+        return TesterRun(completed=completed, runtime_ns=runtime_ns, memory_kb=memory_kb)
     except subprocess.TimeoutExpired:
-        return TesterRun(timed_out=True)
+        runtime_ns = time.perf_counter_ns() - start_ns
+        memory_kb = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss - start_usage, 0)
+        return TesterRun(timed_out=True, runtime_ns=runtime_ns, memory_kb=memory_kb)
 
 
 def parse_tester_result(completed: subprocess.CompletedProcess[str] | None) -> dict[str, Any] | None:
@@ -3109,6 +3128,51 @@ def timeout_seconds(milliseconds: int | None) -> float | None:
     return max(milliseconds, 0) / 1000
 
 
+def has_invalid_timeout_args(args: argparse.Namespace) -> bool:
+    return (args.timeout_ms is not None and args.timeout_ms < 0) or (
+        args.total_timeout_ms is not None and args.total_timeout_ms < 0
+    )
+
+
+def command_env(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    root = str(Path(__file__).resolve().parent)
+    env["BABEL_CODE_GOAT_ROOT"] = root
+    env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def prepare_command_context(args: argparse.Namespace) -> CommandContext | None:
+    if args.lang not in SUPPORTED_LANGS or has_invalid_timeout_args(args):
+        return None
+    tests_dir = Path(args.tests_dir)
+    tester = tests_dir / SUPPORTED_LANGS[args.lang]["tester"]
+    if not tester.exists():
+        return None
+    try:
+        payload = extract_tester_payload(tester, args.lang)
+        discovered = [test.to_jsonable() for test in discover_tests(tests_dir, payload["entrypoint"])]
+    except Exception:
+        return None
+    if discovered != payload.get("tests"):
+        return None
+
+    in_scope = discovered
+    if args.run is not None:
+        in_scope = [test for test in discovered if test["id"] == args.run]
+        if not in_scope:
+            return None
+    return CommandContext(
+        tests_dir=tests_dir,
+        tester=tester,
+        payload=payload,
+        discovered=discovered,
+        in_scope=in_scope,
+        env=command_env(args),
+    )
+
+
 def run_tests_individually(
     args: argparse.Namespace,
     entrypoint: str,
@@ -3145,6 +3209,47 @@ def run_tests_individually(
     return make_result("pass" if not failed else "fail", passed, failed)
 
 
+@dataclass(frozen=True)
+class ProfileObservation:
+    result: dict[str, Any] | None
+    runtime_ns: int
+    memory_kb: int
+
+
+def run_profile_once(args: argparse.Namespace, context: CommandContext) -> ProfileObservation:
+    start_ns = time.perf_counter_ns()
+    start_usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    if args.timeout_ms is not None or args.total_timeout_ms is not None:
+        result = run_tests_individually(args, context.payload["entrypoint"], context.in_scope, context.env)
+    else:
+        result = run_scoped_once(args, context.payload["entrypoint"], context.in_scope, context.tester, context.env)
+    runtime_ns = time.perf_counter_ns() - start_ns
+    memory_kb = max(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss - start_usage, 0)
+    return ProfileObservation(result=result, runtime_ns=runtime_ns, memory_kb=memory_kb)
+
+
+def stats(values: list[int]) -> dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "std": 0.0}
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return {"mean": mean, "std": variance ** 0.5}
+
+
+def make_profile_result(
+    status: str,
+    passed: list[str],
+    failed: list[str],
+    runtime_values: list[int],
+    memory_values: list[int] | None = None,
+) -> dict[str, Any]:
+    result = make_result(status, passed, failed)
+    result["runtime_ns"] = stats(runtime_values)
+    if memory_values is not None:
+        result["memory_kb"] = stats(memory_values)
+    return result
+
+
 def command_generate(args: argparse.Namespace) -> int:
     if args.lang not in SUPPORTED_LANGS:
         sys.stderr.write(f"error: unsupported language: {args.lang}\n")
@@ -3158,49 +3263,59 @@ def command_generate(args: argparse.Namespace) -> int:
 
 
 def command_test(args: argparse.Namespace) -> int:
-    if args.lang not in SUPPORTED_LANGS:
-        return print_result(RESULT_ERROR)
-    if (args.timeout_ms is not None and args.timeout_ms < 0) or (
-        args.total_timeout_ms is not None and args.total_timeout_ms < 0
-    ):
-        return print_result(RESULT_ERROR)
-    tests_dir = Path(args.tests_dir)
-    tester = tests_dir / SUPPORTED_LANGS[args.lang]["tester"]
-    if not tester.exists():
-        return print_result(RESULT_ERROR)
-    try:
-        payload = extract_tester_payload(tester, args.lang)
-        discovered = [test.to_jsonable() for test in discover_tests(tests_dir, payload["entrypoint"])]
-        if discovered != payload["tests"]:
-            return print_result(RESULT_ERROR)
-    except Exception:
+    context = prepare_command_context(args)
+    if context is None:
         return print_result(RESULT_ERROR)
 
     if args.list_tests:
-        return print_result(make_result("pass", [test["id"] for test in discovered], []))
-
-    in_scope = discovered
-    if args.run is not None:
-        in_scope = [test for test in discovered if test["id"] == args.run]
-        if not in_scope:
-            return print_result(RESULT_ERROR)
+        return print_result(make_result("pass", [test["id"] for test in context.discovered], []))
 
     try:
-        env = os.environ.copy()
-        root = str(Path(__file__).resolve().parent)
-        env["BABEL_CODE_GOAT_ROOT"] = root
-        env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
-        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-
         if args.timeout_ms is not None or args.total_timeout_ms is not None:
-            result = run_tests_individually(args, payload["entrypoint"], in_scope, env)
+            result = run_tests_individually(args, context.payload["entrypoint"], context.in_scope, context.env)
         else:
-            result = run_scoped_once(args, payload["entrypoint"], in_scope, tester, env)
+            result = run_scoped_once(args, context.payload["entrypoint"], context.in_scope, context.tester, context.env)
     except Exception:
         return print_result(RESULT_ERROR)
     if result is None:
         return print_result(RESULT_ERROR)
     return print_result(result)
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    if args.trials < 1 or args.warmup < 0 or args.warmup >= args.trials:
+        return print_result(RESULT_ERROR)
+    context = prepare_command_context(args)
+    if context is None:
+        return print_result(RESULT_ERROR)
+
+    if args.list_tests:
+        return print_result(
+            make_profile_result("pass", [test["id"] for test in context.discovered], [], [0], [0] if args.memory else None)
+        )
+
+    measured: list[ProfileObservation] = []
+    try:
+        for index in range(args.warmup + args.trials):
+            observation = run_profile_once(args, context)
+            if observation.result is None:
+                return print_result(RESULT_ERROR)
+            if index >= args.warmup:
+                measured.append(observation)
+    except Exception:
+        return print_result(RESULT_ERROR)
+
+    failed_ids: set[str] = set()
+    for observation in measured:
+        failed_ids.update(observation.result["failed"])
+    scope_ids = [test["id"] for test in context.in_scope]
+    passed = [test_id for test_id in scope_ids if test_id not in failed_ids]
+    failed = [test_id for test_id in scope_ids if test_id in failed_ids]
+    status = "pass" if not failed else "fail"
+    memory_values = [observation.memory_kb for observation in measured] if args.memory else None
+    return print_result(
+        make_profile_result(status, passed, failed, [observation.runtime_ns for observation in measured], memory_values)
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3223,6 +3338,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms", type=int)
     test.add_argument("--total-timeout-ms", type=int)
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("-n", dest="trials", type=int, default=1)
+    profile.add_argument("--warmup", type=int, default=0)
+    profile.add_argument("--memory", action="store_true")
+    profile.add_argument("--tol", type=float, default=0.0)
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms", type=int)
+    profile.add_argument("--total-timeout-ms", type=int)
+    profile.set_defaults(func=command_profile)
     return parser
 
 
