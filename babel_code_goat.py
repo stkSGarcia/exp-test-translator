@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,8 @@ SUPPORTED_LANGS = {
     "python": {"tester": "tester.py", "runner": "python"},
     "javascript": {"tester": "tester.js", "runner": "node"},
     "typescript": {"tester": "tester.ts", "runner": "node"},
+    "cpp": {"tester": "tester.cpp", "runner": "compiled"},
+    "rust": {"tester": "tester.rs", "runner": "compiled"},
 }
 RESULT_ERROR = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"^\s*#\s*expect_(stdout|stderr):\s*(.+?)\s*$")
@@ -2054,13 +2057,795 @@ main().then(code => process.exit(code)).catch(() => {{
 """
 
 
+def native_payload(entrypoint: str, tests: list[TestCase]) -> str:
+    return json.dumps(
+        {"entrypoint": entrypoint, "tests": [test.to_jsonable() for test in tests]},
+        separators=(",", ":"),
+    )
+
+
+def merge_native_type(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    if left["kind"] == "unknown":
+        return right
+    if right["kind"] == "unknown":
+        return left
+    if left["kind"] == "optional" or right["kind"] == "optional":
+        left_inner = left["item"] if left["kind"] == "optional" else left
+        right_inner = right["item"] if right["kind"] == "optional" else right
+        return {"kind": "optional", "item": merge_native_type(left_inner, right_inner)}
+    if left["kind"] == right["kind"]:
+        if left["kind"] in {"list", "set"}:
+            return {"kind": left["kind"], "item": merge_native_type(left["item"], right["item"])}
+        if left["kind"] == "map":
+            return {
+                "kind": "map",
+                "key": merge_native_type(left["key"], right["key"]),
+                "value": merge_native_type(left["value"], right["value"]),
+            }
+        return left
+    if {left["kind"], right["kind"]} <= {"int", "float"}:
+        return {"kind": "float"}
+    return {"kind": "value"}
+
+
+def infer_native_type(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"kind": "optional", "item": {"kind": "unknown"}}
+    if isinstance(value, bool):
+        return {"kind": "bool"}
+    if isinstance(value, int):
+        return {"kind": "int"}
+    if isinstance(value, float):
+        return {"kind": "float"}
+    if isinstance(value, str):
+        return {"kind": "string"}
+    if isinstance(value, list):
+        item_type = {"kind": "unknown"}
+        for item in value:
+            item_type = merge_native_type(item_type, infer_native_type(item))
+        return {"kind": "list", "item": finalize_native_type(item_type)}
+    if is_tagged(value, "decimal"):
+        return {"kind": "float"}
+    if is_tagged(value, "set") or is_tagged(value, "deque"):
+        item_type = {"kind": "unknown"}
+        for item in value["items"]:
+            item_type = merge_native_type(item_type, infer_native_type(item))
+        return {"kind": "set" if is_tagged(value, "set") else "list", "item": finalize_native_type(item_type)}
+    if is_tagged(value, "counter"):
+        key_type = {"kind": "unknown"}
+        for key, _count in value["items"]:
+            key_type = merge_native_type(key_type, infer_native_type(key))
+        return {"kind": "map", "key": finalize_native_type(key_type), "value": {"kind": "int"}}
+    if is_tagged(value, "dict"):
+        key_type = {"kind": "unknown"}
+        value_type = {"kind": "unknown"}
+        for key, item in value["items"]:
+            key_type = merge_native_type(key_type, infer_native_type(key))
+            value_type = merge_native_type(value_type, infer_native_type(item))
+        return {
+            "kind": "map",
+            "key": finalize_native_type(key_type),
+            "value": finalize_native_type(value_type),
+        }
+    return {"kind": "value"}
+
+
+def finalize_native_type(type_info: dict[str, Any]) -> dict[str, Any]:
+    if type_info["kind"] == "unknown":
+        return {"kind": "int"}
+    if type_info["kind"] == "optional":
+        return {"kind": "optional", "item": finalize_native_type(type_info["item"])}
+    if type_info["kind"] in {"list", "set"}:
+        return {"kind": type_info["kind"], "item": finalize_native_type(type_info["item"])}
+    if type_info["kind"] == "map":
+        return {
+            "kind": "map",
+            "key": finalize_native_type(type_info["key"]),
+            "value": finalize_native_type(type_info["value"]),
+        }
+    return type_info
+
+
+def cpp_type(type_info: dict[str, Any]) -> str:
+    kind = type_info["kind"]
+    if kind == "bool":
+        return "bool"
+    if kind == "int":
+        return "int"
+    if kind == "float":
+        return "long double"
+    if kind == "string":
+        return "std::string"
+    if kind == "list":
+        return f"std::vector<{cpp_type(type_info['item'])}>"
+    if kind == "set":
+        return f"std::set<{cpp_type(type_info['item'])}>"
+    if kind == "map":
+        return f"std::map<{cpp_type(type_info['key'])}, {cpp_type(type_info['value'])}>"
+    if kind == "optional":
+        return f"std::optional<{cpp_type(type_info['item'])}>"
+    return "BcgValue"
+
+
+def render_cpp_value(value: Any, type_info: dict[str, Any] | None = None) -> str:
+    type_info = finalize_native_type(type_info or infer_native_type(value))
+    if type_info["kind"] == "optional":
+        inner = type_info["item"]
+        optional_type = cpp_type(type_info)
+        if value is None:
+            return f"{optional_type}{{std::nullopt}}"
+        return f"{optional_type}{{{render_cpp_value(value, inner)}}}"
+    if value is None:
+        return "std::optional<int>{std::nullopt}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{repr(value)}L"
+    if isinstance(value, str):
+        return f"std::string{{{json.dumps(value)}}}"
+    if isinstance(value, list):
+        item_type = type_info["item"] if type_info["kind"] == "list" else finalize_native_type({"kind": "unknown"})
+        return f"{cpp_type({'kind': 'list', 'item': item_type})}{{{', '.join(render_cpp_value(item, item_type) for item in value)}}}"
+    if is_tagged(value, "decimal"):
+        return f"{value['value']}L"
+    if is_tagged(value, "set"):
+        item_type = type_info["item"] if type_info["kind"] == "set" else finalize_native_type({"kind": "unknown"})
+        return f"{cpp_type({'kind': 'set', 'item': item_type})}{{{', '.join(render_cpp_value(item, item_type) for item in value['items'])}}}"
+    if is_tagged(value, "deque"):
+        item_type = type_info["item"] if type_info["kind"] == "list" else finalize_native_type({"kind": "unknown"})
+        return f"{cpp_type({'kind': 'list', 'item': item_type})}{{{', '.join(render_cpp_value(item, item_type) for item in value['items'])}}}"
+    if is_tagged(value, "counter") or is_tagged(value, "dict"):
+        if type_info["kind"] == "map":
+            key_type = type_info["key"]
+            value_type = type_info["value"]
+        else:
+            key_type = value_type = finalize_native_type({"kind": "unknown"})
+        items = ", ".join(
+            f"{{{render_cpp_value(key, key_type)}, {render_cpp_value(item, value_type)}}}"
+            for key, item in value["items"]
+        )
+        return f"{cpp_type({'kind': 'map', 'key': key_type, 'value': value_type})}{{{items}}}"
+    return "BcgValue{}"
+
+
+def cpp_bcg_literal(value: Any) -> str:
+    if value is None:
+        return "BcgValue::null()"
+    if isinstance(value, bool):
+        return f"BcgValue::boolean({'true' if value else 'false'})"
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return f"BcgValue::number({repr(value)}L)"
+    if isinstance(value, str):
+        return f"BcgValue::string({json.dumps(value)})"
+    if isinstance(value, list):
+        return f"BcgValue::list({{{', '.join(cpp_bcg_literal(item) for item in value)}}})"
+    if is_tagged(value, "decimal"):
+        return f"BcgValue::number({value['value']}L)"
+    if is_tagged(value, "set"):
+        return f"BcgValue::set({{{', '.join(cpp_bcg_literal(item) for item in value['items'])}}})"
+    if is_tagged(value, "counter"):
+        return f"BcgValue::counter({{{', '.join(f'{{{cpp_bcg_literal(key)}, {cpp_bcg_literal(count)}}}' for key, count in value['items'])}}})"
+    if is_tagged(value, "deque"):
+        return f"BcgValue::deque({{{', '.join(cpp_bcg_literal(item) for item in value['items'])}}})"
+    if is_tagged(value, "dict"):
+        return f"BcgValue::dict({{{', '.join(f'{{{cpp_bcg_literal(key)}, {cpp_bcg_literal(item)}}}' for key, item in value['items'])}}})"
+    return "BcgValue::null()"
+
+
+def cpp_expr_value(expression: dict[str, Any], actual: str = "actual_value", variables: str = "variables") -> str:
+    op = expression.get("op")
+    if op == "const":
+        return cpp_bcg_literal(expression.get("value"))
+    if op == "actual":
+        return actual
+    if op == "var":
+        return f'{variables}.at({json.dumps(expression["name"])})'
+    if op == "unary":
+        return f'bcg_unary({json.dumps(expression["operator"])}, {cpp_expr_value(expression["operand"], actual, variables)})'
+    if op == "binary":
+        return (
+            f'bcg_binary({json.dumps(expression["operator"])}, '
+            f'{cpp_expr_value(expression["left"], actual, variables)}, '
+            f'{cpp_expr_value(expression["right"], actual, variables)})'
+        )
+    if op == "bool":
+        rendered = ", ".join(cpp_expr_value(value, actual, variables) for value in expression["values"])
+        return f'bcg_bool({json.dumps(expression["operator"])}, {{{rendered}}})'
+    if op == "compare":
+        return (
+            f'BcgValue::boolean(bcg_compare_expr({json.dumps(expression["operator"])}, '
+            f'{cpp_expr_value(expression["left"], actual, variables)}, '
+            f'{cpp_expr_value(expression["right"], actual, variables)}, tolerance))'
+        )
+    if op == "index":
+        return (
+            f'bcg_index({cpp_expr_value(expression["value"], actual, variables)}, '
+            f'{cpp_expr_value(expression["index"], actual, variables)})'
+        )
+    if op == "call":
+        args = ", ".join(cpp_expr_value(arg, actual, variables) for arg in expression["args"])
+        return f'bcg_call({json.dumps(expression["function"])}, {{{args}}})'
+    return "BcgValue::null()"
+
+
+def cpp_message_check(matcher: dict[str, str] | None, message_expr: str) -> str:
+    if not matcher:
+        return "true"
+    pattern = json.dumps(matcher.get("pattern", ""))
+    if matcher.get("mode") == "contains":
+        return f"{message_expr}.find({pattern}) != std::string::npos"
+    if matcher.get("mode") == "regex":
+        return f"std::regex_search({message_expr}, std::regex({pattern}))"
+    return "false"
+
+
+def cpp_test_block(entrypoint: str, test: dict[str, Any], index: int) -> str:
+    test_id = json.dumps(test["id"])
+    expect_stdout = test.get("expect_stdout")
+    expect_stderr = test.get("expect_stderr")
+    stdout_check = "true" if expect_stdout is None else f"stdout_capture.str() == {json.dumps(expect_stdout)}"
+    stderr_check = "true" if expect_stderr is None else f"stderr_capture.str() == {json.dumps(expect_stderr)}"
+    tolerance = json.dumps(tolerance_policy(test, 0.0), separators=(",", ":"))
+    args = test.get("args") or []
+    arg_decls = []
+    arg_names = []
+    for arg_index, arg in enumerate(args):
+        type_info = finalize_native_type(infer_native_type(arg))
+        name = f"arg_{index}_{arg_index}"
+        arg_decls.append(f"    auto {name} = {render_cpp_value(arg, type_info)};")
+        arg_names.append(name)
+    call = f"{entrypoint}({', '.join(arg_names)})"
+    body: list[str] = [
+        "  {",
+        f"    const std::string test_id = {test_id};",
+        f"    BcgTolerance tolerance = bcg_tolerance_from_json({json.dumps(tolerance)});",
+        "    std::ostringstream stdout_capture;",
+        "    std::ostringstream stderr_capture;",
+        "    auto* old_stdout = std::cout.rdbuf(stdout_capture.rdbuf());",
+        "    auto* old_stderr = std::cerr.rdbuf(stderr_capture.rdbuf());",
+        "    bool ok = false;",
+        *arg_decls,
+        "    try {",
+    ]
+    if test["kind"] == "loop":
+        body.append(f"      ok = {'true' if test.get('expected') else 'false'};")
+    elif test["kind"] == "raises":
+        message_check = cpp_message_check(test.get("message_match"), "message")
+        body.extend(
+            [
+                f"      try {{ {call}; }}",
+                "      catch (const std::exception& exc) {",
+                "        std::string message = exc.what();",
+                f"        ok = {message_check};",
+                "      }",
+                "      catch (...) { ok = false; }",
+            ]
+        )
+    elif test["kind"] == "mutation":
+        mutation_result = test.get("mutation_result")
+        if mutation_result:
+            body.append(f"      auto mutation_result = {call};")
+        else:
+            body.append(f"      {call};")
+        body.append("      std::map<std::string, BcgValue> variables;")
+        for name, arg_index in (test.get("mutation_vars") or {}).items():
+            body.append(f"      variables[{json.dumps(name)}] = bcg_normalize(arg_{index}_{arg_index});")
+        if mutation_result:
+            body.append(f"      variables[{json.dumps(mutation_result)}] = bcg_normalize(mutation_result);")
+        body.append(f"      ok = bcg_truthy({cpp_expr_value(test['expression'])});")
+    else:
+        body.append(f"      auto actual = {call};")
+        body.append("      BcgValue actual_value = bcg_normalize(actual);")
+        if test["kind"] == "expr":
+            body.append(f"      ok = bcg_truthy({cpp_expr_value(test['expression'])});")
+        elif test["kind"] == "eq":
+            body.append(f"      ok = bcg_deep_equal({cpp_bcg_literal(test.get('expected'))}, actual_value, tolerance);")
+        elif test["kind"] == "neq":
+            body.append(f"      ok = !bcg_deep_equal({cpp_bcg_literal(test.get('expected'))}, actual_value, tolerance);")
+        elif test["kind"] == "truthy":
+            body.append("      ok = bcg_truthy(actual_value);")
+        elif test["kind"] == "falsy":
+            body.append("      ok = !bcg_truthy(actual_value);")
+    body.extend(
+        [
+            "    } catch (...) {",
+            "      ok = false;",
+            "    }",
+            "    std::cout.rdbuf(old_stdout);",
+            "    std::cerr.rdbuf(old_stderr);",
+            f"    if (!({stdout_check}) || !({stderr_check})) ok = false;",
+            "    (ok ? passed : failed).push_back(test_id);",
+            "  }",
+        ]
+    )
+    return "\n".join(body)
+
+
+def cpp_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    payload = native_payload(entrypoint, tests)
+    test_dicts = [test.to_jsonable() for test in tests]
+    blocks = "\n".join(cpp_test_block(entrypoint, test, index) for index, test in enumerate(test_dicts))
+    return f"""// BCG_PAYLOAD: {payload}
+#include <algorithm>
+#include <cmath>
+#include <deque>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#ifndef BCG_SOLUTION_PATH
+#error "BCG_SOLUTION_PATH is required"
+#endif
+#include BCG_SOLUTION_PATH
+
+struct BcgTolerance {{
+  std::string mode = "default";
+  long double abs = 0.0L;
+  long double rel = 0.0L;
+  bool strict = false;
+}};
+
+struct BcgValue {{
+  enum class Kind {{ Null, Bool, Number, String, List, Dict, Set, Counter, Deque }};
+  Kind kind = Kind::Null;
+  bool bool_value = false;
+  long double number_value = 0.0L;
+  std::string string_value;
+  std::vector<BcgValue> items;
+  std::vector<std::pair<BcgValue, BcgValue>> pairs;
+
+  static BcgValue null() {{ return BcgValue{{}}; }}
+  static BcgValue boolean(bool value) {{ BcgValue out; out.kind = Kind::Bool; out.bool_value = value; return out; }}
+  static BcgValue number(long double value) {{ BcgValue out; out.kind = Kind::Number; out.number_value = value; return out; }}
+  static BcgValue string(std::string value) {{ BcgValue out; out.kind = Kind::String; out.string_value = std::move(value); return out; }}
+  static BcgValue list(std::initializer_list<BcgValue> values) {{ BcgValue out; out.kind = Kind::List; out.items = values; return out; }}
+  static BcgValue set(std::initializer_list<BcgValue> values) {{ BcgValue out; out.kind = Kind::Set; out.items = values; return out; }}
+  static BcgValue deque(std::initializer_list<BcgValue> values) {{ BcgValue out; out.kind = Kind::Deque; out.items = values; return out; }}
+  static BcgValue dict(std::initializer_list<std::pair<BcgValue, BcgValue>> values) {{ BcgValue out; out.kind = Kind::Dict; out.pairs = values; return out; }}
+  static BcgValue counter(std::initializer_list<std::pair<BcgValue, BcgValue>> values) {{ BcgValue out; out.kind = Kind::Counter; out.pairs = values; return out; }}
+}};
+
+std::string bcg_stable(const BcgValue& value);
+
+bool operator<(const BcgValue& left, const BcgValue& right) {{
+  return bcg_stable(left) < bcg_stable(right);
+}}
+
+BcgTolerance bcg_tolerance_from_json(const std::string& raw) {{
+  BcgTolerance tolerance;
+  if (raw.find("\\\"mode\\\":\\\"isclose\\\"") != std::string::npos) tolerance.mode = "isclose";
+  if (raw.find("\\\"mode\\\":\\\"absdiff\\\"") != std::string::npos) tolerance.mode = "absdiff";
+  tolerance.strict = raw.find("\\\"strict\\\":true") != std::string::npos;
+  std::regex number_re("\\\"(abs|rel)\\\":(-?[0-9]+(?:\\\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)");
+  for (auto it = std::sregex_iterator(raw.begin(), raw.end(), number_re); it != std::sregex_iterator(); ++it) {{
+    long double value = std::stold((*it)[2].str());
+    if ((*it)[1].str() == "abs") tolerance.abs = value;
+    if ((*it)[1].str() == "rel") tolerance.rel = value;
+  }}
+  const char* env_tol = std::getenv("BABEL_CODE_GOAT_TOL");
+  if (tolerance.mode == "default" && env_tol != nullptr) tolerance.abs = std::stold(env_tol);
+  return tolerance;
+}}
+
+std::string bcg_stable(const BcgValue& value) {{
+  std::ostringstream out;
+  out << static_cast<int>(value.kind) << ":";
+  if (value.kind == BcgValue::Kind::Bool) out << (value.bool_value ? "true" : "false");
+  else if (value.kind == BcgValue::Kind::Number) out << std::setprecision(30) << value.number_value;
+  else if (value.kind == BcgValue::Kind::String) out << value.string_value;
+  else if (value.kind == BcgValue::Kind::List || value.kind == BcgValue::Kind::Set || value.kind == BcgValue::Kind::Deque) {{
+    for (const auto& item : value.items) out << "[" << bcg_stable(item) << "]";
+  }} else if (value.kind == BcgValue::Kind::Dict || value.kind == BcgValue::Kind::Counter) {{
+    for (const auto& pair : value.pairs) out << "{{" << bcg_stable(pair.first) << ":" << bcg_stable(pair.second) << "}}";
+  }}
+  return out.str();
+}}
+
+BcgValue bcg_normalize(const BcgValue& value) {{ return value; }}
+BcgValue bcg_normalize(std::nullptr_t) {{ return BcgValue::null(); }}
+BcgValue bcg_normalize(bool value) {{ return BcgValue::boolean(value); }}
+BcgValue bcg_normalize(const std::string& value) {{ return BcgValue::string(value); }}
+BcgValue bcg_normalize(const char* value) {{ return BcgValue::string(value == nullptr ? "" : value); }}
+
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>>
+BcgValue bcg_normalize(T value) {{ return BcgValue::number(static_cast<long double>(value)); }}
+
+template <typename T, typename = std::enable_if_t<std::is_floating_point_v<T>>, typename = void>
+BcgValue bcg_normalize(T value) {{ return BcgValue::number(static_cast<long double>(value)); }}
+
+template <typename T>
+BcgValue bcg_normalize(const std::optional<T>& value) {{
+  if (!value.has_value()) return BcgValue::null();
+  return bcg_normalize(*value);
+}}
+
+template <typename T>
+BcgValue bcg_normalize(const std::vector<T>& values) {{
+  BcgValue out; out.kind = BcgValue::Kind::List;
+  for (const auto& item : values) out.items.push_back(bcg_normalize(item));
+  return out;
+}}
+
+template <typename T>
+BcgValue bcg_normalize(const std::deque<T>& values) {{
+  BcgValue out; out.kind = BcgValue::Kind::Deque;
+  for (const auto& item : values) out.items.push_back(bcg_normalize(item));
+  return out;
+}}
+
+template <typename T>
+BcgValue bcg_normalize(const std::set<T>& values) {{
+  BcgValue out; out.kind = BcgValue::Kind::Set;
+  for (const auto& item : values) out.items.push_back(bcg_normalize(item));
+  std::sort(out.items.begin(), out.items.end());
+  return out;
+}}
+
+template <typename T>
+BcgValue bcg_normalize(const std::unordered_set<T>& values) {{
+  BcgValue out; out.kind = BcgValue::Kind::Set;
+  for (const auto& item : values) out.items.push_back(bcg_normalize(item));
+  std::sort(out.items.begin(), out.items.end());
+  return out;
+}}
+
+template <typename K, typename V>
+BcgValue bcg_normalize(const std::map<K, V>& values) {{
+  BcgValue out; out.kind = BcgValue::Kind::Dict;
+  for (const auto& pair : values) out.pairs.push_back({{bcg_normalize(pair.first), bcg_normalize(pair.second)}});
+  return out;
+}}
+
+template <typename K, typename V>
+BcgValue bcg_normalize(const std::unordered_map<K, V>& values) {{
+  BcgValue out; out.kind = BcgValue::Kind::Dict;
+  for (const auto& pair : values) out.pairs.push_back({{bcg_normalize(pair.first), bcg_normalize(pair.second)}});
+  std::sort(out.pairs.begin(), out.pairs.end(), [](const auto& a, const auto& b) {{ return bcg_stable(a.first) < bcg_stable(b.first); }});
+  return out;
+}}
+
+bool bcg_numeric_equal(const BcgValue& expected, const BcgValue& actual, const BcgTolerance& tolerance) {{
+  if (expected.kind != BcgValue::Kind::Number || actual.kind != BcgValue::Kind::Number) return false;
+  long double diff = std::fabs(actual.number_value - expected.number_value);
+  if (tolerance.mode == "absdiff" && tolerance.strict) return diff < tolerance.abs;
+  long double limit = std::max(tolerance.abs, tolerance.rel * std::max(std::fabs(actual.number_value), std::fabs(expected.number_value)));
+  return diff <= limit;
+}}
+
+bool bcg_deep_equal(const BcgValue& expected, const BcgValue& actual, const BcgTolerance& tolerance);
+
+bool bcg_compare_unordered(const std::vector<BcgValue>& expected, const std::vector<BcgValue>& actual, const BcgTolerance& tolerance) {{
+  if (expected.size() != actual.size()) return false;
+  std::vector<bool> used(actual.size(), false);
+  for (const auto& expected_item : expected) {{
+    bool matched = false;
+    for (std::size_t i = 0; i < actual.size(); ++i) {{
+      if (!used[i] && bcg_deep_equal(expected_item, actual[i], tolerance)) {{
+        used[i] = true;
+        matched = true;
+        break;
+      }}
+    }}
+    if (!matched) return false;
+  }}
+  return true;
+}}
+
+bool bcg_compare_pairs(const std::vector<std::pair<BcgValue, BcgValue>>& expected, const std::vector<std::pair<BcgValue, BcgValue>>& actual, const BcgTolerance& tolerance) {{
+  if (expected.size() != actual.size()) return false;
+  std::vector<bool> used(actual.size(), false);
+  BcgTolerance exact;
+  for (const auto& expected_pair : expected) {{
+    bool matched = false;
+    for (std::size_t i = 0; i < actual.size(); ++i) {{
+      if (!used[i] && bcg_deep_equal(expected_pair.first, actual[i].first, exact) && bcg_deep_equal(expected_pair.second, actual[i].second, tolerance)) {{
+        used[i] = true;
+        matched = true;
+        break;
+      }}
+    }}
+    if (!matched) return false;
+  }}
+  return true;
+}}
+
+bool bcg_deep_equal(const BcgValue& expected, const BcgValue& actual, const BcgTolerance& tolerance) {{
+  if (expected.kind == BcgValue::Kind::Number && actual.kind == BcgValue::Kind::Number) return bcg_numeric_equal(expected, actual, tolerance);
+  if (expected.kind != actual.kind) return false;
+  if (expected.kind == BcgValue::Kind::Null) return true;
+  if (expected.kind == BcgValue::Kind::Bool) return expected.bool_value == actual.bool_value;
+  if (expected.kind == BcgValue::Kind::String) return expected.string_value == actual.string_value;
+  if (expected.kind == BcgValue::Kind::List || expected.kind == BcgValue::Kind::Deque) {{
+    if (expected.items.size() != actual.items.size()) return false;
+    for (std::size_t i = 0; i < expected.items.size(); ++i) if (!bcg_deep_equal(expected.items[i], actual.items[i], tolerance)) return false;
+    return true;
+  }}
+  if (expected.kind == BcgValue::Kind::Set) return bcg_compare_unordered(expected.items, actual.items, tolerance);
+  if (expected.kind == BcgValue::Kind::Dict || expected.kind == BcgValue::Kind::Counter) return bcg_compare_pairs(expected.pairs, actual.pairs, tolerance);
+  return false;
+}}
+
+bool bcg_truthy(const BcgValue& value) {{
+  if (value.kind == BcgValue::Kind::Null) return false;
+  if (value.kind == BcgValue::Kind::Bool) return value.bool_value;
+  if (value.kind == BcgValue::Kind::Number) return value.number_value != 0.0L;
+  if (value.kind == BcgValue::Kind::String) return !value.string_value.empty();
+  if (value.kind == BcgValue::Kind::List || value.kind == BcgValue::Kind::Set || value.kind == BcgValue::Kind::Deque) return !value.items.empty();
+  if (value.kind == BcgValue::Kind::Dict || value.kind == BcgValue::Kind::Counter) return !value.pairs.empty();
+  return false;
+}}
+
+BcgValue bcg_unary(const std::string& op, const BcgValue& value) {{
+  if (op == "not") return BcgValue::boolean(!bcg_truthy(value));
+  if (op == "neg" && value.kind == BcgValue::Kind::Number) return BcgValue::number(-value.number_value);
+  if (op == "pos" && value.kind == BcgValue::Kind::Number) return value;
+  return BcgValue::null();
+}}
+
+BcgValue bcg_binary(const std::string& op, const BcgValue& left, const BcgValue& right) {{
+  if (left.kind == BcgValue::Kind::Number && right.kind == BcgValue::Kind::Number) {{
+    if (op == "add") return BcgValue::number(left.number_value + right.number_value);
+    if (op == "sub") return BcgValue::number(left.number_value - right.number_value);
+    if (op == "mul") return BcgValue::number(left.number_value * right.number_value);
+    if (op == "div") return BcgValue::number(left.number_value / right.number_value);
+    if (op == "floordiv") return BcgValue::number(std::floor(left.number_value / right.number_value));
+    if (op == "mod") return BcgValue::number(std::fmod(left.number_value, right.number_value));
+    if (op == "pow") return BcgValue::number(std::pow(left.number_value, right.number_value));
+  }}
+  if (op == "add" && left.kind == BcgValue::Kind::String && right.kind == BcgValue::Kind::String) return BcgValue::string(left.string_value + right.string_value);
+  return BcgValue::null();
+}}
+
+BcgValue bcg_bool(const std::string& op, std::initializer_list<BcgValue> values) {{
+  if (op == "and") {{
+    for (const auto& value : values) if (!bcg_truthy(value)) return BcgValue::boolean(false);
+    return BcgValue::boolean(true);
+  }}
+  if (op == "or") {{
+    for (const auto& value : values) if (bcg_truthy(value)) return BcgValue::boolean(true);
+    return BcgValue::boolean(false);
+  }}
+  return BcgValue::boolean(false);
+}}
+
+bool bcg_contains(const BcgValue& container, const BcgValue& needle, const BcgTolerance& tolerance) {{
+  if (container.kind == BcgValue::Kind::String && needle.kind == BcgValue::Kind::String) return container.string_value.find(needle.string_value) != std::string::npos;
+  if (container.kind == BcgValue::Kind::Dict || container.kind == BcgValue::Kind::Counter) {{
+    BcgTolerance exact;
+    for (const auto& pair : container.pairs) if (bcg_deep_equal(pair.first, needle, exact)) return true;
+    return false;
+  }}
+  if (container.kind == BcgValue::Kind::List || container.kind == BcgValue::Kind::Set || container.kind == BcgValue::Kind::Deque) {{
+    for (const auto& item : container.items) if (bcg_deep_equal(item, needle, tolerance)) return true;
+  }}
+  return false;
+}}
+
+bool bcg_compare_expr(const std::string& op, const BcgValue& left, const BcgValue& right, const BcgTolerance& tolerance) {{
+  if (op == "eq") return bcg_deep_equal(left, right, tolerance);
+  if (op == "neq") return !bcg_deep_equal(left, right, tolerance);
+  if (op == "in") return bcg_contains(right, left, tolerance);
+  if (op == "not_in") return !bcg_contains(right, left, tolerance);
+  if (left.kind == BcgValue::Kind::Number && right.kind == BcgValue::Kind::Number) {{
+    if (op == "lt") return left.number_value < right.number_value;
+    if (op == "lte") return left.number_value <= right.number_value;
+    if (op == "gt") return left.number_value > right.number_value;
+    if (op == "gte") return left.number_value >= right.number_value;
+  }}
+  if (op == "lt") return bcg_stable(left) < bcg_stable(right);
+  if (op == "lte") return bcg_stable(left) <= bcg_stable(right);
+  if (op == "gt") return bcg_stable(left) > bcg_stable(right);
+  if (op == "gte") return bcg_stable(left) >= bcg_stable(right);
+  return false;
+}}
+
+BcgValue bcg_index(const BcgValue& value, const BcgValue& index) {{
+  int numeric_index = static_cast<int>(index.number_value);
+  if ((value.kind == BcgValue::Kind::List || value.kind == BcgValue::Kind::Deque || value.kind == BcgValue::Kind::Set) && index.kind == BcgValue::Kind::Number) return value.items.at(numeric_index);
+  if (value.kind == BcgValue::Kind::String && index.kind == BcgValue::Kind::Number) return BcgValue::string(std::string(1, value.string_value.at(numeric_index)));
+  if (value.kind == BcgValue::Kind::Dict) {{
+    BcgTolerance exact;
+    for (const auto& pair : value.pairs) if (bcg_deep_equal(pair.first, index, exact)) return pair.second;
+  }}
+  throw std::out_of_range("missing index");
+}}
+
+BcgValue bcg_call(const std::string& function, std::initializer_list<BcgValue> args) {{
+  const BcgValue& value = *args.begin();
+  if (function == "abs" && value.kind == BcgValue::Kind::Number) return BcgValue::number(std::fabs(value.number_value));
+  if (function == "sorted") {{
+    BcgValue out = value;
+    if (out.kind == BcgValue::Kind::String) {{
+      out.kind = BcgValue::Kind::List;
+      out.items.clear();
+      for (char ch : value.string_value) out.items.push_back(BcgValue::string(std::string(1, ch)));
+    }}
+    std::sort(out.items.begin(), out.items.end());
+    out.kind = BcgValue::Kind::List;
+    return out;
+  }}
+  return BcgValue::null();
+}}
+
+int main() {{
+  std::vector<std::string> passed;
+  std::vector<std::string> failed;
+{blocks}
+  std::cout << "{{\\\"status\\\":\\\"" << (failed.empty() ? "pass" : "fail") << "\\\",\\\"passed\\\":[";
+  for (std::size_t i = 0; i < passed.size(); ++i) {{ if (i) std::cout << ","; std::cout << "\\\"" << passed[i] << "\\\""; }}
+  std::cout << "],\\\"failed\\\":[";
+  for (std::size_t i = 0; i < failed.size(); ++i) {{ if (i) std::cout << ","; std::cout << "\\\"" << failed[i] << "\\\""; }}
+  std::cout << "]}}" << std::endl;
+  return failed.empty() ? 0 : 1;
+}}
+"""
+
+
+def rust_type(type_info: dict[str, Any]) -> str:
+    kind = type_info["kind"]
+    if kind == "bool":
+        return "bool"
+    if kind == "int":
+        return "i64"
+    if kind == "float":
+        return "f64"
+    if kind == "string":
+        return "String"
+    if kind == "list":
+        return f"Vec<{rust_type(type_info['item'])}>"
+    if kind == "set":
+        return f"std::collections::HashSet<{rust_type(type_info['item'])}>"
+    if kind == "map":
+        return f"std::collections::HashMap<{rust_type(type_info['key'])}, {rust_type(type_info['value'])}>"
+    if kind == "optional":
+        return f"Option<{rust_type(type_info['item'])}>"
+    return "()"
+
+
+def render_rust_value(value: Any, type_info: dict[str, Any] | None = None) -> str:
+    type_info = finalize_native_type(type_info or infer_native_type(value))
+    if type_info["kind"] == "optional":
+        if value is None:
+            return f"None::<{rust_type(type_info['item'])}>"
+        return f"Some({render_rust_value(value, type_info['item'])})"
+    if value is None:
+        return "None::<i64>"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return f"{value}_i64"
+    if isinstance(value, float):
+        return f"{repr(value)}_f64"
+    if isinstance(value, str):
+        return f"String::from({json.dumps(value)})"
+    if isinstance(value, list):
+        item_type = type_info["item"] if type_info["kind"] == "list" else finalize_native_type({"kind": "unknown"})
+        return f"vec![{', '.join(render_rust_value(item, item_type) for item in value)}]"
+    if is_tagged(value, "decimal"):
+        return f"{value['value']}_f64"
+    if is_tagged(value, "set"):
+        item_type = type_info["item"] if type_info["kind"] == "set" else finalize_native_type({"kind": "unknown"})
+        return f"std::collections::HashSet::from([{', '.join(render_rust_value(item, item_type) for item in value['items'])}])"
+    if is_tagged(value, "deque"):
+        item_type = type_info["item"] if type_info["kind"] == "list" else finalize_native_type({"kind": "unknown"})
+        return f"vec![{', '.join(render_rust_value(item, item_type) for item in value['items'])}]"
+    if is_tagged(value, "counter") or is_tagged(value, "dict"):
+        key_type = type_info["key"] if type_info["kind"] == "map" else finalize_native_type({"kind": "unknown"})
+        value_type = type_info["value"] if type_info["kind"] == "map" else finalize_native_type({"kind": "unknown"})
+        pairs = ", ".join(
+            f"({render_rust_value(key, key_type)}, {render_rust_value(item, value_type)})"
+            for key, item in value["items"]
+        )
+        return f"std::collections::HashMap::from([{pairs}])"
+    return "()"
+
+
+def rust_expected_check(actual: str, expected: Any, tolerance: dict[str, Any]) -> str:
+    if numeric_decimal(expected) is not None:
+        abs_tol = tolerance.get("abs", 0.0)
+        strict = "true" if tolerance.get("mode") == "absdiff" and tolerance.get("strict") else "false"
+        return f"bcg_num_eq(({actual}) as f64, {float(numeric_decimal(expected))!r}_f64, {float(abs_tol)!r}_f64, {strict})"
+    return f"{actual} == {render_rust_value(expected)}"
+
+
+def rust_test_block(entrypoint: str, test: dict[str, Any], index: int) -> str:
+    test_id = json.dumps(test["id"])
+    args = ", ".join(render_rust_value(arg) for arg in test.get("args") or [])
+    call = f"{entrypoint}({args})"
+    lines = [f"    let mut ok_{index} = false;"]
+    if test["kind"] == "loop":
+        lines.append(f"    ok_{index} = {'true' if test.get('expected') else 'false'};")
+    elif test["kind"] == "raises":
+        matcher = test.get("message_match")
+        if matcher and matcher.get("mode") == "contains":
+            msg_check = f"message.contains({json.dumps(matcher.get('pattern', ''))})"
+        else:
+            msg_check = "true"
+        lines.extend(
+            [
+                f"    let raised_{index} = std::panic::catch_unwind(|| {{ {call}; }});",
+                f"    if let Err(payload) = raised_{index} {{",
+                "        let message = if let Some(value) = payload.downcast_ref::<&str>() { value.to_string() } else if let Some(value) = payload.downcast_ref::<String>() { value.clone() } else { String::new() };",
+                f"        ok_{index} = {msg_check};",
+                "    }",
+            ]
+        )
+    elif test["kind"] == "eq":
+        lines.append(f"    let actual_{index} = {call};")
+        lines.append(f"    ok_{index} = {rust_expected_check(f'actual_{index}', test.get('expected'), tolerance_policy(test, 0.0))};")
+    elif test["kind"] == "neq":
+        lines.append(f"    let actual_{index} = {call};")
+        lines.append(f"    ok_{index} = !({rust_expected_check(f'actual_{index}', test.get('expected'), tolerance_policy(test, 0.0))});")
+    elif test["kind"] == "truthy":
+        lines.append(f"    ok_{index} = bool::from({call});")
+    elif test["kind"] == "falsy":
+        lines.append(f"    ok_{index} = !bool::from({call});")
+    else:
+        lines.append(f"    let _ = {call};")
+        lines.append(f"    ok_{index} = true;")
+    lines.append(f"    if ok_{index} {{ passed.push(String::from({test_id})); }} else {{ failed.push(String::from({test_id})); }}")
+    return "\n".join(lines)
+
+
+def rust_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    payload = native_payload(entrypoint, tests)
+    blocks = "\n".join(rust_test_block(entrypoint, test.to_jsonable(), index) for index, test in enumerate(tests))
+    return f"""// BCG_PAYLOAD: {payload}
+// Nullable values use Option<T>, Some(value), and None.
+// HashMap<String, V> lookups use get_mut(String::from("items")) style owned-key helpers when mutation requires them.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+use std::collections::{{BTreeMap, HashMap, HashSet}};
+mod solution {{
+    include!(env!("BCG_SOLUTION_PATH"));
+}}
+use solution::*;
+
+fn bcg_num_eq(actual: f64, expected: f64, abs_tol: f64, strict: bool) -> bool {{
+    let diff = (actual - expected).abs();
+    if strict {{ diff < abs_tol }} else {{ diff <= abs_tol }}
+}}
+
+fn main() {{
+    let _owned_lookup_marker = String::from("items");
+    let mut passed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+{blocks}
+    let status = if failed.is_empty() {{ "pass" }} else {{ "fail" }};
+    let passed_json = passed.iter().map(|item| format!("\\\"{{}}\\\"", item)).collect::<Vec<_>>().join(",");
+    let failed_json = failed.iter().map(|item| format!("\\\"{{}}\\\"", item)).collect::<Vec<_>>().join(",");
+    println!("{{{{\\\"status\\\":\\\"{{}}\\\",\\\"passed\\\":[{{}}],\\\"failed\\\":[{{}}]}}}}", status, passed_json, failed_json);
+    std::process::exit(if failed.is_empty() {{ 0 }} else {{ 1 }});
+}}
+"""
+
+
 def generate_tester(lang: str, entrypoint: str, tests_dir: Path) -> None:
     tests = discover_tests(tests_dir, entrypoint)
     filename = SUPPORTED_LANGS[lang]["tester"]
     if lang == "python":
         source = python_tester_source(entrypoint, tests)
-    else:
+    elif lang in {"javascript", "typescript"}:
         source = javascript_tester_source(entrypoint, tests)
+    elif lang == "cpp":
+        source = cpp_tester_source(entrypoint, tests)
+    elif lang == "rust":
+        source = rust_tester_source(entrypoint, tests)
+    else:
+        raise DiscoveryError("unsupported language")
 
     destination = tests_dir / filename
     fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=tests_dir)
@@ -2087,11 +2872,50 @@ def extract_tester_payload(tester: Path, lang: str) -> dict[str, Any]:
             ):
                 value = ast.literal_eval(stmt.value)
                 return json.loads(value)
-    else:
+    elif lang in {"javascript", "typescript"}:
         match = re.search(r"const payload = (\{.*?\});", source, re.DOTALL)
         if match:
             return json.loads(match.group(1))
+    elif lang in {"cpp", "rust"}:
+        match = re.search(r"^// BCG_PAYLOAD: (\{.*\})$", source, re.MULTILINE)
+        if match:
+            return json.loads(match.group(1))
     raise DiscoveryError("tester payload not found")
+
+
+def compiled_command(lang: str, tester: Path, solution_path: Path, output_path: Path) -> list[str] | None:
+    if lang == "cpp":
+        compiler = shutil.which("g++") or shutil.which("c++") or shutil.which("clang++")
+        if compiler is None:
+            return None
+        return [
+            compiler,
+            "-std=c++17",
+            f'-DBCG_SOLUTION_PATH="{solution_path.resolve()}"',
+            str(tester),
+            "-o",
+            str(output_path),
+        ]
+    if lang == "rust":
+        compiler = shutil.which("rustc")
+        if compiler is None:
+            return None
+        return [compiler, str(tester), "-o", str(output_path)]
+    return None
+
+
+def run_compiled_tester(lang: str, tester: Path, solution_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str] | None:
+    with tempfile.TemporaryDirectory(prefix="babel-code-goat-") as temp_dir:
+        output_path = Path(temp_dir) / ("tester.exe" if os.name == "nt" else "tester")
+        compile_command = compiled_command(lang, tester, solution_path, output_path)
+        if compile_command is None:
+            return None
+        compile_env = env.copy()
+        compile_env["BCG_SOLUTION_PATH"] = str(solution_path.resolve())
+        compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=compile_env)
+        if compiled.returncode != 0:
+            return None
+        return subprocess.run([str(output_path)], text=True, capture_output=True, check=False, env=env)
 
 
 def command_generate(args: argparse.Namespace) -> int:
@@ -2120,17 +2944,22 @@ def command_test(args: argparse.Namespace) -> int:
             return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
-    if args.lang == "python":
-        command = [sys.executable, str(tester), str(Path(args.solution_path))]
-    else:
-        command = ["node", str(tester), str(Path(args.solution_path))]
     try:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
         env["BABEL_CODE_GOAT_ROOT"] = root
         env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        if args.lang == "python":
+            command = [sys.executable, str(tester), str(Path(args.solution_path))]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        elif args.lang in {"javascript", "typescript"}:
+            command = ["node", str(tester), str(Path(args.solution_path))]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        else:
+            completed = run_compiled_tester(args.lang, tester, Path(args.solution_path), env)
+            if completed is None:
+                return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
 

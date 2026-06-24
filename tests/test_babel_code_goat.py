@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,6 +51,8 @@ def test_supported_languages_generate_expected_files(tmp_path):
         "python": "tester.py",
         "javascript": "tester.js",
         "typescript": "tester.ts",
+        "cpp": "tester.cpp",
+        "rust": "tester.rs",
     }.items():
         tests_dir = write_tests(tmp_path / lang, "def cases():\n    assert solve(1) == 1\n")
 
@@ -57,6 +60,7 @@ def test_supported_languages_generate_expected_files(tmp_path):
 
         assert completed.returncode == 0
         assert (tests_dir / filename).exists()
+        assert sum((tests_dir / other).exists() for other in ("tester.py", "tester.js", "tester.ts", "tester.cpp", "tester.rs")) == 1
 
 
 def test_unsupported_language_handling(tmp_path):
@@ -73,7 +77,7 @@ def test_unsupported_language_handling(tmp_path):
 def test_failed_generate_preserves_existing_tester_files(tmp_path):
     tests_dir = write_tests(tmp_path, "import os\n")
     preserved = {}
-    for filename in ("tester.py", "tester.js", "tester.ts"):
+    for filename in ("tester.py", "tester.js", "tester.ts", "tester.cpp", "tester.rs"):
         path = tests_dir / filename
         path.write_text(f"old {filename}", encoding="utf-8")
         preserved[filename] = path.read_text(encoding="utf-8")
@@ -85,16 +89,26 @@ def test_failed_generate_preserves_existing_tester_files(tmp_path):
         assert (tests_dir / filename).read_text(encoding="utf-8") == content
 
 
-def test_missing_tester_errors_and_does_not_create_tester(tmp_path):
+@pytest.mark.parametrize(
+    ("lang", "filename", "solution_name"),
+    [
+        ("python", "tester.py", "solution.py"),
+        ("javascript", "tester.js", "solution.js"),
+        ("typescript", "tester.ts", "solution.js"),
+        ("cpp", "tester.cpp", "solution.cpp"),
+        ("rust", "tester.rs", "solution.rs"),
+    ],
+)
+def test_missing_tester_errors_and_does_not_create_tester(tmp_path, lang, filename, solution_name):
     tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
-    solution = tmp_path / "solution.py"
+    solution = tmp_path / solution_name
     solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
 
-    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+    completed = run_cli("test", solution, tests_dir, "--lang", lang)
 
     assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
     assert completed.returncode == 2
-    assert not (tests_dir / "tester.py").exists()
+    assert not (tests_dir / filename).exists()
 
 
 def test_discovery_accepts_allowed_constructs_and_duplicate_line_ids(tmp_path):
@@ -812,6 +826,112 @@ module.exports = {solve};
             "failed": ["tests.py:4"],
         }
         assert completed.returncode == 1
+
+
+@pytest.mark.skipif(shutil.which("g++") is None and shutil.which("c++") is None and shutil.which("clang++") is None, reason="C++ compiler is not available")
+def test_cpp_execution_reports_pass_fail_and_build_error(tmp_path):
+    tests_dir = write_tests(
+        tmp_path / "cpp",
+        """def cases():
+    assert solve(1) == 1
+    assert solve(2) == 3
+""",
+    )
+    solution = tmp_path / "cpp" / "solution.cpp"
+    solution.write_text("int solve(int value) { return value; }\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "cpp").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "cpp")
+
+    assert parse_result(completed) == {"status": "fail", "passed": ["tests.py:2"], "failed": ["tests.py:3"]}
+    assert completed.returncode == 1
+
+    broken = tmp_path / "cpp" / "broken.cpp"
+    broken.write_text("int solve(int value) { return value ", encoding="utf-8")
+    build_error = run_cli("test", broken, tests_dir, "--lang", "cpp")
+
+    assert parse_result(build_error) == {"status": "error", "passed": [], "failed": []}
+    assert build_error.returncode == 2
+
+
+@pytest.mark.skipif(shutil.which("g++") is None and shutil.which("c++") is None and shutil.which("clang++") is None, reason="C++ compiler is not available")
+def test_cpp_execution_handles_nested_nulls_containers_tolerance_expressions_and_exceptions(tmp_path):
+    tests_dir = write_tests(
+        tmp_path / "cpp-rich",
+        """def cases():
+    assert solve([1, None, 3]) == [1, None, 3]
+    assert sorted(solve([3, 1, 2])) == [1, 2, 3]
+    assert solve(set([3, 1, 2])) == set([1, 2, 3])
+    assert solve({"items": [1.0]}) == {"items": [1.0005]}
+    try:
+        solve("boom")
+        assert False
+    except ValueError as e:
+        assert "bad" in str(e)
+""",
+    )
+    solution = tmp_path / "cpp-rich" / "solution.cpp"
+    solution.write_text(
+        """#include <map>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+std::vector<std::optional<int>> solve(std::vector<std::optional<int>> values) { return values; }
+std::vector<int> solve(std::vector<int> values) { return values; }
+std::set<int> solve(std::set<int> values) { return values; }
+std::map<std::string, std::vector<long double>> solve(std::map<std::string, std::vector<long double>>) {
+    return {{"items", {1.0005L}}};
+}
+int solve(std::string) { throw std::runtime_error("bad input"); }
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "cpp").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "cpp", "--tol", "0.001")
+
+    assert parse_result(completed) == {
+        "status": "pass",
+        "passed": ["tests.py:2", "tests.py:3", "tests.py:4", "tests.py:5", "tests.py:6"],
+        "failed": [],
+    }
+    assert completed.returncode == 0
+
+
+def test_rust_generation_renders_options_collections_and_owned_string_marker(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve([1, None, 3]) == [1, None, 3]
+    assert solve({"items": [1]}) == {"items": [1]}
+""",
+    )
+
+    completed = run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "rust")
+
+    assert completed.returncode == 0
+    source = (tests_dir / "tester.rs").read_text(encoding="utf-8")
+    assert "Option<" in source
+    assert "Some(" in source
+    assert "None::<" in source
+    assert "HashMap" in source
+    assert 'String::from("items")' in source
+
+
+@pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc is not available")
+def test_rust_execution_reports_pass(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
+    solution = tmp_path / "solution.rs"
+    solution.write_text("pub fn solve(value: i64) -> i64 { value }\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "rust").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "rust")
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+    assert completed.returncode == 0
 
 
 def test_test_tol_does_not_change_nonnumeric_equality(tmp_path):
