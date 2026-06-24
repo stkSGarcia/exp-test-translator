@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 from collections import Counter, defaultdict, deque
 import contextlib
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -1289,6 +1291,24 @@ def make_result(status: str, passed: list[str] | None = None, failed: list[str] 
     return {"status": status, "passed": passed or [], "failed": failed or []}
 
 
+def test_case_from_jsonable(value: dict[str, Any]) -> TestCase:
+    return TestCase(
+        id=value["id"],
+        line=value["line"],
+        kind=value["kind"],
+        args=value["args"],
+        source_path=value.get("source_path", "tests.py"),
+        expected=value.get("expected"),
+        tolerance=value.get("tolerance"),
+        expected_exception=value.get("expected_exception"),
+        message_match=value.get("message_match"),
+        expression=value.get("expression"),
+        mutation=value.get("mutation"),
+        expect_stdout=value.get("expect_stdout"),
+        expect_stderr=value.get("expect_stderr"),
+    )
+
+
 def print_result(result: dict[str, Any]) -> int:
     sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     return {"pass": 0, "fail": 1, "error": 2}[result["status"]]
@@ -1619,6 +1639,12 @@ def resolve_python_callable(solution_path: Path, entrypoint: str) -> Any:
     raise RuntimeError("entrypoint not found")
 
 
+def await_if_needed(value: Any) -> Any:
+    if not inspect.isawaitable(value):
+        return value
+    return asyncio.run(value)
+
+
 def execute_python_tests(
     solution_path: Path, entrypoint: str, tests: list[dict[str, Any]], default_tol: float = 0.0
 ) -> dict[str, Any]:
@@ -1652,7 +1678,7 @@ def execute_python_tests(
                         for name, index in test["mutation"]["arg_bindings"].items()
                     }
                     try:
-                        actual = callable_under_test(*decoded_args)
+                        actual = await_if_needed(callable_under_test(*decoded_args))
                         if test["mutation"].get("assign") is not None:
                             env[test["mutation"]["assign"]] = actual
                     except Exception as exc:
@@ -1668,7 +1694,7 @@ def execute_python_tests(
                     raised = False
                     raised_exc = None
                     try:
-                        actual = callable_under_test(*[decode_arg(arg) for arg in test["args"]])
+                        actual = await_if_needed(callable_under_test(*[decode_arg(arg) for arg in test["args"]]))
                     except Exception as exc:
                         raised = True
                         raised_exc = exc
@@ -2406,6 +2432,7 @@ def cpp_runtime_source() -> str:
 #include <cmath>
 #include <deque>
 #include <exception>
+#include <future>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -2504,6 +2531,26 @@ template <typename K, typename V> Value normalize(const std::map<K, V>& value) {
 }
 template <typename K, typename V> Value normalize(const std::unordered_map<K, V>& value) {
   std::vector<std::pair<Value, Value>> pairs; for (const auto& item : value) pairs.push_back({normalize(item.first), normalize(item.second)}); sort_pairs(pairs); return Value::dict(pairs);
+}
+
+template <typename T> struct is_future : std::false_type {};
+template <typename T> struct is_future<std::future<T>> : std::true_type {};
+template <typename T> struct is_future<std::shared_future<T>> : std::true_type {};
+template <typename T> decltype(auto) await_value(T&& value) {
+  if constexpr (is_future<std::decay_t<T>>::value) {
+    return value.get();
+  } else {
+    return std::forward<T>(value);
+  }
+}
+template <typename F> void invoke_discard(F&& fn) {
+  if constexpr (std::is_void_v<decltype(fn())>) {
+    fn();
+  } else if constexpr (std::is_void_v<decltype(await_value(fn()))>) {
+    await_value(fn());
+  } else {
+    (void)await_value(fn());
+  }
 }
 
 bool numeric_equal(const Value& expected, const Value& actual, long double abs_tol, long double rel_tol, bool strict) {
@@ -2629,18 +2676,18 @@ def cpp_call_block(test: TestCase, arg_types: list[NativeType]) -> str:
     if test.kind == "mutation":
         lines.extend([
             f"    auto invoke = [&]() -> decltype(auto) {{ return {test_arg_entrypoint_name()}({', '.join(args)}); }};",
-            "    if constexpr (std::is_void_v<decltype(invoke())>) { invoke(); } else { (void)invoke(); }",
+            "    bcg::invoke_discard(invoke);",
         ])
         assertion = test.mutation["assertion"] if test.mutation else {"op": "const", "value": False}
         lines.append(f"    ok = {cpp_expression_bool(assertion, test.mutation or {}, arg_types)};")
     else:
         lines.append(f"    auto invoke = [&]() -> decltype(auto) {{ return {test_arg_entrypoint_name()}({', '.join(args)}); }};")
         if test.kind == "raises":
-            lines.append("    if constexpr (std::is_void_v<decltype(invoke())>) { invoke(); } else { (void)invoke(); }")
+            lines.append("    bcg::invoke_discard(invoke);")
             lines.append("    ok = false;")
         else:
             lines.append("    if constexpr (std::is_void_v<decltype(invoke())>) { invoke(); ok = false; } else {")
-            lines.append("      auto actual_native = invoke();")
+            lines.append("      auto actual_native = bcg::await_value(invoke());")
             lines.append("      auto actual = bcg::normalize(actual_native);")
             if test.kind == "eq":
                 lines.append(f"      ok = bcg::deep_equal({expected}, actual, {abs_tol}, {rel_tol}, {strict});")
@@ -2783,18 +2830,18 @@ def rust_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
         strict = "true" if tolerance.get("mode") == "absdiff" and tolerance.get("strict") else "false"
         lines = ["{", *declarations, "let mut ok = false;"]
         if test.kind == "raises":
-            lines.append(f"let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {entrypoint}({args}); }}));")
+            lines.append(f"let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ resolve_value({entrypoint}({args})); }}));")
             if test.message_match and test.message_match.get("mode") == "contains":
                 lines.append(f"ok = result.is_err() && panic_message_contains(result.err(), {rust_string(test.message_match.get('pattern', ''))});")
             else:
                 lines.append("ok = result.is_err();")
         elif test.kind == "mutation":
             call_args = ", ".join(f"&mut arg{index}" if arg_types[index].kind in {"vector", "map", "set", "deque"} else f"arg{index}.clone()" for index in range(len(test.args)))
-            lines.append(f"let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {entrypoint}({call_args}); }}));")
+            lines.append(f"let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ resolve_value({entrypoint}({call_args})); }}));")
             assertion = test.mutation["assertion"] if test.mutation else {"op": "const", "value": False}
             lines.append(f"ok = {rust_expression_bool(assertion, test.mutation or {}, arg_types)};")
         else:
-            lines.append(f"let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {entrypoint}({args})));")
+            lines.append(f"let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolve_value({entrypoint}({args}))));")
             lines.append("if let Ok(actual_native) = result { let actual = actual_native.to_value();")
             if test.kind == "eq":
                 lines.append(f"ok = deep_equal(&{expected}, &actual, {abs_tol}, {rel_tol}, {strict});")
@@ -2846,6 +2893,41 @@ impl<V> BcgOwnedStringGetMut<V> for std::collections::HashMap<String, V> {{
         std::collections::HashMap::get_mut(self, &key)
     }}
 }}
+
+fn noop_raw_waker() -> std::task::RawWaker {{
+    fn clone(_: *const ()) -> std::task::RawWaker {{ noop_raw_waker() }}
+    fn wake(_: *const ()) {{}}
+    fn wake_by_ref(_: *const ()) {{}}
+    fn drop(_: *const ()) {{}}
+    std::task::RawWaker::new(std::ptr::null(), &std::task::RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+}}
+fn block_on<F: std::future::Future>(future: F) -> F::Output {{
+    let waker = unsafe {{ std::task::Waker::from_raw(noop_raw_waker()) }};
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {{
+        match std::future::Future::poll(std::pin::Pin::as_mut(&mut future), &mut context) {{
+            std::task::Poll::Ready(value) => return value,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }}
+    }}
+}}
+
+trait BcgResolve {{ type Output; fn resolve(self) -> Self::Output; }}
+fn resolve_value<T: BcgResolve>(value: T) -> T::Output {{ value.resolve() }}
+impl BcgResolve for () {{ type Output = (); fn resolve(self) -> Self::Output {{ self }} }}
+impl BcgResolve for bool {{ type Output = bool; fn resolve(self) -> Self::Output {{ self }} }}
+impl BcgResolve for i64 {{ type Output = i64; fn resolve(self) -> Self::Output {{ self }} }}
+impl BcgResolve for i32 {{ type Output = i32; fn resolve(self) -> Self::Output {{ self }} }}
+impl BcgResolve for usize {{ type Output = usize; fn resolve(self) -> Self::Output {{ self }} }}
+impl BcgResolve for f64 {{ type Output = f64; fn resolve(self) -> Self::Output {{ self }} }}
+impl BcgResolve for String {{ type Output = String; fn resolve(self) -> Self::Output {{ self }} }}
+impl<'a> BcgResolve for &'a str {{ type Output = &'a str; fn resolve(self) -> Self::Output {{ self }} }}
+impl<T> BcgResolve for Option<T> {{ type Output = Option<T>; fn resolve(self) -> Self::Output {{ self }} }}
+impl<T> BcgResolve for Vec<T> {{ type Output = Vec<T>; fn resolve(self) -> Self::Output {{ self }} }}
+impl<T: Eq + std::hash::Hash> BcgResolve for std::collections::HashSet<T> {{ type Output = std::collections::HashSet<T>; fn resolve(self) -> Self::Output {{ self }} }}
+impl<K: Eq + std::hash::Hash, V> BcgResolve for std::collections::HashMap<K, V> {{ type Output = std::collections::HashMap<K, V>; fn resolve(self) -> Self::Output {{ self }} }}
+impl<F: std::future::Future> BcgResolve for F {{ type Output = F::Output; fn resolve(self) -> Self::Output {{ block_on(self) }} }}
 
 fn stable(value: &Value) -> String {{ format!("{{:?}}", value) }}
 fn sort_values(values: &mut Vec<Value>) {{ values.sort_by_key(stable); }}
@@ -2987,20 +3069,22 @@ def rust_expression_bool(expression: dict[str, Any], mutation: dict[str, Any], a
     return f"truthy(&{rust_expression_value(expression, mutation, arg_types, actual_name)})"
 
 
+def tester_source(lang: str, entrypoint: str, tests: list[TestCase]) -> str:
+    if lang == "python":
+        return python_tester_source(entrypoint, tests)
+    if lang in {"javascript", "typescript"}:
+        return javascript_tester_source(entrypoint, tests)
+    if lang == "cpp":
+        return cpp_tester_source(entrypoint, tests)
+    if lang == "rust":
+        return rust_tester_source(entrypoint, tests)
+    raise DiscoveryError("unsupported language")
+
+
 def generate_tester(lang: str, entrypoint: str, tests_dir: Path) -> None:
     tests = discover_tests(tests_dir, entrypoint)
     filename = SUPPORTED_LANGS[lang]["tester"]
-    if lang == "python":
-        source = python_tester_source(entrypoint, tests)
-    elif lang in {"javascript", "typescript"}:
-        source = javascript_tester_source(entrypoint, tests)
-    elif lang == "cpp":
-        source = cpp_tester_source(entrypoint, tests)
-    elif lang == "rust":
-        source = rust_tester_source(entrypoint, tests)
-    else:
-        raise DiscoveryError("unsupported language")
-
+    source = tester_source(lang, entrypoint, tests)
     destination = tests_dir / filename
     fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=tests_dir)
     try:
@@ -3040,7 +3124,9 @@ def cpp_compiler() -> str | None:
     return shutil.which("g++") or shutil.which("clang++")
 
 
-def run_cpp_tester(tester: Path, solution_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str] | None:
+def run_cpp_tester(
+    tester: Path, solution_path: Path, env: dict[str, str], timeout: float | None = None
+) -> subprocess.CompletedProcess[str] | None:
     compiler = cpp_compiler()
     if compiler is None:
         return None
@@ -3055,13 +3141,15 @@ def run_cpp_tester(tester: Path, solution_path: Path, env: dict[str, str]) -> su
             "-o",
             str(binary),
         ]
-        compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=env)
+        compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=env, timeout=timeout)
         if compiled.returncode != 0:
             return None
-        return subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env)
+        return subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env, timeout=timeout)
 
 
-def run_rust_tester(tester: Path, solution_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str] | None:
+def run_rust_tester(
+    tester: Path, solution_path: Path, env: dict[str, str], timeout: float | None = None
+) -> subprocess.CompletedProcess[str] | None:
     rustc = shutil.which("rustc")
     if rustc is None:
         return None
@@ -3070,10 +3158,12 @@ def run_rust_tester(tester: Path, solution_path: Path, env: dict[str, str]) -> s
         compile_env = env.copy()
         compile_env["BCG_SOLUTION_PATH"] = str(solution_path.resolve())
         compile_command = [rustc, "--edition=2021", str(tester), "-o", str(binary)]
-        compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=compile_env)
+        compiled = subprocess.run(
+            compile_command, text=True, capture_output=True, check=False, env=compile_env, timeout=timeout
+        )
         if compiled.returncode != 0:
             return None
-        return subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env)
+        return subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env, timeout=timeout)
 
 
 def command_generate(args: argparse.Namespace) -> int:
@@ -3088,8 +3178,121 @@ def command_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_tester_process(
+    lang: str, tester: Path, solution_path: Path, env: dict[str, str], timeout: float | None = None
+) -> subprocess.CompletedProcess[str] | None:
+    if lang == "python":
+        return subprocess.run(
+            [sys.executable, str(tester), str(solution_path)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+            timeout=timeout,
+        )
+    if lang in {"javascript", "typescript"}:
+        return subprocess.run(
+            ["node", str(tester), str(solution_path)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+            timeout=timeout,
+        )
+    if lang == "cpp":
+        return run_cpp_tester(tester, solution_path, env, timeout)
+    if lang == "rust":
+        return run_rust_tester(tester, solution_path, env, timeout)
+    return None
+
+
+def parse_runner_result(completed: subprocess.CompletedProcess[str]) -> dict[str, Any] | None:
+    stdout = completed.stdout
+    if stdout.count("\n") != 1:
+        return None
+    line = stdout.rstrip("\n")
+    try:
+        result = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(result, dict)
+        or list(result.keys()) != ["status", "passed", "failed"]
+        or result.get("status") not in {"pass", "fail", "error"}
+        or not isinstance(result.get("passed"), list)
+        or not isinstance(result.get("failed"), list)
+    ):
+        return None
+    return result
+
+
+def run_filtered_tests(
+    lang: str,
+    entrypoint: str,
+    tests: list[dict[str, Any]],
+    solution_path: Path,
+    env: dict[str, str],
+    timeout_ms: int | None,
+    total_timeout_ms: int | None,
+) -> dict[str, Any]:
+    filename = SUPPORTED_LANGS[lang]["tester"]
+    per_test_timeout = timeout_ms / 1000 if timeout_ms is not None else None
+    deadline = time.monotonic() + (total_timeout_ms / 1000) if total_timeout_ms is not None else None
+    passed: list[str] = []
+    failed: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="bcg-filter-") as temp_dir:
+        temp_tester = Path(temp_dir) / filename
+        for index, test in enumerate(tests):
+            if deadline is not None and time.monotonic() >= deadline:
+                failed.extend(item["id"] for item in tests[index:])
+                break
+
+            timeout = per_test_timeout
+            total_wins = False
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                if timeout is None or remaining <= timeout:
+                    timeout = remaining
+                    total_wins = True
+
+            case = test_case_from_jsonable(test)
+            temp_tester.write_text(tester_source(lang, entrypoint, [case]), encoding="utf-8")
+            try:
+                completed = run_tester_process(lang, temp_tester, solution_path, env, timeout)
+            except subprocess.TimeoutExpired:
+                failed.append(test["id"])
+                if total_wins:
+                    failed.extend(item["id"] for item in tests[index + 1 :])
+                    break
+                continue
+            except Exception:
+                return RESULT_ERROR
+            if completed is None:
+                return RESULT_ERROR
+
+            result = parse_runner_result(completed)
+            if result is None or result["status"] == "error":
+                return RESULT_ERROR
+            reported = result["passed"] + result["failed"]
+            if reported != [test["id"]]:
+                return RESULT_ERROR
+            if result["passed"]:
+                passed.append(test["id"])
+            else:
+                failed.append(test["id"])
+
+    return make_result("pass" if not failed else "fail", passed, failed)
+
+
 def command_test(args: argparse.Namespace) -> int:
     if args.lang not in SUPPORTED_LANGS:
+        return print_result(RESULT_ERROR)
+    if args.list_tests and args.run_id is not None:
+        return print_result(RESULT_ERROR)
+    if args.timeout_ms is not None and args.timeout_ms <= 0:
+        return print_result(RESULT_ERROR)
+    if args.total_timeout_ms is not None and args.total_timeout_ms <= 0:
         return print_result(RESULT_ERROR)
     tests_dir = Path(args.tests_dir)
     tester = tests_dir / SUPPORTED_LANGS[args.lang]["tester"]
@@ -3102,6 +3305,14 @@ def command_test(args: argparse.Namespace) -> int:
             return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
+    discovered_ids = [test["id"] for test in discovered]
+    if args.list_tests:
+        return print_result(make_result("pass", discovered_ids, []))
+    selected_tests = discovered
+    if args.run_id is not None:
+        selected_tests = [test for test in discovered if test["id"] == args.run_id]
+        if not selected_tests:
+            return print_result(RESULT_ERROR)
     try:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
@@ -3109,16 +3320,19 @@ def command_test(args: argparse.Namespace) -> int:
         env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
         solution_path = Path(args.solution_path)
-        if args.lang == "python":
-            command = [sys.executable, str(tester), str(solution_path)]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
-        elif args.lang in {"javascript", "typescript"}:
-            command = ["node", str(tester), str(solution_path)]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
-        elif args.lang == "cpp":
-            completed = run_cpp_tester(tester, solution_path, env)
-        elif args.lang == "rust":
-            completed = run_rust_tester(tester, solution_path, env)
+        if args.run_id is not None or args.timeout_ms is not None or args.total_timeout_ms is not None:
+            result = run_filtered_tests(
+                args.lang,
+                payload["entrypoint"],
+                selected_tests,
+                solution_path,
+                env,
+                args.timeout_ms,
+                args.total_timeout_ms,
+            )
+            return print_result(result)
+        if args.lang in SUPPORTED_LANGS:
+            completed = run_tester_process(args.lang, tester, solution_path, env)
         else:
             completed = None
     except Exception:
@@ -3126,21 +3340,8 @@ def command_test(args: argparse.Namespace) -> int:
     if completed is None:
         return print_result(RESULT_ERROR)
 
-    stdout = completed.stdout
-    if stdout.count("\n") != 1:
-        return print_result(RESULT_ERROR)
-    line = stdout.rstrip("\n")
-    try:
-        result = json.loads(line)
-    except json.JSONDecodeError:
-        return print_result(RESULT_ERROR)
-    if (
-        not isinstance(result, dict)
-        or list(result.keys()) != ["status", "passed", "failed"]
-        or result.get("status") not in {"pass", "fail", "error"}
-        or not isinstance(result.get("passed"), list)
-        or not isinstance(result.get("failed"), list)
-    ):
+    result = parse_runner_result(completed)
+    if result is None:
         return print_result(RESULT_ERROR)
     return print_result(result)
 
@@ -3160,6 +3361,10 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
     test.add_argument("--tol", type=float, default=0.0)
+    test.add_argument("--list-tests", action="store_true")
+    test.add_argument("--run", dest="run_id")
+    test.add_argument("--timeout-ms", type=int)
+    test.add_argument("--total-timeout-ms", type=int)
     test.set_defaults(func=command_test)
     return parser
 

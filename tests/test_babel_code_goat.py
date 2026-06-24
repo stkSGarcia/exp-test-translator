@@ -728,6 +728,176 @@ module.exports = {solve};
 
 
 @pytest.mark.parametrize(
+    ("lang", "solution_name", "solution_source"),
+    [
+        ("python", "solution.py", "from pathlib import Path\n\ndef solve(x):\n    Path('invoked.txt').write_text('yes')\n    return x\n"),
+        ("javascript", "solution.js", "const fs = require('fs');\nfunction solve(x) { fs.writeFileSync('invoked.txt', 'yes'); return x; }\nmodule.exports = {solve};\n"),
+    ],
+)
+def test_cli_list_tests_reports_ids_without_invoking_solution(tmp_path, lang, solution_name, solution_source):
+    tests_dir = write_tests(
+        tmp_path / lang,
+        """def cases():
+    assert solve(1) == 1
+    assert solve(2) == 2
+""",
+    )
+    solution = tmp_path / lang / solution_name
+    solution.write_text(solution_source, encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", lang, "--list-tests", cwd=tmp_path / lang)
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2", "tests.py:3"], "failed": []}
+    assert completed.returncode == 0
+    assert not (tmp_path / lang / "invoked.txt").exists()
+
+
+def test_cli_run_executes_only_selected_test(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve("first") == "nope"
+    assert solve("second") == "second"
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(value):\n    return value\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "tests.py:3")
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:3"], "failed": []}
+    assert completed.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--run", "missing.py:1"],
+        ["--list-tests", "--run", "tests.py:2"],
+        ["--timeout-ms", "0"],
+        ["--total-timeout-ms", "-1"],
+    ],
+)
+def test_cli_selection_and_timeout_flag_errors(tmp_path, extra_args):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python", *extra_args)
+
+    assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
+    assert completed.returncode == 2
+
+
+def test_cli_timeout_controls_report_failed_ids(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve("slow") == "slow"
+    assert solve("fast") == "fast"
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """import time
+
+def solve(value):
+    if value == "slow":
+        time.sleep(1.0)
+    return value
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    per_test = run_cli("test", solution, tests_dir, "--lang", "python", "--timeout-ms", "300")
+    total = run_cli("test", solution, tests_dir, "--lang", "python", "--total-timeout-ms", "300")
+    selected = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "tests.py:2", "--timeout-ms", "300")
+
+    assert parse_result(per_test) == {"status": "fail", "passed": ["tests.py:3"], "failed": ["tests.py:2"]}
+    assert per_test.returncode == 1
+    assert parse_result(total) == {"status": "fail", "passed": [], "failed": ["tests.py:2", "tests.py:3"]}
+    assert total.returncode == 1
+    assert parse_result(selected) == {"status": "fail", "passed": [], "failed": ["tests.py:2"]}
+    assert selected.returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("lang", "available", "solution_name", "solution_source"),
+    [
+        (
+            "python",
+            True,
+            "solution.py",
+            """import asyncio
+
+async def solve(x):
+    await asyncio.sleep(0)
+    return x
+""",
+        ),
+        (
+            "javascript",
+            True,
+            "solution.js",
+            """async function solve(x) {
+  await Promise.resolve();
+  return x;
+}
+module.exports = {solve};
+""",
+        ),
+        (
+            "typescript",
+            True,
+            "solution.js",
+            """async function solve(x) {
+  await Promise.resolve();
+  return x;
+}
+module.exports = {solve};
+""",
+        ),
+        (
+            "cpp",
+            CPP_AVAILABLE,
+            "solution.cpp",
+            """#include <future>
+
+std::future<long long> solve(long long x) {
+    return std::async(std::launch::async, [x]() { return x; });
+}
+""",
+        ),
+        (
+            "rust",
+            RUST_AVAILABLE,
+            "solution.rs",
+            """async fn solve(x: i64) -> i64 {
+    x
+}
+""",
+        ),
+    ],
+)
+def test_async_entrypoints_complete_for_supported_targets(tmp_path, lang, available, solution_name, solution_source):
+    if not available:
+        pytest.skip(f"{lang} toolchain is unavailable")
+    tests_dir = write_tests(tmp_path / lang, "def cases():\n    assert solve(2) == 2\n")
+    solution = tmp_path / lang / solution_name
+    solution.write_text(solution_source, encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+    assert completed.returncode == 0
+
+
+@pytest.mark.parametrize(
     ("lang", "available", "solution_name", "solution_source"),
     [
         (
