@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,22 @@ class ExpressionBuild:
     expression: dict[str, Any]
     args: list[Any] | None
     call_count: int
+
+
+@dataclass(frozen=True)
+class CommandRun:
+    lang: str
+    tester: Path
+    solution_path: Path
+    discovered_ids: list[str]
+    selected_ids: list[str]
+
+
+@dataclass(frozen=True)
+class ProfileSample:
+    result: dict[str, Any]
+    runtime_ns: int
+    memory_kb: int | None = None
 
 
 ALLOWED_IMPORTS = {
@@ -3349,77 +3366,178 @@ def make_timeout_fail_result(selected_ids: list[str]) -> dict[str, Any]:
     return make_result("fail", [], selected_ids)
 
 
-def command_test(args: argparse.Namespace) -> int:
+def prepare_command_run(args: argparse.Namespace) -> CommandRun | None:
     if args.lang not in SUPPORTED_LANGS:
-        return print_result(RESULT_ERROR)
+        return None
     tests_dir = Path(args.tests_dir)
     tester = tests_dir / SUPPORTED_LANGS[args.lang]["tester"]
     if not tester.exists():
-        return print_result(RESULT_ERROR)
+        return None
     try:
         payload = extract_tester_payload(tester, args.lang)
         discovered = [test.to_jsonable() for test in discover_tests(tests_dir, payload["entrypoint"])]
         if discovered != payload["tests"]:
-            return print_result(RESULT_ERROR)
+            return None
     except Exception:
-        return print_result(RESULT_ERROR)
+        return None
 
     discovered_ids = [test["id"] for test in discovered]
     if args.run is not None and args.run not in set(discovered_ids):
-        return print_result(RESULT_ERROR)
+        return None
     selected_ids = [args.run] if args.run is not None else discovered_ids
-    if args.list_tests:
-        return print_result(make_result("pass", discovered_ids, []))
+    return CommandRun(args.lang, tester, Path(args.solution_path), discovered_ids, selected_ids)
 
+
+def make_tester_env(
+    selected_ids: list[str], tol: float, timeout_ms: int | None, total_timeout_ms: int | None
+) -> dict[str, str]:
+    env = os.environ.copy()
+    root = str(Path(__file__).resolve().parent)
+    env["BABEL_CODE_GOAT_ROOT"] = root
+    env["BABEL_CODE_GOAT_TOL"] = str(tol)
+    env[TIMEOUT_MS_ENV] = "" if timeout_ms is None else str(timeout_ms)
+    env[TOTAL_TIMEOUT_MS_ENV] = "" if total_timeout_ms is None else str(total_timeout_ms)
+    env[SELECTED_IDS_ENV] = json.dumps(selected_ids, separators=(",", ":"))
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def execute_selected_run(
+    command: CommandRun,
+    tol: float,
+    timeout_ms: int | None,
+    total_timeout_ms: int | None,
+) -> dict[str, Any] | None:
     try:
-        env = os.environ.copy()
-        root = str(Path(__file__).resolve().parent)
-        env["BABEL_CODE_GOAT_ROOT"] = root
-        env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
-        env[TIMEOUT_MS_ENV] = "" if args.timeout_ms is None else str(args.timeout_ms)
-        env[TOTAL_TIMEOUT_MS_ENV] = "" if args.total_timeout_ms is None else str(args.total_timeout_ms)
-        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        solution_path = Path(args.solution_path)
-        total_timeout = timeout_seconds_from_ms(args.total_timeout_ms)
-        per_test_timeout = timeout_seconds_from_ms(args.timeout_ms)
+        env = make_tester_env(command.selected_ids, tol, timeout_ms, total_timeout_ms)
+        total_timeout = timeout_seconds_from_ms(total_timeout_ms)
+        per_test_timeout = timeout_seconds_from_ms(timeout_ms)
         if per_test_timeout is not None:
             passed: list[str] = []
             failed: list[str] = []
             deadline = None if total_timeout is None else time.monotonic() + total_timeout
-            for index, test_id in enumerate(selected_ids):
+            for index, test_id in enumerate(command.selected_ids):
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
-                    failed.extend(selected_ids[index:])
+                    failed.extend(command.selected_ids[index:])
                     break
                 run_timeout = per_test_timeout if remaining is None else min(per_test_timeout, remaining)
                 env[SELECTED_IDS_ENV] = json.dumps([test_id], separators=(",", ":"))
                 try:
-                    completed = run_tester_process(args.lang, tester, solution_path, env, run_timeout)
+                    completed = run_tester_process(command.lang, command.tester, command.solution_path, env, run_timeout)
                 except subprocess.TimeoutExpired:
                     failed.append(test_id)
                     continue
                 result = parse_tester_stdout(completed.stdout)
                 if result is None or result["status"] == "error":
-                    return print_result(RESULT_ERROR)
+                    return None
                 passed.extend([item for item in result["passed"] if item == test_id])
                 if test_id not in passed:
                     failed.append(test_id)
                 elif test_id in result["failed"]:
                     failed.append(test_id)
                     passed = [item for item in passed if item != test_id]
-            return print_result(make_result("pass" if not failed else "fail", passed, failed))
+            return make_result("pass" if not failed else "fail", passed, failed)
 
-        env[SELECTED_IDS_ENV] = json.dumps(selected_ids, separators=(",", ":"))
         try:
-            completed = run_tester_process(args.lang, tester, solution_path, env, total_timeout)
+            completed = run_tester_process(command.lang, command.tester, command.solution_path, env, total_timeout)
         except subprocess.TimeoutExpired:
-            return print_result(make_timeout_fail_result(selected_ids))
+            return make_timeout_fail_result(command.selected_ids)
     except Exception:
-        return print_result(RESULT_ERROR)
+        return None
 
     result = parse_tester_stdout(completed.stdout)
     if result is None:
+        return None
+    return result
+
+
+def aggregate_values(values: list[int]) -> dict[str, float]:
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return {"mean": mean, "std": variance**0.5}
+
+
+def current_child_memory_kb() -> int:
+    try:
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    except Exception:
+        return 0
+    return max(0, int(usage.ru_maxrss))
+
+
+def measure_selected_run(
+    command: CommandRun,
+    tol: float,
+    timeout_ms: int | None,
+    total_timeout_ms: int | None,
+    include_memory: bool,
+) -> ProfileSample | None:
+    memory_before = current_child_memory_kb() if include_memory else 0
+    started_ns = time.perf_counter_ns()
+    result = execute_selected_run(command, tol, timeout_ms, total_timeout_ms)
+    runtime_ns = time.perf_counter_ns() - started_ns
+    if result is None:
+        return None
+    memory_kb = None
+    if include_memory:
+        memory_after = current_child_memory_kb()
+        memory_kb = memory_after - memory_before if memory_after > memory_before else memory_after
+    return ProfileSample(result, runtime_ns, memory_kb)
+
+
+def merge_profile_result(result: dict[str, Any], passed: set[str], failed: set[str]) -> None:
+    failed.update(result["failed"])
+    passed.update(test_id for test_id in result["passed"] if test_id not in failed)
+    passed.difference_update(failed)
+
+
+def command_test(args: argparse.Namespace) -> int:
+    command = prepare_command_run(args)
+    if command is None:
         return print_result(RESULT_ERROR)
+    if args.list_tests:
+        return print_result(make_result("pass", command.discovered_ids, []))
+
+    result = execute_selected_run(command, args.tol, args.timeout_ms, args.total_timeout_ms)
+    if result is None:
+        return print_result(RESULT_ERROR)
+    return print_result(result)
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    command = prepare_command_run(args)
+    if command is None:
+        return print_result(RESULT_ERROR)
+    if args.list_tests:
+        return print_result(make_result("pass", command.discovered_ids, []))
+    if args.trials <= 0 or args.warmup < 0 or args.warmup >= args.trials:
+        return print_result(RESULT_ERROR)
+
+    passed: set[str] = set()
+    failed: set[str] = set()
+    for _ in range(args.warmup):
+        warmup_result = execute_selected_run(command, args.tol, args.timeout_ms, args.total_timeout_ms)
+        if warmup_result is None:
+            return print_result(RESULT_ERROR)
+        merge_profile_result(warmup_result, passed, failed)
+
+    samples: list[ProfileSample] = []
+    for _ in range(args.trials):
+        sample = measure_selected_run(command, args.tol, args.timeout_ms, args.total_timeout_ms, args.memory)
+        if sample is None:
+            return print_result(RESULT_ERROR)
+        samples.append(sample)
+        merge_profile_result(sample.result, passed, failed)
+
+    result: dict[str, Any] = {
+        "status": "pass" if not failed else "fail",
+        "passed": [test_id for test_id in command.selected_ids if test_id in passed and test_id not in failed],
+        "failed": [test_id for test_id in command.selected_ids if test_id in failed],
+        "runtime_ns": aggregate_values([sample.runtime_ns for sample in samples]),
+    }
+    if args.memory:
+        result["memory_kb"] = aggregate_values([sample.memory_kb or 0 for sample in samples])
     return print_result(result)
 
 
@@ -3443,6 +3561,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms", type=int)
     test.add_argument("--total-timeout-ms", type=int)
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("-n", "--trials", type=int, default=1)
+    profile.add_argument("--warmup", type=int, default=0)
+    profile.add_argument("--memory", action="store_true")
+    profile.add_argument("--tol", type=float, default=0.0)
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms", type=int)
+    profile.add_argument("--total-timeout-ms", type=int)
+    profile.set_defaults(func=command_profile)
     return parser
 
 
