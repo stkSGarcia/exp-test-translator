@@ -127,6 +127,178 @@ def test_missing_tester_errors_and_does_not_create_tester(tmp_path, lang, filena
     assert not (tests_dir / filename).exists()
 
 
+def test_list_tests_reports_ids_without_executing_solution(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n    assert solve(2) == 2\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    raise RuntimeError('should not run')\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python", "--list-tests")
+
+    assert parse_result(completed) == {
+        "status": "pass",
+        "passed": ["tests.py:2", "tests.py:3"],
+        "failed": [],
+    }
+    assert completed.returncode == 0
+
+
+def test_run_selects_only_requested_test_id(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n    assert solve(2) == 3\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    passing = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "tests.py:2")
+    failing = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "tests.py:3")
+
+    assert parse_result(passing) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+    assert passing.returncode == 0
+    assert parse_result(failing) == {"status": "fail", "passed": [], "failed": ["tests.py:3"]}
+    assert failing.returncode == 1
+
+
+def test_unknown_run_id_and_list_discovery_failure_are_errors(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    unknown = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "missing.py:1")
+    (tests_dir / "tests.py").write_text("not valid python", encoding="utf-8")
+    listed = run_cli("test", solution, tests_dir, "--lang", "python", "--list-tests")
+
+    assert parse_result(unknown) == {"status": "error", "passed": [], "failed": []}
+    assert unknown.returncode == 2
+    assert parse_result(listed) == {"status": "error", "passed": [], "failed": []}
+    assert listed.returncode == 2
+
+
+def test_timeout_flags_report_failed_selected_ids(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n    assert solve(2) == 2\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """import time
+
+def solve(x):
+    if x == 1:
+        return 1
+    time.sleep(0.5)
+    return x
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    per_test = run_cli("test", solution, tests_dir, "--lang", "python", "--timeout-ms", "250")
+    selected = run_cli(
+        "test", solution, tests_dir, "--lang", "python", "--run", "tests.py:3", "--timeout-ms", "250"
+    )
+
+    assert parse_result(per_test) == {"status": "fail", "passed": ["tests.py:2"], "failed": ["tests.py:3"]}
+    assert parse_result(selected) == {"status": "fail", "passed": [], "failed": ["tests.py:3"]}
+
+    solution.write_text(
+        """import time
+
+def solve(x):
+    if x == 1:
+        time.sleep(0.5)
+    return x
+""",
+        encoding="utf-8",
+    )
+    total = run_cli(
+        "test",
+        solution,
+        tests_dir,
+        "--lang",
+        "python",
+        "--timeout-ms",
+        "1000",
+        "--total-timeout-ms",
+        "100",
+    )
+
+    assert parse_result(total) == {"status": "fail", "passed": [], "failed": ["tests.py:2", "tests.py:3"]}
+
+
+def test_python_async_entrypoints_are_awaited_and_async_errors_fail(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve(1) == 2
+    try:
+        solve("boom")
+        assert False
+    except ValueError:
+        pass
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """import asyncio
+
+async def solve(value):
+    await asyncio.sleep(0)
+    if value == "boom":
+        raise ValueError("boom")
+    return value + 1
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2", "tests.py:3"], "failed": []}
+
+
+def test_javascript_and_typescript_promises_are_awaited_and_rejections_fail(tmp_path):
+    for lang, suffix, source in [
+        (
+            "javascript",
+            "js",
+            """async function solve(value) {
+  await Promise.resolve();
+  if (value === "boom") throw new Error("boom");
+  return value + 1;
+}
+module.exports = { solve };
+""",
+        ),
+        (
+            "typescript",
+            "ts",
+            """async function solve(value) {
+  await Promise.resolve();
+  if (value === "boom") throw new Error("boom");
+  return value + 1;
+}
+module.exports = { solve };
+""",
+        ),
+    ]:
+        tests_dir = write_tests(
+            tmp_path / lang,
+            """def cases():
+    assert solve(1) == 2
+    try:
+        solve("boom")
+        assert False
+    except Exception:
+        pass
+""",
+        )
+        solution = tmp_path / lang / f"solution.{suffix}"
+        solution.write_text(source, encoding="utf-8")
+
+        assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+        completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+        assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2", "tests.py:3"], "failed": []}
+
+
 def test_discovery_accepts_allowed_constructs_and_duplicate_line_ids(tmp_path):
     tests_dir = write_tests(
         tmp_path,
@@ -888,6 +1060,26 @@ def test_cpp_execution_handles_values_expressions_loops_and_raises(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_GXX, reason="g++ is required for C++ target tests")
+def test_cpp_future_results_are_completed(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 2\n")
+    solution = tmp_path / "solution.cpp"
+    solution.write_text(
+        """#include <future>
+
+std::future<int> solve(int value) {
+    return std::async(std::launch::async, [value]() { return value + 1; });
+}
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "cpp").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "cpp")
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+
+@pytest.mark.skipif(not HAS_GXX, reason="g++ is required for C++ target tests")
 def test_cpp_execution_compares_rich_values_tolerance_streams_and_mutation(tmp_path):
     optional_tests = write_tests(
         tmp_path / "optional",
@@ -1043,6 +1235,35 @@ def test_rust_execution_handles_values_expressions_loops_and_panics(tmp_path):
         "failed": [],
     }
     assert completed.returncode == 0
+
+
+@pytest.mark.skipif(not HAS_RUSTC, reason="rustc is required for Rust target tests")
+def test_rust_future_results_are_completed(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 2\n")
+    solution = tmp_path / "solution.rs"
+    solution.write_text(
+        """#[derive(Clone)]
+struct ReadyI32(i32);
+
+impl Future for ReadyI32 {
+    type Output = i32;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(self.0)
+    }
+}
+
+fn solve(value: i32) -> ReadyI32 {
+    ReadyI32(value + 1)
+}
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "rust").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "rust")
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
 
 
 @pytest.mark.skipif(not HAS_RUSTC, reason="rustc is required for Rust target tests")

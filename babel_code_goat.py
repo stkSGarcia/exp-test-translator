@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 from collections import Counter, defaultdict, deque
 import contextlib
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +33,10 @@ SUPPORTED_LANGS = {
 RESULT_ERROR = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"^\s*#\s*expect_(stdout|stderr):\s*(.+?)\s*$")
 TAG_KEY = "__bcg_type__"
+# Internal runtime contract from the CLI to generated testers.
+SELECTED_IDS_ENV = "BABEL_CODE_GOAT_SELECTED_IDS"
+TIMEOUT_MS_ENV = "BABEL_CODE_GOAT_TIMEOUT_MS"
+TOTAL_TIMEOUT_MS_ENV = "BABEL_CODE_GOAT_TOTAL_TIMEOUT_MS"
 
 
 class DiscoveryError(Exception):
@@ -1529,6 +1535,12 @@ def resolve_python_callable(solution_path: Path, entrypoint: str) -> Any:
     raise RuntimeError("entrypoint not found")
 
 
+def complete_python_value(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return asyncio.run(value)
+    return value
+
+
 def execute_python_mutation_group(
     callable_under_test: Any, group: list[dict[str, Any]], default_tol: float
 ) -> tuple[list[str], list[str]]:
@@ -1544,7 +1556,7 @@ def execute_python_mutation_group(
     actual = None
     try:
         with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-            actual = callable_under_test(*call_args)
+            actual = complete_python_value(callable_under_test(*call_args))
     except Exception:
         raised = True
     if group[0].get("mutation_assign") is not None:
@@ -1618,7 +1630,7 @@ def execute_python_tests(
                     raised = False
                     raised_exc = None
                     try:
-                        actual = callable_under_test(*[decode_arg(arg) for arg in test["args"]])
+                        actual = complete_python_value(callable_under_test(*[decode_arg(arg) for arg in test["args"]]))
                     except Exception as exc:
                         raised = True
                         raised_exc = exc
@@ -1683,7 +1695,10 @@ def main():
     if len(sys.argv) != 2:
         return print_result({{"status": "error", "passed": [], "failed": []}})
     data = json.loads(PAYLOAD)
-    result = execute_python_tests(Path(sys.argv[1]), data["entrypoint"], data["tests"], float(os.environ.get("BABEL_CODE_GOAT_TOL", "0")))
+    selected_raw = os.environ.get("{SELECTED_IDS_ENV}", "")
+    selected_ids = set(json.loads(selected_raw)) if selected_raw else None
+    tests = [test for test in data["tests"] if selected_ids is None or test["id"] in selected_ids]
+    result = execute_python_tests(Path(sys.argv[1]), data["entrypoint"], tests, float(os.environ.get("BABEL_CODE_GOAT_TOL", "0")))
     return print_result(result)
 
 if __name__ == "__main__":
@@ -1702,6 +1717,9 @@ const {{ pathToFileURL }} = require("url");
 const payload = {payload};
 const TAG = "{TAG_KEY}";
 const defaultTol = Number(process.env.BABEL_CODE_GOAT_TOL || "0");
+const selectedRaw = process.env.{SELECTED_IDS_ENV} || "";
+const selectedIds = selectedRaw ? new Set(JSON.parse(selectedRaw)) : null;
+const selectedTests = selectedIds ? payload.tests.filter(test => selectedIds.has(test.id)) : payload.tests;
 
 function isTagged(value, typeName) {{
   return value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, TAG) && (!typeName || value[TAG] === typeName);
@@ -2020,24 +2038,24 @@ async function main() {{
   }}
   const solutionPath = path.resolve(process.argv[2]);
   let fn;
-  const hasExecutableTests = payload.tests.some(test => test.kind !== "loop");
+  const hasExecutableTests = selectedTests.some(test => test.kind !== "loop");
   if (hasExecutableTests) {{
     try {{
       fn = findCallable(await loadSolution(solutionPath), payload.entrypoint);
     }} catch (error) {{
-      console.log(JSON.stringify({{status: "fail", passed: [], failed: payload.tests.map(test => test.id)}}));
+      console.log(JSON.stringify({{status: "fail", passed: [], failed: selectedTests.map(test => test.id)}}));
       return 1;
     }}
   }}
 
   const passed = [];
   const failed = [];
-  for (let index = 0; index < payload.tests.length; index++) {{
-    const test = payload.tests[index];
+  for (let index = 0; index < selectedTests.length; index++) {{
+    const test = selectedTests[index];
     if (test.kind === "mutation") {{
       let cursor = index + 1;
-      while (cursor < payload.tests.length && payload.tests[cursor].kind === "mutation" && payload.tests[cursor].mutation_group === test.mutation_group) cursor++;
-      const result = await executeMutationGroup(fn, payload.tests.slice(index, cursor));
+      while (cursor < selectedTests.length && selectedTests[cursor].kind === "mutation" && selectedTests[cursor].mutation_group === test.mutation_group) cursor++;
+      const result = await executeMutationGroup(fn, selectedTests.slice(index, cursor));
       passed.push(...result.passed);
       failed.push(...result.failed);
       index = cursor - 1;
@@ -2300,9 +2318,11 @@ def cpp_test_block(test: dict[str, Any], index: int) -> str:
     if test["kind"] == "loop":
         ok = "true" if test.get("expected") else "false"
         return f"""
+  if (bcg_should_run({test_id})) {{
   {{
     bool ok = {ok};
     (ok ? passed : failed).push_back({test_id});
+  }}
   }}
 """
     arg_types = [cpp_native_type(arg) for arg in test["args"]]
@@ -2317,6 +2337,7 @@ def cpp_test_block(test: dict[str, Any], index: int) -> str:
         elif matcher.get("mode") == "regex":
             message_check = f"std::regex_search(std::string(exc.what()), std::regex({c_string(matcher.get('pattern', ''))}))"
         return f"""
+  if (bcg_should_run({test_id})) {{
   {{
     bool ok = false;
     std::ostringstream stdout_capture;
@@ -2334,6 +2355,7 @@ def cpp_test_block(test: dict[str, Any], index: int) -> str:
     std::cerr.rdbuf(old_err);{output_checks}
     (ok ? passed : failed).push_back({test_id});
   }}
+  }}
 """
     if test["kind"] == "expr":
         expr = cpp_expression(test["expression"])
@@ -2343,12 +2365,13 @@ def cpp_test_block(test: dict[str, Any], index: int) -> str:
     elif test["kind"] == "neq":
         ok_expr = f"!bcg_equal({cpp_value_literal(test['expected'])}, bcg_normalize(actual), tolerance)"
     elif test["kind"] == "truthy":
-        ok_expr = "static_cast<bool>(actual)"
+        ok_expr = "bcg_truthy(bcg_normalize(actual))"
     elif test["kind"] == "falsy":
-        ok_expr = "!static_cast<bool>(actual)"
+        ok_expr = "!bcg_truthy(bcg_normalize(actual))"
     else:
         ok_expr = "false"
     return f"""
+  if (bcg_should_run({test_id})) {{
   {{
     bool ok = false;
     BcgTolerance tolerance = {tolerance};
@@ -2357,7 +2380,7 @@ def cpp_test_block(test: dict[str, Any], index: int) -> str:
     auto* old_out = std::cout.rdbuf(stdout_capture.rdbuf());
     auto* old_err = std::cerr.rdbuf(stderr_capture.rdbuf());
     try {{
-      auto actual = solve({arg_list});
+      auto actual = bcg_complete(solve({arg_list}));
       ok = {ok_expr};
     }} catch (...) {{
       ok = false;
@@ -2365,6 +2388,7 @@ def cpp_test_block(test: dict[str, Any], index: int) -> str:
     std::cout.rdbuf(old_out);
     std::cerr.rdbuf(old_err);{output_checks}
     (ok ? passed : failed).push_back({test_id});
+  }}
   }}
 """
 
@@ -2396,30 +2420,37 @@ def cpp_test_blocks(tests: list[TestCase]) -> str:
         call_args = ",".join(f"arg{arg_index}" for arg_index in range(len(group[0]["args"])))
         assertion_blocks = []
         for assertion in group:
+            assertion_id = c_string(assertion["id"])
             expression = cpp_expression(assertion["expression"], assigned or "actual", set(variables))
             for name, actual_name in variables.items():
                 expression = re.sub(rf"\b{re.escape(name)}\b", actual_name, expression)
             assertion_blocks.append(
                 f"""
+    if (bcg_should_run({assertion_id})) {{
     {{
       BcgTolerance tolerance = {cpp_tolerance_literal(assertion)};
       bool ok = !raised && static_cast<bool>({expression});
-      (ok ? passed : failed).push_back({c_string(assertion["id"])});
+      (ok ? passed : failed).push_back({assertion_id});
+    }}
     }}
 """
             )
         actual_declaration = "auto actual = " if assigned is not None else ""
+        actual_call = f"{actual_declaration}bcg_complete(solve({call_args}));" if assigned is not None else f"solve({call_args});"
+        group_condition = " || ".join(f"bcg_should_run({c_string(assertion['id'])})" for assertion in group)
         blocks.append(
             f"""
+  if ({group_condition}) {{
   {{
 {chr(10).join(declarations)}
     bool raised = false;
     try {{
-      {actual_declaration}solve({call_args});
+      {actual_call}
     }} catch (...) {{
       raised = true;
     }}
 {''.join(assertion_blocks)}
+  }}
   }}
 """
         )
@@ -2561,9 +2592,11 @@ def rust_test_block(test: dict[str, Any]) -> str:
     if test["kind"] == "loop":
         ok = "true" if test.get("expected") else "false"
         return f"""
+    if bcg_should_run({test_id}) {{
     {{
         let ok = {ok};
         if ok {{ passed.push({test_id}); }} else {{ failed.push({test_id}); }}
+    }}
     }}
 """
     arg_list = ",".join(rust_native_literal(arg) for arg in test["args"])
@@ -2573,6 +2606,7 @@ def rust_test_block(test: dict[str, Any]) -> str:
         if matcher.get("mode") in {"contains", "regex"}:
             message_check = f"message.contains({c_string(matcher.get('pattern', ''))})"
         return f"""
+    if bcg_should_run({test_id}) {{
     {{
         let result = panic::catch_unwind(AssertUnwindSafe(|| {{ solve({arg_list}); }}));
         let ok = match result {{
@@ -2583,6 +2617,7 @@ def rust_test_block(test: dict[str, Any]) -> str:
             }}
         }};
         if ok {{ passed.push({test_id}); }} else {{ failed.push({test_id}); }}
+    }}
     }}
 """
     tolerance = rust_tolerance_literal(test)
@@ -2599,6 +2634,7 @@ def rust_test_block(test: dict[str, Any]) -> str:
     else:
         ok_expr = "false"
     return f"""
+    if bcg_should_run({test_id}) {{
     {{
         let tolerance = {tolerance};
         let ok = match panic::catch_unwind(AssertUnwindSafe(|| solve({arg_list}))) {{
@@ -2606,6 +2642,7 @@ def rust_test_block(test: dict[str, Any]) -> str:
             Err(_) => false,
         }};
         if ok {{ passed.push({test_id}); }} else {{ failed.push({test_id}); }}
+    }}
     }}
 """
 
@@ -2637,20 +2674,24 @@ def rust_test_blocks(tests: list[TestCase]) -> str:
         actual_line = f"let {assigned} = solve({call_args});" if assigned else f"solve({call_args});"
         assertion_blocks = []
         for assertion in group:
+            assertion_id = c_string(assertion["id"])
             expression = rust_expression(assertion["expression"], assigned or "()")
             for name, actual_name in variables.items():
                 expression = re.sub(rf"\b{re.escape(name)}\b", actual_name, expression)
             assertion_blocks.append(
                 f"""
+        if bcg_should_run({assertion_id}) {{
         {{
             let tolerance = {rust_tolerance_literal(assertion)};
             let ok = !raised && ({expression});
-            if ok {{ passed.push({c_string(assertion["id"])}); }} else {{ failed.push({c_string(assertion["id"])}); }}
+            if ok {{ passed.push({assertion_id}); }} else {{ failed.push({assertion_id}); }}
+        }}
         }}
 """
             )
         blocks.append(
             f"""
+    if {" || ".join(f"bcg_should_run({c_string(assertion['id'])})" for assertion in group)} {{
     {{
 {chr(10).join(declarations)}
         let mut raised = false;
@@ -2658,6 +2699,7 @@ def rust_test_blocks(tests: list[TestCase]) -> str:
             raised = true;
         }}
 {''.join(assertion_blocks)}
+    }}
     }}
 """
         )
@@ -2678,6 +2720,7 @@ def cpp_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
 #include <cmath>
 #include <cstdlib>
 #include <deque>
+#include <future>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -2722,6 +2765,21 @@ struct BcgValue {{
   static BcgValue dict(std::vector<std::pair<BcgValue, BcgValue>> inner) {{ BcgValue value; value.type = "dict"; value.pairs = std::move(inner); return value; }}
   static BcgValue counter(std::vector<std::pair<BcgValue, BcgValue>> inner) {{ BcgValue value; value.type = "counter"; value.pairs = std::move(inner); return value; }}
 }};
+
+bool bcg_should_run(const std::string& id) {{
+  const char* raw = std::getenv("{SELECTED_IDS_ENV}");
+  if (!raw || !*raw) return true;
+  return std::string(raw).find("\\"" + id + "\\"") != std::string::npos;
+}}
+
+template <typename T>
+T bcg_complete(T value) {{ return value; }}
+
+template <typename T>
+T bcg_complete(std::future<T> value) {{ return value.get(); }}
+
+template <typename T>
+T bcg_complete(std::shared_future<T> value) {{ return value.get(); }}
 
 bool bcg_numeric(const BcgValue& value) {{
   return value.type == "number";
@@ -2787,6 +2845,16 @@ bool bcg_equal(const BcgValue& expected, const BcgValue& actual, const BcgTolera
   return false;
 }}
 
+bool bcg_truthy(const BcgValue& value) {{
+  if (value.type == "null") return false;
+  if (value.type == "bool") return value.bool_value;
+  if (value.type == "number") return value.number_value != 0.0L;
+  if (value.type == "string") return !value.string_value.empty();
+  if (value.type == "array" || value.type == "set" || value.type == "deque") return !value.items.empty();
+  if (value.type == "dict" || value.type == "counter") return !value.pairs.empty();
+  return false;
+}}
+
 BcgValue bcg_normalize(const BcgValue& value) {{ return value; }}
 BcgValue bcg_normalize(std::nullptr_t) {{ return BcgValue::null(); }}
 BcgValue bcg_normalize(bool value) {{ return BcgValue::boolean(value); }}
@@ -2830,6 +2898,16 @@ BcgValue bcg_normalize(const std::map<K, V>& value) {{
   std::vector<std::pair<BcgValue, BcgValue>> items;
   for (const auto& item : value) items.push_back({{bcg_normalize(item.first), bcg_normalize(item.second)}});
   return BcgValue::dict(items);
+}}
+
+template <typename T>
+BcgValue bcg_normalize(std::future<T>& value) {{
+  return bcg_normalize(value.get());
+}}
+
+template <typename T>
+BcgValue bcg_normalize(std::shared_future<T>& value) {{
+  return bcg_normalize(value.get());
 }}
 
 template <typename T>
@@ -2884,8 +2962,11 @@ def rust_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
 // BCG_PAYLOAD_END
 use std::collections::{{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}};
 use std::env;
+use std::future::Future;
 use std::hash::Hash;
 use std::panic::{{self, AssertUnwindSafe}};
+use std::pin::Pin;
+use std::task::{{Context, Poll, RawWaker, RawWakerVTable, Waker}};
 
 include!(env!("BCG_SOLUTION_PATH"));
 
@@ -2925,6 +3006,32 @@ struct BcgTolerance {{
 fn bcg_default_tolerance() -> BcgTolerance {{
     let abs = env::var("BABEL_CODE_GOAT_TOL").ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(0.0);
     BcgTolerance {{ abs, rel: 0.0, strict: false }}
+}}
+
+fn bcg_should_run(id: &str) -> bool {{
+    let raw = match env::var("{SELECTED_IDS_ENV}") {{
+        Ok(value) if !value.is_empty() => value,
+        _ => return true,
+    }};
+    raw.contains(&format!("\\"{{}}\\"", id))
+}}
+
+fn bcg_raw_waker() -> RawWaker {{
+    fn clone(_: *const ()) -> RawWaker {{ bcg_raw_waker() }}
+    fn noop(_: *const ()) {{}}
+    RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone, noop, noop, noop))
+}}
+
+fn bcg_block_on<F: Future>(future: F) -> F::Output {{
+    let waker = unsafe {{ Waker::from_raw(bcg_raw_waker()) }};
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {{
+        match Pin::as_mut(&mut future).poll(&mut context) {{
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }}
+    }}
 }}
 
 trait BcgNormalize {{
@@ -2998,6 +3105,15 @@ impl<K: BcgNormalize + Eq + Hash, V: BcgNormalize> BcgNormalize for HashMap<K, V
 impl<K: BcgNormalize + Ord, V: BcgNormalize> BcgNormalize for BTreeMap<K, V> {{
     fn bcg_normalize(&self) -> BcgValue {{
         BcgValue::Dict(self.iter().map(|(key, value)| (key.bcg_normalize(), value.bcg_normalize())).collect())
+    }}
+}}
+impl<F> BcgNormalize for F
+where
+    F: Future + Clone,
+    F::Output: BcgNormalize,
+{{
+    fn bcg_normalize(&self) -> BcgValue {{
+        bcg_block_on(self.clone()).bcg_normalize()
     }}
 }}
 
@@ -3160,7 +3276,9 @@ def command_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_compiled_tester(lang: str, tester: Path, solution_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_compiled_tester(
+    lang: str, tester: Path, solution_path: Path, env: dict[str, str], timeout_seconds: float | None = None
+) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory(prefix="babel-code-goat-") as build_dir:
         executable = Path(build_dir) / ("tester.exe" if lang == "cpp" else "tester")
         if lang == "cpp":
@@ -3182,7 +3300,53 @@ def run_compiled_tester(lang: str, tester: Path, solution_path: Path, env: dict[
         compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=compile_env)
         if compiled.returncode != 0:
             raise RuntimeError("compiled tester build failed")
-        return subprocess.run([str(executable)], text=True, capture_output=True, check=False, env=env)
+        return subprocess.run([str(executable)], text=True, capture_output=True, check=False, env=env, timeout=timeout_seconds)
+
+
+def run_tester_process(
+    lang: str,
+    tester: Path,
+    solution_path: Path,
+    env: dict[str, str],
+    timeout_seconds: float | None,
+) -> subprocess.CompletedProcess[str]:
+    if lang == "python":
+        command = [sys.executable, str(tester), str(solution_path)]
+        return subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout_seconds)
+    if lang in {"javascript", "typescript"}:
+        command = ["node", str(tester), str(solution_path)]
+        return subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout_seconds)
+    completed = run_compiled_tester(lang, tester, solution_path, env, timeout_seconds)
+    return completed
+
+
+def parse_tester_stdout(stdout: str) -> dict[str, Any] | None:
+    if stdout.count("\n") != 1:
+        return None
+    line = stdout.rstrip("\n")
+    try:
+        result = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(result, dict)
+        or list(result.keys()) != ["status", "passed", "failed"]
+        or result.get("status") not in {"pass", "fail", "error"}
+        or not isinstance(result.get("passed"), list)
+        or not isinstance(result.get("failed"), list)
+    ):
+        return None
+    return result
+
+
+def timeout_seconds_from_ms(value: int | None) -> float | None:
+    if value is None:
+        return None
+    return max(value, 0) / 1000.0
+
+
+def make_timeout_fail_result(selected_ids: list[str]) -> dict[str, Any]:
+    return make_result("fail", [], selected_ids)
 
 
 def command_test(args: argparse.Namespace) -> int:
@@ -3199,38 +3363,62 @@ def command_test(args: argparse.Namespace) -> int:
             return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
+
+    discovered_ids = [test["id"] for test in discovered]
+    if args.run is not None and args.run not in set(discovered_ids):
+        return print_result(RESULT_ERROR)
+    selected_ids = [args.run] if args.run is not None else discovered_ids
+    if args.list_tests:
+        return print_result(make_result("pass", discovered_ids, []))
+
     try:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
         env["BABEL_CODE_GOAT_ROOT"] = root
         env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
+        env[TIMEOUT_MS_ENV] = "" if args.timeout_ms is None else str(args.timeout_ms)
+        env[TOTAL_TIMEOUT_MS_ENV] = "" if args.total_timeout_ms is None else str(args.total_timeout_ms)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        if args.lang == "python":
-            command = [sys.executable, str(tester), str(Path(args.solution_path))]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
-        elif args.lang in {"javascript", "typescript"}:
-            command = ["node", str(tester), str(Path(args.solution_path))]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
-        else:
-            completed = run_compiled_tester(args.lang, tester, Path(args.solution_path), env)
+        solution_path = Path(args.solution_path)
+        total_timeout = timeout_seconds_from_ms(args.total_timeout_ms)
+        per_test_timeout = timeout_seconds_from_ms(args.timeout_ms)
+        if per_test_timeout is not None:
+            passed: list[str] = []
+            failed: list[str] = []
+            deadline = None if total_timeout is None else time.monotonic() + total_timeout
+            for index, test_id in enumerate(selected_ids):
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    failed.extend(selected_ids[index:])
+                    break
+                run_timeout = per_test_timeout if remaining is None else min(per_test_timeout, remaining)
+                env[SELECTED_IDS_ENV] = json.dumps([test_id], separators=(",", ":"))
+                try:
+                    completed = run_tester_process(args.lang, tester, solution_path, env, run_timeout)
+                except subprocess.TimeoutExpired:
+                    failed.append(test_id)
+                    continue
+                result = parse_tester_stdout(completed.stdout)
+                if result is None or result["status"] == "error":
+                    return print_result(RESULT_ERROR)
+                passed.extend([item for item in result["passed"] if item == test_id])
+                if test_id not in passed:
+                    failed.append(test_id)
+                elif test_id in result["failed"]:
+                    failed.append(test_id)
+                    passed = [item for item in passed if item != test_id]
+            return print_result(make_result("pass" if not failed else "fail", passed, failed))
+
+        env[SELECTED_IDS_ENV] = json.dumps(selected_ids, separators=(",", ":"))
+        try:
+            completed = run_tester_process(args.lang, tester, solution_path, env, total_timeout)
+        except subprocess.TimeoutExpired:
+            return print_result(make_timeout_fail_result(selected_ids))
     except Exception:
         return print_result(RESULT_ERROR)
 
-    stdout = completed.stdout
-    if stdout.count("\n") != 1:
-        return print_result(RESULT_ERROR)
-    line = stdout.rstrip("\n")
-    try:
-        result = json.loads(line)
-    except json.JSONDecodeError:
-        return print_result(RESULT_ERROR)
-    if (
-        not isinstance(result, dict)
-        or list(result.keys()) != ["status", "passed", "failed"]
-        or result.get("status") not in {"pass", "fail", "error"}
-        or not isinstance(result.get("passed"), list)
-        or not isinstance(result.get("failed"), list)
-    ):
+    result = parse_tester_stdout(completed.stdout)
+    if result is None:
         return print_result(RESULT_ERROR)
     return print_result(result)
 
@@ -3250,6 +3438,10 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
     test.add_argument("--tol", type=float, default=0.0)
+    test.add_argument("--list-tests", action="store_true")
+    test.add_argument("--run")
+    test.add_argument("--timeout-ms", type=int)
+    test.add_argument("--total-timeout-ms", type=int)
     test.set_defaults(func=command_test)
     return parser
 
