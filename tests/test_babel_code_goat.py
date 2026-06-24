@@ -38,6 +38,13 @@ def write_tests(tmp_path, source):
     return tests_dir
 
 
+def write_test_file(tests_dir, relative_path, source):
+    path = tests_dir / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    return path
+
+
 def test_supported_languages_generate_expected_files(tmp_path):
     for lang, filename in {
         "python": "tester.py",
@@ -320,6 +327,197 @@ def test_loop_body_traceability_rejections(tmp_path):
         discover_tests(multiple_calls, "solve")
     with pytest.raises(DiscoveryError):
         discover_tests(unsupported_helper, "solve")
+
+
+def test_discovery_accepts_statement_mutation_calls(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    a = [2, 0, 2, 1, 1, 0]
+    sort_colors(a)
+    assert a == [0, 0, 1, 1, 2, 2]
+    b = [3, 1, 2]
+    sort_colors(b)
+    assert b == [1, 2, 3]
+    assert b[0] == 1
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "sort_colors")
+
+    assert [test.kind for test in discovered] == ["mutation", "mutation", "mutation"]
+    assert [test.id for test in discovered] == ["tests.py:4", "tests.py:7", "tests.py:8"]
+    assert discovered[0].args == [[2, 0, 2, 1, 1, 0]]
+    assert discovered[0].mutation_vars == {"a": 0}
+    assert discovered[0].expression["op"] == "compare"
+    assert discovered[2].expression["left"]["op"] == "index"
+
+
+def test_discovery_accepts_assignment_mutation_calls(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    a = [3, 1, 2]
+    expected = [1, 2, 3]
+    result = solve(a)
+    assert result == expected
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.kind for test in discovered] == ["mutation"]
+    assert discovered[0].args == [[3, 1, 2]]
+    assert discovered[0].mutation_vars == {"a": 0}
+    assert discovered[0].mutation_result == "result"
+    assert discovered[0].expression["left"] == {"op": "var", "name": "result"}
+
+
+def test_discovery_rejects_invalid_mutation_patterns(tmp_path):
+    missing_assert = write_tests(
+        tmp_path / "missing",
+        "def cases():\n    a = [2, 1]\n    solve(a)\n",
+    )
+    non_adjacent = write_tests(
+        tmp_path / "non_adjacent",
+        "def cases():\n    a = [2, 1]\n    solve(a)\n    marker = 1\n    assert a == [1, 2]\n",
+    )
+    unrelated = write_tests(
+        tmp_path / "unrelated",
+        "def cases():\n    a = [2, 1]\n    expected = [1, 2]\n    solve(a)\n    assert expected == [1, 2]\n",
+    )
+    entrypoint_in_assert = write_tests(
+        tmp_path / "entrypoint",
+        "def cases():\n    a = [2, 1]\n    solve(a)\n    assert a == solve(a)\n",
+    )
+
+    for tests_dir in (missing_assert, non_adjacent, unrelated, entrypoint_in_assert):
+        with pytest.raises(DiscoveryError):
+            discover_tests(tests_dir, "solve")
+
+
+def test_discovery_recurses_python_files_and_rejects_missing_or_test_like_files(tmp_path):
+    tests_dir = tmp_path / "tests"
+    write_test_file(tests_dir, "z/tests.py", "def cases():\n    assert solve(2) == 2\n")
+    write_test_file(tests_dir, "a/test_cases.py", "def cases():\n    assert solve(1) == 1\n")
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.id for test in discovered] == ["a/test_cases.py:2", "z/tests.py:2"]
+
+    empty_dir = tmp_path / "empty" / "tests"
+    empty_dir.mkdir(parents=True)
+    with pytest.raises(DiscoveryError):
+        discover_tests(empty_dir, "solve")
+
+    test_like_dir = tmp_path / "test_like" / "tests"
+    write_test_file(test_like_dir, "nested/test_cases.txt", "assert solve(1) == 1\n")
+    with pytest.raises(DiscoveryError):
+        discover_tests(test_like_dir, "solve")
+
+
+def test_relative_path_ids_are_scoped_by_file_and_loop_iteration(tmp_path):
+    tests_dir = tmp_path / "tests"
+    write_test_file(
+        tests_dir,
+        "tests.py",
+        """def cases():
+    assert solve(1); assert solve(2)
+""",
+    )
+    write_test_file(
+        tests_dir,
+        "nested/test_cases.py",
+        """def cases():
+    for x in [1, 2]:
+        assert solve(x) == x
+""",
+    )
+    write_test_file(
+        tests_dir,
+        "other/tests.py",
+        """def cases():
+    assert solve(3) == 3
+""",
+    )
+
+    discovered = discover_tests(tests_dir, "solve")
+
+    assert [test.id for test in discovered] == [
+        "nested/test_cases.py:2",
+        "nested/test_cases.py:3:0",
+        "nested/test_cases.py:3:1",
+        "other/tests.py:2",
+        "tests.py:2#0",
+        "tests.py:2#1",
+    ]
+
+
+def test_mutation_style_tests_execute_for_python_javascript_and_typescript(tmp_path):
+    for lang in ("python", "javascript", "typescript"):
+        tests_dir = write_tests(
+            tmp_path / lang,
+            """def cases():
+    a = [2, 0, 2, 1, 1, 0]
+    sort_colors(a)
+    assert a == [0, 0, 1, 1, 2, 2]
+    b = [3, 1, 2]
+    result = sort_colors(b)
+    assert b == [1, 2, 3]
+    assert result == "done"
+""",
+        )
+        if lang == "python":
+            solution = tmp_path / lang / "solution.py"
+            solution.write_text(
+                """def sort_colors(values):
+    values.sort()
+    return "done"
+""",
+                encoding="utf-8",
+            )
+        else:
+            solution = tmp_path / lang / "solution.js"
+            solution.write_text(
+                """function sort_colors(values) {
+  values.sort((a, b) => a - b);
+  return "done";
+}
+module.exports = {sort_colors};
+""",
+                encoding="utf-8",
+            )
+
+        assert run_cli("generate", tests_dir, "--entrypoint", "sort_colors", "--lang", lang).returncode == 0
+        completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+        assert parse_result(completed) == {
+            "status": "pass",
+            "passed": ["tests.py:4", "tests.py:7", "tests.py:8"],
+            "failed": [],
+        }
+        assert completed.returncode == 0
+
+
+def test_recursive_discovery_cli_errors_and_nested_execution(tmp_path):
+    tests_dir = tmp_path / "tests"
+    write_test_file(tests_dir, "nested/test_cases.py", "def cases():\n    assert solve(4) == 4\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+
+    assert parse_result(completed) == {"status": "pass", "passed": ["nested/test_cases.py:2"], "failed": []}
+    assert completed.returncode == 0
+
+    empty_dir = tmp_path / "empty" / "tests"
+    empty_dir.mkdir(parents=True)
+    assert run_cli("generate", empty_dir, "--entrypoint", "solve", "--lang", "python").returncode != 0
+
+    bad_dir = tmp_path / "bad" / "tests"
+    write_test_file(bad_dir, "test_cases.txt", "assert solve(1) == 1\n")
+    assert run_cli("generate", bad_dir, "--entrypoint", "solve", "--lang", "python").returncode != 0
 
 
 def test_discovery_accepts_rich_python_values_and_metadata(tmp_path):

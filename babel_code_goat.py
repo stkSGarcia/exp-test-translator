@@ -40,11 +40,14 @@ class TestCase:
     line: int
     kind: str
     args: list[Any]
+    source: str = "tests.py"
     expected: Any = None
     tolerance: dict[str, Any] | None = None
     expected_exception: str | None = None
     message_match: dict[str, str] | None = None
     expression: dict[str, Any] | None = None
+    mutation_vars: dict[str, int] | None = None
+    mutation_result: str | None = None
     expect_stdout: str | None = None
     expect_stderr: str | None = None
     in_loop: bool = False
@@ -60,6 +63,8 @@ class TestCase:
             "expected_exception": self.expected_exception,
             "message_match": self.message_match,
             "expression": self.expression,
+            "mutation_vars": self.mutation_vars,
+            "mutation_result": self.mutation_result,
             "expect_stdout": self.expect_stdout,
             "expect_stderr": self.expect_stderr,
         }
@@ -411,6 +416,10 @@ def const_expression(node: ast.AST, context: DiscoveryContext) -> ExpressionBuil
     return ExpressionBuild({"op": "const", "value": value_from_node(node, context)}, None, 0)
 
 
+def variable_expression(name: str) -> ExpressionBuild:
+    return ExpressionBuild({"op": "var", "name": name}, None, 1)
+
+
 def expression_from_node(node: ast.AST, entrypoint: str, context: DiscoveryContext) -> ExpressionBuild:
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == entrypoint:
         return ExpressionBuild({"op": "actual"}, parse_entrypoint_call(node, entrypoint, context), 1)
@@ -530,6 +539,120 @@ def expression_from_node(node: ast.AST, entrypoint: str, context: DiscoveryConte
     raise DiscoveryError("unsupported primitive expression")
 
 
+def mutation_expression_from_node(node: ast.AST, entrypoint: str, context: DiscoveryContext, variables: set[str]) -> ExpressionBuild:
+    if entrypoint_call_count(node, entrypoint):
+        raise DiscoveryError("mutation assert must not call entrypoint")
+
+    if isinstance(node, ast.Name):
+        if node.id in variables:
+            return variable_expression(node.id)
+        return const_expression(node, context)
+
+    if isinstance(node, ast.Call):
+        callee = resolve_callee(node.func, context)
+        if callee in {"sorted", "abs"}:
+            if node.keywords or len(node.args) != 1:
+                raise DiscoveryError("unsupported primitive helper call")
+            operand = mutation_expression_from_node(node.args[0], entrypoint, context, variables)
+            return ExpressionBuild(
+                {"op": "call", "function": callee, "args": [operand.expression]},
+                None,
+                operand.call_count,
+            )
+        return const_expression(node, context)
+
+    if isinstance(node, ast.Constant | ast.List | ast.Tuple | ast.Set | ast.Dict):
+        return const_expression(node, context)
+
+    if isinstance(node, ast.UnaryOp):
+        unary_ops = {
+            ast.Not: "not",
+            ast.USub: "neg",
+            ast.UAdd: "pos",
+        }
+        operator = next((name for op_type, name in unary_ops.items() if isinstance(node.op, op_type)), None)
+        if operator is None:
+            raise DiscoveryError("unsupported unary expression")
+        operand = mutation_expression_from_node(node.operand, entrypoint, context, variables)
+        return ExpressionBuild(
+            {"op": "unary", "operator": operator, "operand": operand.expression},
+            None,
+            operand.call_count,
+        )
+
+    if isinstance(node, ast.BinOp):
+        binary_ops = {
+            ast.Add: "add",
+            ast.Sub: "sub",
+            ast.Mult: "mul",
+            ast.Div: "div",
+            ast.FloorDiv: "floordiv",
+            ast.Mod: "mod",
+            ast.Pow: "pow",
+        }
+        operator = next((name for op_type, name in binary_ops.items() if isinstance(node.op, op_type)), None)
+        if operator is None:
+            raise DiscoveryError("unsupported binary expression")
+        left = mutation_expression_from_node(node.left, entrypoint, context, variables)
+        right = mutation_expression_from_node(node.right, entrypoint, context, variables)
+        return ExpressionBuild(
+            {"op": "binary", "operator": operator, "left": left.expression, "right": right.expression},
+            None,
+            left.call_count + right.call_count,
+        )
+
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            operator = "and"
+        elif isinstance(node.op, ast.Or):
+            operator = "or"
+        else:
+            raise DiscoveryError("unsupported boolean expression")
+        values = [mutation_expression_from_node(value, entrypoint, context, variables) for value in node.values]
+        return ExpressionBuild(
+            {"op": "bool", "operator": operator, "values": [value.expression for value in values]},
+            None,
+            sum(value.call_count for value in values),
+        )
+
+    if isinstance(node, ast.Compare):
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise DiscoveryError("unsupported comparison expression")
+        compare_ops = {
+            ast.Eq: "eq",
+            ast.NotEq: "neq",
+            ast.In: "in",
+            ast.NotIn: "not_in",
+            ast.Lt: "lt",
+            ast.LtE: "lte",
+            ast.Gt: "gt",
+            ast.GtE: "gte",
+        }
+        operator = next((name for op_type, name in compare_ops.items() if isinstance(node.ops[0], op_type)), None)
+        if operator is None:
+            raise DiscoveryError("unsupported comparison expression")
+        left = mutation_expression_from_node(node.left, entrypoint, context, variables)
+        right = mutation_expression_from_node(node.comparators[0], entrypoint, context, variables)
+        return ExpressionBuild(
+            {"op": "compare", "operator": operator, "left": left.expression, "right": right.expression},
+            None,
+            left.call_count + right.call_count,
+        )
+
+    if isinstance(node, ast.Subscript):
+        if isinstance(node.slice, ast.Slice):
+            raise DiscoveryError("unsupported slice expression")
+        value = mutation_expression_from_node(node.value, entrypoint, context, variables)
+        index = mutation_expression_from_node(node.slice, entrypoint, context, variables)
+        return ExpressionBuild(
+            {"op": "index", "value": value.expression, "index": index.expression},
+            None,
+            value.call_count + index.call_count,
+        )
+
+    raise DiscoveryError("unsupported primitive expression")
+
+
 def parse_expression_assertion(test: ast.AST, entrypoint: str, context: DiscoveryContext) -> tuple[list[Any], dict[str, Any]]:
     parsed = expression_from_node(test, entrypoint, context)
     if parsed.call_count != 1 or parsed.args is None:
@@ -638,6 +761,71 @@ def parse_assert(node: ast.Assert, entrypoint: str, lines: list[str], context: D
         expected=expected,
         tolerance=tolerance,
         expression=expression,
+        expect_stdout=expect_stdout,
+        expect_stderr=expect_stderr,
+    )
+
+
+def mutation_call_from_stmt(stmt: ast.stmt, entrypoint: str) -> tuple[ast.Call, str | None] | None:
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+        if isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == entrypoint:
+            return stmt.value, None
+    if isinstance(stmt, ast.Assign):
+        if len(stmt.targets) != 1:
+            return None
+        if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == entrypoint:
+            if not isinstance(stmt.targets[0], ast.Name):
+                raise DiscoveryError("mutation assignment target must be a name")
+            return stmt.value, stmt.targets[0].id
+    return None
+
+
+def mutation_call_args(
+    call: ast.Call, assigned_name: str | None, context: DiscoveryContext
+) -> tuple[list[Any], dict[str, int], set[str]]:
+    if call.keywords:
+        raise DiscoveryError("keyword arguments are unsupported")
+    args: list[Any] = []
+    mutation_vars: dict[str, int] = {}
+    for arg in call.args:
+        if isinstance(arg, ast.Starred):
+            expanded = value_from_node(arg.value, context)
+            if not isinstance(expanded, list):
+                raise DiscoveryError("starred arguments require iterable literal")
+            args.extend(expanded)
+            continue
+        index = len(args)
+        args.append(value_from_node(arg, context))
+        if isinstance(arg, ast.Name):
+            mutation_vars[arg.id] = index
+    allowed = set(mutation_vars)
+    if assigned_name is not None:
+        allowed.add(assigned_name)
+    return args, mutation_vars, allowed
+
+
+def parse_mutation_assert(
+    node: ast.Assert,
+    entrypoint: str,
+    lines: list[str],
+    context: DiscoveryContext,
+    args: list[Any],
+    mutation_vars: dict[str, int],
+    mutation_result: str | None,
+    allowed_vars: set[str],
+) -> TestCase:
+    parsed = mutation_expression_from_node(node.test, entrypoint, context, allowed_vars)
+    if parsed.call_count < 1:
+        raise DiscoveryError("mutation assert must reference a mutated variable")
+    expect_stdout, expect_stderr = parse_expectations(lines, node.lineno)
+    return TestCase(
+        id="",
+        line=node.lineno,
+        kind="mutation",
+        args=args,
+        expression=parsed.expression,
+        mutation_vars=mutation_vars,
+        mutation_result=mutation_result,
         expect_stdout=expect_stdout,
         expect_stderr=expect_stderr,
     )
@@ -848,7 +1036,51 @@ def discover_in_body(
     body: list[ast.stmt], entrypoint: str, lines: list[str], context: DiscoveryContext, in_loop: bool = False
 ) -> list[TestCase]:
     discovered: list[TestCase] = []
-    for stmt in body:
+    index = 0
+    while index < len(body):
+        stmt = body[index]
+        mutation_call = mutation_call_from_stmt(stmt, entrypoint)
+        if mutation_call is not None:
+            call, assigned_name = mutation_call
+            args, mutation_vars, allowed_vars = mutation_call_args(call, assigned_name, context)
+            mutation_asserts: list[ast.Assert] = []
+            index += 1
+            while index < len(body) and isinstance(body[index], ast.Assert):
+                mutation_asserts.append(body[index])
+                index += 1
+            if not mutation_asserts:
+                raise DiscoveryError("mutation call must be immediately followed by an assert")
+            for assert_stmt in mutation_asserts:
+                test_case = parse_mutation_assert(
+                    assert_stmt,
+                    entrypoint,
+                    lines,
+                    context,
+                    args,
+                    mutation_vars,
+                    assigned_name,
+                    allowed_vars,
+                )
+                discovered.append(
+                    TestCase(
+                        id=test_case.id,
+                        line=test_case.line,
+                        kind=test_case.kind,
+                        args=test_case.args,
+                        source=test_case.source,
+                        expected=test_case.expected,
+                        tolerance=test_case.tolerance,
+                        expected_exception=test_case.expected_exception,
+                        message_match=test_case.message_match,
+                        expression=test_case.expression,
+                        mutation_vars=test_case.mutation_vars,
+                        mutation_result=test_case.mutation_result,
+                        expect_stdout=test_case.expect_stdout,
+                        expect_stderr=test_case.expect_stderr,
+                        in_loop=in_loop,
+                    )
+                )
+            continue
         if isinstance(stmt, ast.FunctionDef):
             discovered.extend(discover_in_body(stmt.body, entrypoint, lines, context.child(), in_loop))
         elif isinstance(stmt, ast.Assert):
@@ -859,11 +1091,14 @@ def discover_in_body(
                     line=test_case.line,
                     kind=test_case.kind,
                     args=test_case.args,
+                    source=test_case.source,
                     expected=test_case.expected,
                     tolerance=test_case.tolerance,
                     expected_exception=test_case.expected_exception,
                     message_match=test_case.message_match,
                     expression=test_case.expression,
+                    mutation_vars=test_case.mutation_vars,
+                    mutation_result=test_case.mutation_result,
                     expect_stdout=test_case.expect_stdout,
                     expect_stderr=test_case.expect_stderr,
                     in_loop=in_loop,
@@ -877,11 +1112,14 @@ def discover_in_body(
                     line=test_case.line,
                     kind=test_case.kind,
                     args=test_case.args,
+                    source=test_case.source,
                     expected=test_case.expected,
                     tolerance=test_case.tolerance,
                     expected_exception=test_case.expected_exception,
                     message_match=test_case.message_match,
                     expression=test_case.expression,
+                    mutation_vars=test_case.mutation_vars,
+                    mutation_result=test_case.mutation_result,
                     expect_stdout=test_case.expect_stdout,
                     expect_stderr=test_case.expect_stderr,
                     in_loop=in_loop,
@@ -892,35 +1130,38 @@ def discover_in_body(
         elif isinstance(stmt, ast.While):
             discovered.extend(discover_while_loop(stmt, entrypoint, lines, context, in_loop))
         elif handle_assignment(stmt, context) or handle_aug_assignment(stmt, context):
-            continue
+            pass
         elif isinstance(stmt, ast.Pass):
-            continue
+            pass
         elif handle_import(stmt, context):
-            continue
+            pass
         else:
             raise DiscoveryError(f"unsupported code at line {getattr(stmt, 'lineno', '?')}")
+        index += 1
     return discovered
 
 
 def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
-    counts: dict[int, int] = {}
+    counts: dict[tuple[str, int], int] = {}
     for test_case in test_cases:
         if not test_case.in_loop:
-            counts[test_case.line] = counts.get(test_case.line, 0) + 1
+            key = (test_case.source, test_case.line)
+            counts[key] = counts.get(key, 0) + 1
 
-    seen: dict[int, int] = {}
-    loop_seen: dict[int, int] = {}
+    seen: dict[tuple[str, int], int] = {}
+    loop_seen: dict[tuple[str, int], int] = {}
     assigned: list[TestCase] = []
     for test_case in test_cases:
+        key = (test_case.source, test_case.line)
         if test_case.in_loop:
-            line_seen = loop_seen.get(test_case.line, 0)
-            loop_seen[test_case.line] = line_seen + 1
-            test_id = f"tests.py:{test_case.line}:{line_seen}"
+            line_seen = loop_seen.get(key, 0)
+            loop_seen[key] = line_seen + 1
+            test_id = f"{test_case.source}:{test_case.line}:{line_seen}"
         else:
-            line_seen = seen.get(test_case.line, 0)
-            seen[test_case.line] = line_seen + 1
-            test_id = f"tests.py:{test_case.line}"
-            if counts.get(test_case.line, 0) > 1:
+            line_seen = seen.get(key, 0)
+            seen[key] = line_seen + 1
+            test_id = f"{test_case.source}:{test_case.line}"
+            if counts.get(key, 0) > 1:
                 test_id = f"{test_id}#{line_seen}"
         assigned.append(
             TestCase(
@@ -928,11 +1169,14 @@ def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
                 line=test_case.line,
                 kind=test_case.kind,
                 args=test_case.args,
+                source=test_case.source,
                 expected=test_case.expected,
                 tolerance=test_case.tolerance,
                 expected_exception=test_case.expected_exception,
                 message_match=test_case.message_match,
                 expression=test_case.expression,
+                mutation_vars=test_case.mutation_vars,
+                mutation_result=test_case.mutation_result,
                 expect_stdout=test_case.expect_stdout,
                 expect_stderr=test_case.expect_stderr,
                 in_loop=test_case.in_loop,
@@ -941,19 +1185,73 @@ def assign_ids(test_cases: list[TestCase]) -> list[TestCase]:
     return assigned
 
 
-def discover_tests(tests_dir: Path, entrypoint: str) -> list[TestCase]:
-    tests_path = tests_dir / "tests.py"
+TEST_LIKE_RE = re.compile(r"^(test.*|.*_test|tests|.*_tests)\.[^.]+$")
+GENERATED_TESTERS = {settings["tester"] for settings in SUPPORTED_LANGS.values()}
+
+
+def relative_test_path(path: Path, tests_dir: Path) -> str:
+    return path.relative_to(tests_dir).as_posix()
+
+
+def is_test_like_non_python(path: Path) -> bool:
+    return path.suffix != ".py" and bool(TEST_LIKE_RE.match(path.name))
+
+
+def discover_test_files(tests_dir: Path) -> list[Path]:
+    if not tests_dir.exists():
+        raise DiscoveryError("tests directory does not exist")
+    paths = [path for path in tests_dir.rglob("*") if path.is_file() and path.name not in GENERATED_TESTERS]
+    for path in paths:
+        if is_test_like_non_python(path):
+            raise DiscoveryError("test-like non-Python file")
+    return sorted(
+        [path for path in paths if path.suffix == ".py"],
+        key=lambda path: relative_test_path(path, tests_dir),
+    )
+
+
+def discover_tests_in_file(tests_path: Path, tests_dir: Path, entrypoint: str) -> list[TestCase]:
+    relative_path = relative_test_path(tests_path, tests_dir)
     try:
         source = tests_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise DiscoveryError("could not read tests.py") from exc
+        raise DiscoveryError(f"could not read {relative_path}") from exc
     try:
-        tree = ast.parse(source, filename="tests.py")
+        tree = ast.parse(source, filename=relative_path)
     except SyntaxError as exc:
-        raise DiscoveryError("could not parse tests.py") from exc
+        raise DiscoveryError(f"could not parse {relative_path}") from exc
     lines = source.splitlines()
     context = DiscoveryContext(names={}, values={})
-    return assign_ids(discover_in_body(tree.body, entrypoint, lines, context))
+    discovered = discover_in_body(tree.body, entrypoint, lines, context)
+    return [
+        TestCase(
+            id=test.id,
+            line=test.line,
+            kind=test.kind,
+            args=test.args,
+            source=relative_path,
+            expected=test.expected,
+            tolerance=test.tolerance,
+            expected_exception=test.expected_exception,
+            message_match=test.message_match,
+            expression=test.expression,
+            mutation_vars=test.mutation_vars,
+            mutation_result=test.mutation_result,
+            expect_stdout=test.expect_stdout,
+            expect_stderr=test.expect_stderr,
+            in_loop=test.in_loop,
+        )
+        for test in discovered
+    ]
+
+
+def discover_tests(tests_dir: Path, entrypoint: str) -> list[TestCase]:
+    discovered: list[TestCase] = []
+    for tests_path in discover_test_files(tests_dir):
+        discovered.extend(discover_tests_in_file(tests_path, tests_dir, entrypoint))
+    if not discovered:
+        raise DiscoveryError("no tests discovered")
+    return assign_ids(discovered)
 
 
 def make_result(status: str, passed: list[str] | None = None, failed: list[str] | None = None) -> dict[str, Any]:
@@ -1157,14 +1455,19 @@ def expression_sorted(value: Any) -> Any:
     return sorted(value)
 
 
-def evaluate_expression(expression: dict[str, Any], actual: Any, tolerance: dict[str, Any]) -> Any:
+def evaluate_expression(
+    expression: dict[str, Any], actual: Any, tolerance: dict[str, Any], variables: dict[str, Any] | None = None
+) -> Any:
+    variables = variables or {}
     op = expression.get("op")
     if op == "const":
         return expression.get("value")
     if op == "actual":
         return actual
+    if op == "var":
+        return variables[expression["name"]]
     if op == "unary":
-        operand = evaluate_expression(expression["operand"], actual, tolerance)
+        operand = evaluate_expression(expression["operand"], actual, tolerance, variables)
         operator = expression.get("operator")
         if operator == "not":
             return not bool(operand)
@@ -1173,8 +1476,8 @@ def evaluate_expression(expression: dict[str, Any], actual: Any, tolerance: dict
         if operator == "pos":
             return +operand
     if op == "binary":
-        left = evaluate_expression(expression["left"], actual, tolerance)
-        right = evaluate_expression(expression["right"], actual, tolerance)
+        left = evaluate_expression(expression["left"], actual, tolerance, variables)
+        right = evaluate_expression(expression["right"], actual, tolerance, variables)
         operator = expression.get("operator")
         if operator == "add":
             return left + right
@@ -1191,14 +1494,14 @@ def evaluate_expression(expression: dict[str, Any], actual: Any, tolerance: dict
         if operator == "pow":
             return left**right
     if op == "bool":
-        values = [evaluate_expression(value, actual, tolerance) for value in expression["values"]]
+        values = [evaluate_expression(value, actual, tolerance, variables) for value in expression["values"]]
         if expression.get("operator") == "and":
             return all(bool(value) for value in values)
         if expression.get("operator") == "or":
             return any(bool(value) for value in values)
     if op == "compare":
-        left = evaluate_expression(expression["left"], actual, tolerance)
-        right = evaluate_expression(expression["right"], actual, tolerance)
+        left = evaluate_expression(expression["left"], actual, tolerance, variables)
+        right = evaluate_expression(expression["right"], actual, tolerance, variables)
         operator = expression.get("operator")
         if operator == "eq":
             return deep_compare(normalize_comparable(left), normalize_comparable(right), tolerance)
@@ -1228,11 +1531,11 @@ def evaluate_expression(expression: dict[str, Any], actual: Any, tolerance: dict
         if operator == "gte":
             return left >= right
     if op == "index":
-        value = evaluate_expression(expression["value"], actual, tolerance)
-        index = evaluate_expression(expression["index"], actual, tolerance)
+        value = evaluate_expression(expression["value"], actual, tolerance, variables)
+        index = evaluate_expression(expression["index"], actual, tolerance, variables)
         return expression_index(value, index)
     if op == "call":
-        args = [evaluate_expression(arg, actual, tolerance) for arg in expression["args"]]
+        args = [evaluate_expression(arg, actual, tolerance, variables) for arg in expression["args"]]
         if expression.get("function") == "sorted":
             return expression_sorted(args[0])
         if expression.get("function") == "abs":
@@ -1287,6 +1590,22 @@ def execute_python_tests(
                     actual = None
                     raised = False
                     raised_exc = None
+                elif test["kind"] == "mutation":
+                    decoded_args = [decode_arg(arg) for arg in test["args"]]
+                    variables = {
+                        name: decoded_args[index]
+                        for name, index in (test.get("mutation_vars") or {}).items()
+                    }
+                    raised = False
+                    raised_exc = None
+                    try:
+                        actual = callable_under_test(*decoded_args)
+                        if test.get("mutation_result"):
+                            variables[test["mutation_result"]] = actual
+                    except Exception as exc:
+                        raised = True
+                        raised_exc = exc
+                        actual = None
                 else:
                     raised = False
                     raised_exc = None
@@ -1298,6 +1617,15 @@ def execute_python_tests(
                         actual = None
                 if test["kind"] == "loop":
                     pass
+                elif test["kind"] == "mutation":
+                    ok = not raised and bool(
+                        evaluate_expression(
+                            test["expression"],
+                            actual,
+                            tolerance_policy(test, default_tol),
+                            variables,
+                        )
+                    )
                 elif test["kind"] == "raises":
                     ok = (
                         raised
@@ -1550,18 +1878,20 @@ function expressionSorted(value) {{
   }});
 }}
 
-function evaluateExpression(expression, actual, tolerance) {{
+function evaluateExpression(expression, actual, tolerance, variables) {{
+  variables = variables || {{}};
   if (expression.op === "const") return expression.value;
   if (expression.op === "actual") return actual;
+  if (expression.op === "var") return variables[expression.name];
   if (expression.op === "unary") {{
-    const operand = evaluateExpression(expression.operand, actual, tolerance);
+    const operand = evaluateExpression(expression.operand, actual, tolerance, variables);
     if (expression.operator === "not") return !operand;
     if (expression.operator === "neg") return -operand;
     if (expression.operator === "pos") return +operand;
   }}
   if (expression.op === "binary") {{
-    const left = evaluateExpression(expression.left, actual, tolerance);
-    const right = evaluateExpression(expression.right, actual, tolerance);
+    const left = evaluateExpression(expression.left, actual, tolerance, variables);
+    const right = evaluateExpression(expression.right, actual, tolerance, variables);
     if (expression.operator === "add") return left + right;
     if (expression.operator === "sub") return left - right;
     if (expression.operator === "mul") return left * right;
@@ -1571,13 +1901,13 @@ function evaluateExpression(expression, actual, tolerance) {{
     if (expression.operator === "pow") return left ** right;
   }}
   if (expression.op === "bool") {{
-    const values = expression.values.map(value => evaluateExpression(value, actual, tolerance));
+    const values = expression.values.map(value => evaluateExpression(value, actual, tolerance, variables));
     if (expression.operator === "and") return values.every(Boolean);
     if (expression.operator === "or") return values.some(Boolean);
   }}
   if (expression.op === "compare") {{
-    const left = evaluateExpression(expression.left, actual, tolerance);
-    const right = evaluateExpression(expression.right, actual, tolerance);
+    const left = evaluateExpression(expression.left, actual, tolerance, variables);
+    const right = evaluateExpression(expression.right, actual, tolerance, variables);
     if (expression.operator === "eq") return deepEqual(normalize(left), normalize(right), tolerance);
     if (expression.operator === "neq") return !deepEqual(normalize(left), normalize(right), tolerance);
     if (expression.operator === "in") return containsValue(right, left, tolerance);
@@ -1592,10 +1922,10 @@ function evaluateExpression(expression, actual, tolerance) {{
     if (expression.operator === "gte") return comparableLeft >= comparableRight;
   }}
   if (expression.op === "index") {{
-    return expressionIndex(evaluateExpression(expression.value, actual, tolerance), evaluateExpression(expression.index, actual, tolerance));
+    return expressionIndex(evaluateExpression(expression.value, actual, tolerance, variables), evaluateExpression(expression.index, actual, tolerance, variables));
   }}
   if (expression.op === "call") {{
-    const args = expression.args.map(arg => evaluateExpression(arg, actual, tolerance));
+    const args = expression.args.map(arg => evaluateExpression(arg, actual, tolerance, variables));
     if (expression.function === "sorted") return expressionSorted(args[0]);
     if (expression.function === "abs") return Math.abs(args[0]);
   }}
@@ -1670,8 +2000,20 @@ async function main() {{
       let actual;
       let raised = false;
       let raisedError = null;
+      let variables = {{}};
       if (test.kind === "loop") {{
         ok = !!test.expected;
+      }} else if (test.kind === "mutation") {{
+        const decodedArgs = test.args.map(decodeArg);
+        for (const [name, index] of Object.entries(test.mutation_vars || {{}})) variables[name] = decodedArgs[index];
+        try {{
+          actual = fn(...decodedArgs);
+          if (actual && typeof actual.then === "function") actual = await actual;
+          if (test.mutation_result) variables[test.mutation_result] = actual;
+        }} catch (error) {{
+          raised = true;
+          raisedError = error;
+        }}
       }} else {{
         try {{
           actual = fn(...test.args.map(decodeArg));
@@ -1682,6 +2024,7 @@ async function main() {{
         }}
       }}
       if (test.kind === "loop") {{}}
+      else if (test.kind === "mutation") ok = !raised && !!evaluateExpression(test.expression, actual, tolerancePolicy(test), variables);
       else if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
       else if (raised) ok = false;
       else if (test.kind === "expr") ok = !!evaluateExpression(test.expression, actual, tolerancePolicy(test));
