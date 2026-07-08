@@ -32,6 +32,30 @@ def parse_result(completed):
     return result
 
 
+def parse_profile_result(completed, *, memory=False):
+    lines = completed.stdout.splitlines()
+    assert len(lines) == 1
+    result = json.loads(lines[0])
+    expected_keys = ["status", "passed", "failed", "runtime_ns"]
+    if memory:
+        expected_keys.append("memory_kb")
+    assert list(result) == expected_keys
+    assert set(result["runtime_ns"]) == {"mean", "std"}
+    assert isinstance(result["runtime_ns"]["mean"], int | float)
+    assert isinstance(result["runtime_ns"]["std"], int | float)
+    assert result["runtime_ns"]["mean"] >= 0
+    assert result["runtime_ns"]["std"] >= 0
+    if memory:
+        assert set(result["memory_kb"]) == {"mean", "std"}
+        assert isinstance(result["memory_kb"]["mean"], int | float)
+        assert isinstance(result["memory_kb"]["std"], int | float)
+        assert result["memory_kb"]["mean"] >= 0
+        assert result["memory_kb"]["std"] >= 0
+    else:
+        assert "memory_kb" not in result
+    return result
+
+
 def has_cpp_compiler():
     return shutil.which("g++") is not None or shutil.which("clang++") is not None
 
@@ -169,6 +193,169 @@ def test_run_unknown_test_id_returns_error(tmp_path):
 
     assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
     assert completed.returncode == 2
+
+
+def test_profile_reports_runtime_statistics_by_default(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("profile", tests_dir, solution, "--lang", "python")
+    result = parse_profile_result(completed)
+
+    assert completed.returncode == 0
+    assert result["status"] == "pass"
+    assert result["passed"] == ["tests.py:2"]
+    assert result["failed"] == []
+    assert result["runtime_ns"]["std"] == 0
+
+
+def test_profile_warmup_runs_are_excluded_from_statistics(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
+    counter = tmp_path / "counter.txt"
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        f"""from pathlib import Path
+import time
+
+counter = Path({str(counter)!r})
+
+def solve(x):
+    count = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(count + 1))
+    if count == 0:
+        time.sleep(1.0)
+    return x
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("profile", tests_dir, solution, "--lang", "python", "-n", "2", "--warmup", "1")
+    result = parse_profile_result(completed)
+
+    assert completed.returncode == 0
+    assert result["status"] == "pass"
+    assert counter.read_text(encoding="utf-8") == "3"
+    assert result["runtime_ns"]["mean"] < 800_000_000
+
+
+def test_profile_validation_errors_report_json(tmp_path):
+    tests_dir = write_tests(tmp_path / "missing", "def cases():\n    assert solve(1) == 1\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+
+    missing = run_cli("profile", tests_dir, solution, "--lang", "python")
+    invalid_warmup = run_cli("profile", tests_dir, solution, "--lang", "python", "-n", "2", "--warmup", "2")
+
+    assert parse_profile_result(missing) == {
+        "status": "error",
+        "passed": [],
+        "failed": [],
+        "runtime_ns": {"mean": 0, "std": 0},
+    }
+    assert missing.returncode == 2
+    assert not (tests_dir / "tester.py").exists()
+    assert parse_profile_result(invalid_warmup)["status"] == "error"
+    assert invalid_warmup.returncode == 2
+
+
+def test_profile_memory_output_is_optional(tmp_path):
+    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve([1, 2, 3]) == 3\n")
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(items):\n    return len(items)\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    without_memory = run_cli("profile", tests_dir, solution, "--lang", "python")
+    with_memory = run_cli("profile", tests_dir, solution, "--lang", "python", "--memory")
+
+    assert parse_profile_result(without_memory)["status"] == "pass"
+    assert parse_profile_result(with_memory, memory=True)["status"] == "pass"
+    assert without_memory.returncode == 0
+    assert with_memory.returncode == 0
+
+
+def test_profile_list_run_and_tolerance_match_test(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve(1) == 1
+    assert solve(2) == 2.001
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text("def solve(x):\n    return float(x)\n", encoding="utf-8")
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    listed = run_cli("profile", tests_dir, tmp_path / "missing.py", "--lang", "python", "--list-tests")
+    selected = run_cli("profile", tests_dir, solution, "--lang", "python", "--run", "tests.py:2")
+    without_tol = run_cli("profile", tests_dir, solution, "--lang", "python")
+    with_tol = run_cli("profile", tests_dir, solution, "--lang", "python", "--tol", "0.01")
+
+    assert parse_profile_result(listed)["passed"] == ["tests.py:2", "tests.py:3"]
+    assert listed.returncode == 0
+    assert parse_profile_result(selected) == {
+        "status": "pass",
+        "passed": ["tests.py:2"],
+        "failed": [],
+        "runtime_ns": parse_profile_result(selected)["runtime_ns"],
+    }
+    assert selected.returncode == 0
+    assert parse_profile_result(without_tol)["failed"] == ["tests.py:3"]
+    assert without_tol.returncode == 1
+    assert parse_profile_result(with_tol)["status"] == "pass"
+    assert with_tol.returncode == 0
+
+
+def test_profile_timeouts_report_failed_ids_and_statistics(tmp_path):
+    per_test_dir = write_tests(
+        tmp_path / "per_test",
+        "def cases():\n    assert solve(1) == 1\n",
+    )
+    total_dir = write_tests(
+        tmp_path / "total",
+        """def cases():
+    assert solve(1) == 1
+    assert solve(2) == 2
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """import time
+
+def solve(x):
+    time.sleep(0.2)
+    return x
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", per_test_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    assert run_cli("generate", total_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    per_test = run_cli(
+        "profile",
+        per_test_dir,
+        solution,
+        "--lang",
+        "python",
+        "--run",
+        "tests.py:2",
+        "--timeout-ms",
+        "20",
+    )
+    total = run_cli("profile", total_dir, solution, "--lang", "python", "--total-timeout-ms", "20")
+    per_test_result = parse_profile_result(per_test)
+    total_result = parse_profile_result(total)
+
+    assert per_test_result["status"] == "fail"
+    assert per_test_result["failed"] == ["tests.py:2"]
+    assert per_test_result["runtime_ns"]["mean"] > 0
+    assert per_test.returncode == 1
+    assert total_result["status"] == "fail"
+    assert total_result["failed"] == ["tests.py:2", "tests.py:3"]
+    assert total_result["runtime_ns"]["mean"] > 0
+    assert total.returncode == 1
 
 
 def test_discovery_accepts_allowed_constructs_and_duplicate_line_ids(tmp_path):

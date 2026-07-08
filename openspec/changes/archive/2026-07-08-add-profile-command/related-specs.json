@@ -1,0 +1,4 @@
+[
+  "babel-code-goat-cli/support-rich-python-test-comparisons",
+  "async-test-execution-controls/support-async-test-selection-timeouts"
+]

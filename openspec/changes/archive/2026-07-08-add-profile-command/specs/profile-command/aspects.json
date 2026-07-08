@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Profile Command Surface",
+    "tags": ["profile command", "generated tester", "language target"]
+  },
+  {
+    "label": "Execution Controls",
+    "tags": ["trial count", "warmup exclusion", "memory flag"]
+  },
+  {
+    "label": "Result Statistics",
+    "tags": ["runtime metrics", "mean std", "json output"]
+  },
+  {
+    "label": "Timeout Accounting",
+    "tags": ["per test timeout", "total timeout", "failed aggregation"]
+  }
+]
