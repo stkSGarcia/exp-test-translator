@@ -1,0 +1,7 @@
+[
+  "babel-code-goat-cli/support-rich-python-test-comparisons",
+  "compiled-targets/add-cpp-rust-targets",
+  "python-test-discovery/add-mutation-style-test-discovery",
+  "babel-code-goat-cli/support-loop-construct-tests",
+  "babel-code-goat-cli/add-babel-code-goat"
+]

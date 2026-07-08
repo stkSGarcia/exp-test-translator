@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Async Target Completion",
+    "tags": ["async execution", "awaited results", "runtime completion"]
+  },
+  {
+    "label": "Discovery Listing",
+    "tags": ["test listing", "discovered ids", "list mode"]
+  },
+  {
+    "label": "Selected Execution",
+    "tags": ["selected runs", "single test", "id filtering"]
+  },
+  {
+    "label": "Timeout Accounting",
+    "tags": ["per test timeout", "total timeout", "failure coverage"]
+  }
+]
