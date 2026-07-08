@@ -1,0 +1,18 @@
+[
+  {
+    "label": "CLI Command Contract",
+    "tags": ["command routing", "language validation", "entrypoint flags"]
+  },
+  {
+    "label": "Tester File Generation",
+    "tags": ["tester filenames", "atomic writes", "failure preservation"]
+  },
+  {
+    "label": "Test Discovery Semantics",
+    "tags": ["python assertions", "literal parsing", "line identifiers"]
+  },
+  {
+    "label": "Execution Results",
+    "tags": ["json output", "exit statuses", "coverage accounting"]
+  }
+]

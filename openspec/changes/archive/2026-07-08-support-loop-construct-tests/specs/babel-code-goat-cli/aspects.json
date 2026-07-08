@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Loop Statement Tests",
+    "tags": ["loop pass fail", "zero iteration", "normal results"]
+  },
+  {
+    "label": "Parameterized Discovery",
+    "tags": ["literal assignments", "enumerate loops", "while updates"]
+  },
+  {
+    "label": "Loop-aware Identifiers",
+    "tags": ["iteration suffixes", "nested ordering", "line ids"]
+  },
+  {
+    "label": "Traceable Loop Execution",
+    "tags": ["scoped bindings", "single call", "tester payloads"]
+  }
+]

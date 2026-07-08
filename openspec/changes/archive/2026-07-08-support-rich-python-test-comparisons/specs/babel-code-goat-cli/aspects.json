@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Tolerance CLI",
+    "tags": ["default tolerance", "numeric leaves", "test flag"]
+  },
+  {
+    "label": "Constrained Discovery",
+    "tags": ["allowed imports", "ast parsing", "assertion forms"]
+  },
+  {
+    "label": "Rich Value Semantics",
+    "tags": ["container equality", "typed dictionary keys", "decimal values"]
+  },
+  {
+    "label": "Exception Matching",
+    "tags": ["typed raises", "message substrings", "regex checks"]
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Mutation Test Grouping",
+    "tags": ["mutation tests", "entrypoint grouping", "assert traceability"]
+  },
+  {
+    "label": "Recursive Discovery",
+    "tags": ["recursive files", "tests directory", "source enumeration"]
+  },
+  {
+    "label": "Discovery Errors",
+    "tags": ["invalid patterns", "non python files", "empty discovery"]
+  },
+  {
+    "label": "Stable Test IDs",
+    "tags": ["path ids", "line numbers", "same line suffixes"]
+  }
+]

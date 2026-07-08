@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Single-call Traceability",
+    "tags": ["entrypoint counting", "discovery rejection", "call uniqueness"]
+  },
+  {
+    "label": "Primitive Expressions",
+    "tags": ["serialized operations", "membership assertions", "container access"]
+  },
+  {
+    "label": "Tester Evaluation",
+    "tags": ["expression payloads", "single invocation", "cross language"]
+  },
+  {
+    "label": "Compatibility Preservation",
+    "tags": ["tolerance helpers", "raise parsing", "json reporting"]
+  }
+]
