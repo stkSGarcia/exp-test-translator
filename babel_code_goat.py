@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ SUPPORTED_LANGS = {
     "python": {"tester": "tester.py", "runner": "python"},
     "javascript": {"tester": "tester.js", "runner": "node"},
     "typescript": {"tester": "tester.ts", "runner": "node"},
+    "cpp": {"tester": "tester.cpp", "runner": "compiled"},
+    "rust": {"tester": "tester.rs", "runner": "compiled"},
 }
 RESULT_ERROR = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"^\s*#\s*expect_(stdout|stderr):\s*(.+?)\s*$")
@@ -1898,13 +1901,771 @@ main().then(code => process.exit(code)).catch(() => {{
 """
 
 
+@dataclass(frozen=True)
+class TargetType:
+    kind: str
+    args: tuple["TargetType", ...] = ()
+
+
+TYPE_BOOL = TargetType("bool")
+TYPE_INT = TargetType("int")
+TYPE_FLOAT = TargetType("float")
+TYPE_STRING = TargetType("string")
+
+
+def optional_type(inner: TargetType) -> TargetType:
+    return TargetType("optional", (inner,))
+
+
+def vector_type(inner: TargetType) -> TargetType:
+    return TargetType("vector", (inner,))
+
+
+def map_type(key: TargetType, value: TargetType) -> TargetType:
+    return TargetType("map", (key, value))
+
+
+def set_type(inner: TargetType) -> TargetType:
+    return TargetType("set", (inner,))
+
+
+def contains_tagged_type(value: Any, type_name: str) -> bool:
+    if is_tagged(value, type_name):
+        return True
+    if isinstance(value, dict):
+        return any(contains_tagged_type(item, type_name) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_tagged_type(item, type_name) for item in value)
+    return False
+
+
+def rust_supported_tests(tests: list[TestCase]) -> list[TestCase]:
+    return [test for test in tests if not contains_tagged_type(test.to_jsonable(), "deque")]
+
+
+def compiled_payload(entrypoint: str, tests: list[TestCase]) -> str:
+    return json.dumps(
+        {"entrypoint": entrypoint, "tests": [test.to_jsonable() for test in tests]},
+        separators=(",", ":"),
+    )
+
+
+def unify_target_types(types: list[TargetType]) -> TargetType:
+    concrete = [type_ for type_ in types if type_.kind != "null"]
+    if not concrete:
+        return optional_type(TYPE_INT)
+    if len(concrete) != len(types):
+        return optional_type(unify_target_types(concrete))
+    if all(type_ == concrete[0] for type_ in concrete):
+        return concrete[0]
+    if all(type_.kind in {"int", "float"} for type_ in concrete):
+        return TYPE_FLOAT
+    if all(type_.kind == "optional" for type_ in concrete):
+        return optional_type(unify_target_types([type_.args[0] for type_ in concrete]))
+    if all(type_.kind == "vector" for type_ in concrete):
+        return vector_type(unify_target_types([type_.args[0] for type_ in concrete]))
+    if all(type_.kind == "set" for type_ in concrete):
+        return set_type(unify_target_types([type_.args[0] for type_ in concrete]))
+    if all(type_.kind == "map" for type_ in concrete):
+        return map_type(
+            unify_target_types([type_.args[0] for type_ in concrete]),
+            unify_target_types([type_.args[1] for type_ in concrete]),
+        )
+    raise DiscoveryError("unsupported heterogeneous compiled value")
+
+
+def infer_target_type(value: Any, *, rust: bool = False) -> TargetType:
+    if value is None:
+        return TargetType("null")
+    if isinstance(value, bool):
+        return TYPE_BOOL
+    if isinstance(value, int):
+        return TYPE_INT
+    if isinstance(value, float):
+        return TYPE_FLOAT
+    if isinstance(value, str):
+        return TYPE_STRING
+    if isinstance(value, list):
+        return vector_type(unify_target_types([infer_target_type(item, rust=rust) for item in value]))
+    if is_tagged(value, "decimal"):
+        return TYPE_FLOAT
+    if is_tagged(value, "deque"):
+        if rust:
+            raise DiscoveryError("Rust deque cases must be filtered before rendering")
+        return vector_type(unify_target_types([infer_target_type(item, rust=rust) for item in value["items"]]))
+    if is_tagged(value, "set"):
+        return set_type(unify_target_types([infer_target_type(item, rust=rust) for item in value["items"]]))
+    if is_tagged(value, "counter"):
+        key_type = unify_target_types([infer_target_type(key, rust=rust) for key, _ in value["items"]])
+        return map_type(key_type, TYPE_INT)
+    if is_tagged(value, "dict"):
+        key_type = unify_target_types([infer_target_type(key, rust=rust) for key, _ in value["items"]])
+        item_type = unify_target_types([infer_target_type(item, rust=rust) for _, item in value["items"]])
+        return map_type(key_type, item_type)
+    raise DiscoveryError(f"unsupported compiled value: {value!r}")
+
+
+def cpp_type(type_: TargetType) -> str:
+    if type_.kind == "bool":
+        return "bool"
+    if type_.kind == "int":
+        return "int"
+    if type_.kind == "float":
+        return "long double"
+    if type_.kind == "string":
+        return "std::string"
+    if type_.kind == "optional":
+        return f"std::optional<{cpp_type(type_.args[0])}>"
+    if type_.kind == "vector":
+        return f"std::vector<{cpp_type(type_.args[0])}>"
+    if type_.kind == "set":
+        return f"std::set<{cpp_type(type_.args[0])}>"
+    if type_.kind == "map":
+        return f"std::map<{cpp_type(type_.args[0])}, {cpp_type(type_.args[1])}>"
+    raise DiscoveryError("unsupported C++ type")
+
+
+def rust_type(type_: TargetType) -> str:
+    if type_.kind == "bool":
+        return "bool"
+    if type_.kind == "int":
+        return "i32"
+    if type_.kind == "float":
+        return "f64"
+    if type_.kind == "string":
+        return "String"
+    if type_.kind == "optional":
+        return f"Option<{rust_type(type_.args[0])}>"
+    if type_.kind == "vector":
+        return f"Vec<{rust_type(type_.args[0])}>"
+    if type_.kind == "set":
+        return f"HashSet<{rust_type(type_.args[0])}>"
+    if type_.kind == "map":
+        return f"HashMap<{rust_type(type_.args[0])}, {rust_type(type_.args[1])}>"
+    raise DiscoveryError("unsupported Rust type")
+
+
+def cpp_literal(value: Any, type_: TargetType | None = None) -> str:
+    if type_ is None:
+        type_ = infer_target_type(value)
+        if type_.kind == "null":
+            type_ = optional_type(TYPE_INT)
+    if type_.kind == "optional":
+        inner = type_.args[0]
+        if value is None:
+            return f"{cpp_type(type_)}{{std::nullopt}}"
+        return f"{cpp_type(type_)}{{{cpp_literal(value, inner)}}}"
+    if value is None:
+        raise DiscoveryError("null requires optional compiled type")
+    if type_.kind == "bool":
+        return "true" if value else "false"
+    if type_.kind == "int":
+        return str(int(value))
+    if type_.kind == "float":
+        raw = value["value"] if is_tagged(value, "decimal") else repr(float(value))
+        return f"{raw}L"
+    if type_.kind == "string":
+        return f"std::string({json.dumps(str(value))})"
+    if type_.kind == "vector":
+        items = value["items"] if is_tagged(value, "deque") else value
+        inner = type_.args[0]
+        return f"{cpp_type(type_)}{{{', '.join(cpp_literal(item, inner) for item in items)}}}"
+    if type_.kind == "set":
+        inner = type_.args[0]
+        return f"{cpp_type(type_)}{{{', '.join(cpp_literal(item, inner) for item in value['items'])}}}"
+    if type_.kind == "map":
+        key_type, item_type = type_.args
+        items = value["items"]
+        if is_tagged(value, "counter"):
+            items = [[key, count] for key, count in value["items"]]
+        return (
+            f"{cpp_type(type_)}{{"
+            + ", ".join(
+                f"{{{cpp_literal(key, key_type)}, {cpp_literal(item, item_type)}}}" for key, item in items
+            )
+            + "}"
+        )
+    raise DiscoveryError("unsupported C++ literal")
+
+
+def rust_literal(value: Any, type_: TargetType | None = None) -> str:
+    if type_ is None:
+        type_ = infer_target_type(value, rust=True)
+        if type_.kind == "null":
+            type_ = optional_type(TYPE_INT)
+    if type_.kind == "optional":
+        inner = type_.args[0]
+        if value is None:
+            return f"Option::<{rust_type(inner)}>::None"
+        return f"Some({rust_literal(value, inner)})"
+    if value is None:
+        raise DiscoveryError("null requires optional compiled type")
+    if type_.kind == "bool":
+        return "true" if value else "false"
+    if type_.kind == "int":
+        return f"{int(value)}i32"
+    if type_.kind == "float":
+        raw = value["value"] if is_tagged(value, "decimal") else repr(float(value))
+        return f"{raw}f64"
+    if type_.kind == "string":
+        return f"String::from({json.dumps(str(value))})"
+    if type_.kind == "vector":
+        inner = type_.args[0]
+        return f"vec![{', '.join(rust_literal(item, inner) for item in value)}]"
+    if type_.kind == "set":
+        inner = type_.args[0]
+        return f"bcg_hashset(vec![{', '.join(rust_literal(item, inner) for item in value['items'])}])"
+    if type_.kind == "map":
+        key_type, item_type = type_.args
+        items = value["items"]
+        if is_tagged(value, "counter"):
+            items = [[key, count] for key, count in value["items"]]
+        return (
+            "bcg_hashmap(vec!["
+            + ", ".join(
+                f"({rust_literal(key, key_type)}, {rust_literal(item, item_type)})" for key, item in items
+            )
+            + "])"
+        )
+    raise DiscoveryError("unsupported Rust literal")
+
+
+def cpp_condition_for_test(test: dict[str, Any], entrypoint: str) -> str:
+    args = test.get("args") or []
+    arg_types = [infer_target_type(arg) for arg in args]
+    arg_exprs = [cpp_literal(arg, type_) for arg, type_ in zip(args, arg_types, strict=True)]
+    call = f"{entrypoint}({', '.join(arg_exprs)})"
+    tolerance = test.get("tolerance") or {"abs": "BCG_DEFAULT_TOL", "rel": 0.0, "strict": False}
+    abs_tol = "BCG_DEFAULT_TOL" if tolerance.get("abs") == "BCG_DEFAULT_TOL" else repr(float(tolerance.get("abs", 0.0))) + "L"
+    rel_tol = repr(float(tolerance.get("rel", 0.0))) + "L"
+    strict = "true" if tolerance.get("strict") else "false"
+    tol_decl = f"BcgTol tol{{{abs_tol}, {rel_tol}, {strict}}};"
+
+    kind = test["kind"]
+    if kind == "loop":
+        return f"{tol_decl}\n  return {'true' if test.get('expected') else 'false'};"
+    if kind == "raises":
+        message = test.get("message_match") or {}
+        contains = json.dumps(message.get("pattern", "")) if message.get("mode") == "contains" else '""'
+        regex = json.dumps(message.get("pattern", "")) if message.get("mode") == "regex" else '""'
+        return f"""{tol_decl}
+  try {{
+    (void){call};
+    return false;
+  }} catch (const std::exception& e) {{
+    return bcg_message_matches(e.what(), {contains}, {regex});
+  }} catch (...) {{
+    return true;
+  }}"""
+    if kind == "truthy":
+        return f"{tol_decl}\n  auto actual = {call};\n  return bcg_truthy(actual);"
+    if kind == "falsy":
+        return f"{tol_decl}\n  auto actual = {call};\n  return !bcg_truthy(actual);"
+    if kind in {"eq", "neq"}:
+        expected_type = infer_target_type(test["expected"])
+        expected = cpp_literal(test["expected"], expected_type)
+        comparison = f"bcg_equal(actual, {expected}, tol)"
+        if kind == "neq":
+            comparison = f"!({comparison})"
+        return f"{tol_decl}\n  auto actual = {call};\n  return {comparison};"
+    if kind in {"expr", "mutation"}:
+        prefix: list[str] = [tol_decl]
+        variables: dict[str, str] = {}
+        call_args: list[str] = []
+        if kind == "mutation":
+            for index, (arg, type_) in enumerate(zip(args, arg_types, strict=True)):
+                name = f"arg{index}"
+                prefix.append(f"  auto {name} = {cpp_literal(arg, type_)};")
+                call_args.append(name)
+            for name, source in (test.get("variables") or {}).items():
+                if source.get("source") == "arg":
+                    variables[name] = f"arg{source['index']}"
+                elif source.get("source") == "return":
+                    variables[name] = "actual"
+            call = f"{entrypoint}({', '.join(call_args)})"
+            prefix.append(f"  auto actual = {call};")
+        else:
+            variables = {}
+            prefix.append(f"  auto actual = {call};")
+        condition = cpp_render_expression(test["expression"], variables)
+        return "\n".join(prefix) + f"\n  return bcg_truthy({condition});"
+    return f"{tol_decl}\n  return false;"
+
+
+def cpp_render_expression(expression: dict[str, Any], variables: dict[str, str]) -> str:
+    op = expression.get("op")
+    if op == "const":
+        return cpp_literal(expression.get("value"))
+    if op == "actual":
+        return "actual"
+    if op == "var":
+        return variables[expression["name"]]
+    if op == "unary":
+        operand = cpp_render_expression(expression["operand"], variables)
+        return f"(!({operand}))" if expression["operator"] == "not" else f"({expression['operator']}{operand})"
+    if op == "binary":
+        left = cpp_render_expression(expression["left"], variables)
+        right = cpp_render_expression(expression["right"], variables)
+        ops = {"add": "+", "sub": "-", "mul": "*", "div": "/", "floordiv": "/", "mod": "%"}
+        return f"(({left}) {ops[expression['operator']]} ({right}))"
+    if op == "compare":
+        left = cpp_render_expression(expression["left"], variables)
+        right = cpp_render_expression(expression["right"], variables)
+        operator = expression["operator"]
+        if operator == "eq":
+            return f"bcg_equal({left}, {right}, tol)"
+        if operator == "neq":
+            return f"!bcg_equal({left}, {right}, tol)"
+        if operator == "in":
+            return f"bcg_contains({right}, {left}, tol)"
+        if operator == "not_in":
+            return f"!bcg_contains({right}, {left}, tol)"
+        return f"(({left}) { {'lt':'<','lte':'<=','gt':'>','gte':'>='}[operator] } ({right}))"
+    if op == "index":
+        value = cpp_render_expression(expression["value"], variables)
+        index = cpp_render_expression(expression["index"], variables)
+        return f"bcg_index({value}, {index})"
+    if op == "call":
+        args = [cpp_render_expression(arg, variables) for arg in expression["args"]]
+        if expression.get("function") == "sorted":
+            return f"bcg_sorted({args[0]})"
+        if expression.get("function") == "abs":
+            return f"std::abs({args[0]})"
+    raise DiscoveryError("unsupported C++ expression")
+
+
+def cpp_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    payload = compiled_payload(entrypoint, tests)
+    test_blocks: list[str] = []
+    table_entries: list[str] = []
+    for index, test_case in enumerate(tests):
+        test = test_case.to_jsonable()
+        test_blocks.append(
+            f"""bool bcg_test_{index}() {{
+  try {{
+  {cpp_condition_for_test(test, entrypoint)}
+  }} catch (...) {{
+    return false;
+  }}
+}}"""
+        )
+        table_entries.append(f'  {{"{test["id"]}", bcg_test_{index}}}')
+
+    source = r"""/*
+BCG_PAYLOAD_BEGIN
+__PAYLOAD__
+BCG_PAYLOAD_END
+*/
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <exception>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <vector>
+
+#ifndef BCG_SOLUTION_PATH
+#error "BCG_SOLUTION_PATH must be defined"
+#endif
+#include BCG_SOLUTION_PATH
+
+struct BcgTol {
+  long double abs;
+  long double rel;
+  bool strict;
+};
+
+long double BCG_DEFAULT_TOL = []() {
+  const char* raw = std::getenv("BABEL_CODE_GOAT_TOL");
+  return raw ? std::strtold(raw, nullptr) : 0.0L;
+}();
+
+template <typename T> struct is_optional : std::false_type {};
+template <typename T> struct is_optional<std::optional<T>> : std::true_type {};
+template <typename T> struct is_vector : std::false_type {};
+template <typename T, typename A> struct is_vector<std::vector<T, A>> : std::true_type {};
+template <typename T> struct is_set_like : std::false_type {};
+template <typename K, typename C, typename A> struct is_set_like<std::set<K, C, A>> : std::true_type {};
+template <typename T> struct is_map_like : std::false_type {};
+template <typename K, typename V, typename C, typename A> struct is_map_like<std::map<K, V, C, A>> : std::true_type {};
+template <typename K, typename V, typename H, typename E, typename A> struct is_map_like<std::unordered_map<K, V, H, E, A>> : std::true_type {};
+template <typename T> constexpr bool is_optional_v = is_optional<std::decay_t<T>>::value;
+template <typename T> constexpr bool is_vector_v = is_vector<std::decay_t<T>>::value;
+template <typename T> constexpr bool is_set_like_v = is_set_like<std::decay_t<T>>::value;
+template <typename T> constexpr bool is_map_like_v = is_map_like<std::decay_t<T>>::value;
+template <typename T> constexpr bool is_numeric_v = std::is_arithmetic_v<std::decay_t<T>> && !std::is_same_v<std::decay_t<T>, bool>;
+
+template <typename A, typename B>
+bool bcg_equal(const A& actual, const B& expected, BcgTol tol);
+
+template <typename A, typename B>
+bool bcg_numeric_equal(const A& actual, const B& expected, BcgTol tol) {
+  long double left = static_cast<long double>(actual);
+  long double right = static_cast<long double>(expected);
+  long double diff = std::fabs(left - right);
+  if (tol.strict) return diff < tol.abs;
+  return diff <= std::max(tol.abs, tol.rel * std::max(std::fabs(left), std::fabs(right)));
+}
+
+template <typename A, typename B>
+bool bcg_equal(const A& actual, const B& expected, BcgTol tol) {
+  if constexpr (is_optional_v<A> || is_optional_v<B>) {
+    if constexpr (is_optional_v<A> && is_optional_v<B>) {
+      if (actual.has_value() != expected.has_value()) return false;
+      return !actual.has_value() || bcg_equal(*actual, *expected, tol);
+    } else {
+      return false;
+    }
+  } else if constexpr (is_numeric_v<A> && is_numeric_v<B>) {
+    return bcg_numeric_equal(actual, expected, tol);
+  } else if constexpr (is_vector_v<A> && is_vector_v<B>) {
+    if (actual.size() != expected.size()) return false;
+    for (size_t i = 0; i < actual.size(); ++i) {
+      if (!bcg_equal(actual[i], expected[i], tol)) return false;
+    }
+    return true;
+  } else if constexpr (is_set_like_v<A> && is_set_like_v<B>) {
+    if (actual.size() != expected.size()) return false;
+    std::vector<bool> used(expected.size(), false);
+    for (const auto& item : actual) {
+      bool found = false;
+      size_t index = 0;
+      for (const auto& expected_item : expected) {
+        if (!used[index] && bcg_equal(item, expected_item, tol)) {
+          used[index] = true;
+          found = true;
+          break;
+        }
+        ++index;
+      }
+      if (!found) return false;
+    }
+    return true;
+  } else if constexpr (is_map_like_v<A> && is_map_like_v<B>) {
+    if (actual.size() != expected.size()) return false;
+    for (const auto& [key, value] : expected) {
+      bool found = false;
+      for (const auto& [actual_key, actual_value] : actual) {
+        if (bcg_equal(actual_key, key, BcgTol{0.0L, 0.0L, false}) && bcg_equal(actual_value, value, tol)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  } else {
+    return actual == expected;
+  }
+}
+
+template <typename T>
+bool bcg_truthy(const T& value) {
+  if constexpr (std::is_same_v<std::decay_t<T>, bool>) return value;
+  else if constexpr (is_optional_v<T>) return value.has_value();
+  else if constexpr (is_numeric_v<T>) return value != 0;
+  else return !value.empty();
+}
+
+template <typename Container, typename Needle>
+bool bcg_contains(const Container& container, const Needle& needle, BcgTol tol) {
+  for (const auto& item : container) {
+    if (bcg_equal(item, needle, tol)) return true;
+  }
+  return false;
+}
+
+template <typename K, typename V, typename Needle>
+bool bcg_contains(const std::map<K, V>& container, const Needle& needle, BcgTol tol) {
+  for (const auto& [key, _] : container) {
+    if (bcg_equal(key, needle, tol)) return true;
+  }
+  return false;
+}
+
+template <typename Container, typename Index>
+auto bcg_index(const Container& container, const Index& index) -> decltype(container[index]) {
+  return container[index];
+}
+
+template <typename K, typename V, typename Index>
+const V& bcg_index(const std::map<K, V>& container, const Index& index) {
+  return container.at(index);
+}
+
+template <typename Container>
+Container bcg_sorted(Container value) {
+  std::sort(value.begin(), value.end());
+  return value;
+}
+
+bool bcg_message_matches(const std::string& message, const std::string& contains, const std::string& regex) {
+  if (!contains.empty() && message.find(contains) == std::string::npos) return false;
+  if (!regex.empty() && !std::regex_search(message, std::regex(regex))) return false;
+  return true;
+}
+
+__TEST_BLOCKS__
+
+int main() {
+  std::vector<std::pair<std::string, bool (*)()>> tests = {
+__TABLE_ENTRIES__
+  };
+  std::vector<std::string> passed;
+  std::vector<std::string> failed;
+  for (const auto& [id, fn] : tests) {
+    (fn() ? passed : failed).push_back(id);
+  }
+  std::cout << "{\"status\":\"" << (failed.empty() ? "pass" : "fail") << "\",\"passed\":[";
+  for (size_t i = 0; i < passed.size(); ++i) {
+    if (i) std::cout << ",";
+    std::cout << "\"" << passed[i] << "\"";
+  }
+  std::cout << "],\"failed\":[";
+  for (size_t i = 0; i < failed.size(); ++i) {
+    if (i) std::cout << ",";
+    std::cout << "\"" << failed[i] << "\"";
+  }
+  std::cout << "]}" << std::endl;
+  return failed.empty() ? 0 : 1;
+}
+"""
+    return (
+        source.replace("__PAYLOAD__", payload)
+        .replace("__TEST_BLOCKS__", "\n\n".join(test_blocks))
+        .replace("__TABLE_ENTRIES__", ",\n".join(table_entries))
+    )
+
+
+def rust_condition_for_test(test: dict[str, Any], entrypoint: str) -> str:
+    args = test.get("args") or []
+    arg_types = [infer_target_type(arg, rust=True) for arg in args]
+    arg_exprs = [rust_literal(arg, type_) for arg, type_ in zip(args, arg_types, strict=True)]
+    tolerance = test.get("tolerance") or {}
+    abs_tol = "bcg_default_tol()" if not tolerance else repr(float(tolerance.get("abs", 0.0)))
+    kind = test["kind"]
+    if kind == "loop":
+        return f"return {'true' if test.get('expected') else 'false'};"
+    if kind == "raises":
+        message = test.get("message_match") or {}
+        pattern = json.dumps(message.get("pattern", ""))
+        mode = json.dumps(message.get("mode", ""))
+        return f"""let result = std::panic::catch_unwind(|| {{ {entrypoint}({', '.join(arg_exprs)}); }});
+    match result {{
+        Ok(_) => false,
+        Err(error) => bcg_panic_message_matches(error, {mode}, {pattern}),
+    }}"""
+    call = f"{entrypoint}({', '.join(arg_exprs)})"
+    if kind == "truthy":
+        return f"let actual = {call};\n    return bcg_truthy(&actual);"
+    if kind == "falsy":
+        return f"let actual = {call};\n    return !bcg_truthy(&actual);"
+    if kind in {"eq", "neq"}:
+        expected_type = infer_target_type(test["expected"], rust=True)
+        expected = rust_literal(test["expected"], expected_type)
+        if expected_type.kind in {"int", "float"}:
+            comparison = f"bcg_float_equal(actual as f64, {expected} as f64, {abs_tol})"
+        else:
+            comparison = "actual == expected"
+        if kind == "neq":
+            comparison = f"!({comparison})"
+        return f"let actual = {call};\n    let expected = {expected};\n    return {comparison};"
+    if kind in {"expr", "mutation"}:
+        lines: list[str] = []
+        variables: dict[str, str] = {}
+        if kind == "mutation":
+            call_args: list[str] = []
+            for index, (arg, type_) in enumerate(zip(args, arg_types, strict=True)):
+                name = f"arg{index}"
+                lines.append(f"let mut {name} = {rust_literal(arg, type_)};")
+                call_args.append(f"&mut {name}")
+            for name, source in (test.get("variables") or {}).items():
+                if source.get("source") == "arg":
+                    variables[name] = f"arg{source['index']}.clone()"
+                elif source.get("source") == "return":
+                    variables[name] = "actual.clone()"
+            lines.append(f"let actual = {entrypoint}({', '.join(call_args)});")
+        else:
+            lines.append(f"let actual = {call};")
+        condition = rust_render_expression(test["expression"], variables)
+        return "\n    ".join(lines) + f"\n    return bcg_truthy(&({condition}));"
+    return "return false;"
+
+
+def rust_render_expression(expression: dict[str, Any], variables: dict[str, str]) -> str:
+    op = expression.get("op")
+    if op == "const":
+        return rust_literal(expression.get("value"))
+    if op == "actual":
+        return "actual.clone()"
+    if op == "var":
+        return variables[expression["name"]]
+    if op == "binary":
+        left = rust_render_expression(expression["left"], variables)
+        right = rust_render_expression(expression["right"], variables)
+        ops = {"add": "+", "sub": "-", "mul": "*", "div": "/", "floordiv": "/", "mod": "%"}
+        return f"(({left}) {ops[expression['operator']]} ({right}))"
+    if op == "compare":
+        left = rust_render_expression(expression["left"], variables)
+        right = rust_render_expression(expression["right"], variables)
+        operator = expression["operator"]
+        if operator == "eq":
+            return f"(({left}) == ({right}))"
+        if operator == "neq":
+            return f"(({left}) != ({right}))"
+        if operator == "in":
+            return f"bcg_contains(&({right}), &({left}))"
+        if operator == "not_in":
+            return f"!bcg_contains(&({right}), &({left}))"
+        return f"(({left}) { {'lt':'<','lte':'<=','gt':'>','gte':'>='}[operator] } ({right}))"
+    if op == "index":
+        value = rust_render_expression(expression["value"], variables)
+        index = rust_render_expression(expression["index"], variables)
+        return f"({value})[{index} as usize].clone()"
+    if op == "call":
+        args = [rust_render_expression(arg, variables) for arg in expression["args"]]
+        if expression.get("function") == "sorted":
+            return f"bcg_sorted({args[0]})"
+        if expression.get("function") == "abs":
+            return f"({args[0]}).abs()"
+    if op == "unary":
+        operand = rust_render_expression(expression["operand"], variables)
+        return f"!({operand})" if expression["operator"] == "not" else f"-({operand})"
+    raise DiscoveryError("unsupported Rust expression")
+
+
+def rust_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    tests = rust_supported_tests(tests)
+    payload = compiled_payload(entrypoint, tests)
+    test_blocks: list[str] = []
+    table_entries: list[str] = []
+    for index, test_case in enumerate(tests):
+        test = test_case.to_jsonable()
+        test_blocks.append(
+            f"""fn bcg_test_{index}() -> bool {{
+    let result = std::panic::catch_unwind(|| {{
+    {rust_condition_for_test(test, entrypoint)}
+    }});
+    result.unwrap_or(false)
+}}"""
+        )
+        table_entries.append(f'    ("{test["id"]}", bcg_test_{index} as fn() -> bool)')
+
+    source = r"""/*
+BCG_PAYLOAD_BEGIN
+__PAYLOAD__
+BCG_PAYLOAD_END
+*/
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+
+include!(env!("BCG_SOLUTION_PATH"));
+
+fn bcg_default_tol() -> f64 {
+    std::env::var("BABEL_CODE_GOAT_TOL").ok().and_then(|raw| raw.parse().ok()).unwrap_or(0.0)
+}
+
+fn bcg_float_equal(actual: f64, expected: f64, tol: f64) -> bool {
+    (actual - expected).abs() <= tol
+}
+
+fn bcg_hashmap<K: Eq + Hash, V>(items: Vec<(K, V)>) -> HashMap<K, V> {
+    items.into_iter().collect()
+}
+
+fn bcg_hashset<T: Eq + Hash>(items: Vec<T>) -> HashSet<T> {
+    items.into_iter().collect()
+}
+
+trait BcgTruthy {
+    fn bcg_truthy(&self) -> bool;
+}
+impl BcgTruthy for bool { fn bcg_truthy(&self) -> bool { *self } }
+impl BcgTruthy for i32 { fn bcg_truthy(&self) -> bool { *self != 0 } }
+impl BcgTruthy for f64 { fn bcg_truthy(&self) -> bool { *self != 0.0 } }
+impl BcgTruthy for String { fn bcg_truthy(&self) -> bool { !self.is_empty() } }
+impl<T> BcgTruthy for Vec<T> { fn bcg_truthy(&self) -> bool { !self.is_empty() } }
+impl<T> BcgTruthy for Option<T> { fn bcg_truthy(&self) -> bool { self.is_some() } }
+impl<K, V> BcgTruthy for HashMap<K, V> { fn bcg_truthy(&self) -> bool { !self.is_empty() } }
+impl<T> BcgTruthy for HashSet<T> { fn bcg_truthy(&self) -> bool { !self.is_empty() } }
+fn bcg_truthy<T: BcgTruthy>(value: &T) -> bool { value.bcg_truthy() }
+
+fn bcg_contains<T: PartialEq>(container: &Vec<T>, needle: &T) -> bool {
+    container.iter().any(|item| item == needle)
+}
+
+fn bcg_sorted<T: Ord>(mut value: Vec<T>) -> Vec<T> {
+    value.sort();
+    value
+}
+
+fn bcg_panic_message_matches(error: Box<dyn std::any::Any + Send>, mode: &str, pattern: &str) -> bool {
+    let message = if let Some(value) = error.downcast_ref::<&str>() {
+        value.to_string()
+    } else if let Some(value) = error.downcast_ref::<String>() {
+        value.clone()
+    } else {
+        String::new()
+    };
+    if mode == "contains" {
+        message.contains(pattern)
+    } else if mode == "regex" {
+        message.contains(pattern)
+    } else {
+        true
+    }
+}
+
+__TEST_BLOCKS__
+
+fn main() {
+    let tests: Vec<(&str, fn() -> bool)> = vec![
+__TABLE_ENTRIES__
+    ];
+    let mut passed: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for (id, test_fn) in tests {
+        if test_fn() {
+            passed.push(id);
+        } else {
+            failed.push(id);
+        }
+    }
+    let passed_json = passed.iter().map(|id| format!("\"{}\"", id)).collect::<Vec<_>>().join(",");
+    let failed_json = failed.iter().map(|id| format!("\"{}\"", id)).collect::<Vec<_>>().join(",");
+    let status = if failed.is_empty() { "pass" } else { "fail" };
+    println!("{{\"status\":\"{}\",\"passed\":[{}],\"failed\":[{}]}}", status, passed_json, failed_json);
+    std::process::exit(if failed.is_empty() { 0 } else { 1 });
+}
+"""
+    return (
+        source.replace("__PAYLOAD__", payload)
+        .replace("__TEST_BLOCKS__", "\n\n".join(test_blocks))
+        .replace("__TABLE_ENTRIES__", ",\n".join(table_entries))
+    )
+
+
 def generate_tester(lang: str, entrypoint: str, tests_dir: Path) -> None:
     tests = discover_tests(tests_dir, entrypoint)
     filename = SUPPORTED_LANGS[lang]["tester"]
     if lang == "python":
         source = python_tester_source(entrypoint, tests)
-    else:
+    elif lang in {"javascript", "typescript"}:
         source = javascript_tester_source(entrypoint, tests)
+    elif lang == "cpp":
+        source = cpp_tester_source(entrypoint, tests)
+    elif lang == "rust":
+        source = rust_tester_source(entrypoint, tests)
+    else:
+        raise DiscoveryError(f"unsupported language: {lang}")
 
     destination = tests_dir / filename
     fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=tests_dir)
@@ -1920,6 +2681,9 @@ def generate_tester(lang: str, entrypoint: str, tests_dir: Path) -> None:
 
 def extract_tester_payload(tester: Path, lang: str) -> dict[str, Any]:
     source = tester.read_text(encoding="utf-8")
+    marker = re.search(r"BCG_PAYLOAD_BEGIN\n(.*?)\nBCG_PAYLOAD_END", source, re.DOTALL)
+    if marker:
+        return json.loads(marker.group(1))
     if lang == "python":
         tree = ast.parse(source, filename=str(tester))
         for stmt in tree.body:
@@ -1936,6 +2700,38 @@ def extract_tester_payload(tester: Path, lang: str) -> dict[str, Any]:
         if match:
             return json.loads(match.group(1))
     raise DiscoveryError("tester payload not found")
+
+
+def compiled_test_command(lang: str, tester: Path, solution_path: Path, build_dir: Path) -> list[str] | None:
+    if lang == "cpp":
+        compiler = shutil.which("g++") or shutil.which("clang++")
+        if compiler is None:
+            return None
+        output = build_dir / "bcg_cpp_test"
+        include_arg = f'-DBCG_SOLUTION_PATH="{solution_path}"'
+        return [compiler, "-std=c++17", include_arg, str(tester), "-o", str(output)]
+    if lang == "rust":
+        compiler = shutil.which("rustc")
+        if compiler is None:
+            return None
+        output = build_dir / "bcg_rust_test"
+        return [compiler, "--edition=2021", str(tester), "-o", str(output)]
+    return None
+
+
+def run_compiled_tester(lang: str, tester: Path, solution_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str] | None:
+    with tempfile.TemporaryDirectory(prefix="babel-code-goat-") as build_name:
+        build_dir = Path(build_name)
+        command = compiled_test_command(lang, tester, solution_path, build_dir)
+        if command is None:
+            return None
+        compile_env = env.copy()
+        compile_env["BCG_SOLUTION_PATH"] = str(solution_path)
+        compile_result = subprocess.run(command, text=True, capture_output=True, check=False, env=compile_env)
+        if compile_result.returncode != 0:
+            return None
+        executable = build_dir / ("bcg_cpp_test" if lang == "cpp" else "bcg_rust_test")
+        return subprocess.run([str(executable)], text=True, capture_output=True, check=False, env=env)
 
 
 def command_generate(args: argparse.Namespace) -> int:
@@ -1960,21 +2756,28 @@ def command_test(args: argparse.Namespace) -> int:
     try:
         payload = extract_tester_payload(tester, args.lang)
         discovered = [test.to_jsonable() for test in discover_tests(tests_dir, payload["entrypoint"])]
+        if args.lang == "rust":
+            discovered = [test.to_jsonable() for test in rust_supported_tests(discover_tests(tests_dir, payload["entrypoint"]))]
         if discovered != payload["tests"]:
             return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
-    if args.lang == "python":
-        command = [sys.executable, str(tester), str(Path(args.solution_path))]
-    else:
-        command = ["node", str(tester), str(Path(args.solution_path))]
     try:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
         env["BABEL_CODE_GOAT_ROOT"] = root
         env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        if args.lang == "python":
+            command = [sys.executable, str(tester), str(Path(args.solution_path))]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        elif args.lang in {"javascript", "typescript"}:
+            command = ["node", str(tester), str(Path(args.solution_path))]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        else:
+            completed = run_compiled_tester(args.lang, tester, Path(args.solution_path), env)
+            if completed is None:
+                return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
 

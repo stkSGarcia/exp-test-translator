@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Language Surface",
+    "tags": ["compiled targets", "cli language", "tester files"]
+  },
+  {
+    "label": "Execution Workflow",
+    "tags": ["generate test", "compiler runner", "json results"]
+  },
+  {
+    "label": "Value Parity",
+    "tags": ["nullable values", "nested collections", "numeric tolerance"]
+  },
+  {
+    "label": "Error Handling",
+    "tags": ["missing tester", "rust deque", "exception tests"]
+  }
+]
