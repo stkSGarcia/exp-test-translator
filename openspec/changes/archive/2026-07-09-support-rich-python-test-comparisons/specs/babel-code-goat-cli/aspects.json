@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Tolerance CLI",
+    "tags": ["tol option", "default tolerance", "numeric settings"]
+  },
+  {
+    "label": "Rich Value Discovery",
+    "tags": ["tagged payloads", "supported containers", "constructor parsing"]
+  },
+  {
+    "label": "Comparison Semantics",
+    "tags": ["deep equality", "unordered sets", "decimal numbers"]
+  },
+  {
+    "label": "Exception Expectations",
+    "tags": ["typed raises", "message substrings", "regex matching"]
+  }
+]

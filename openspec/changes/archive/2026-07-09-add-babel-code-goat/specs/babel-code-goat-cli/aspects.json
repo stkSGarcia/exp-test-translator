@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Command Interface",
+    "tags": ["cli commands", "language targets", "argument validation"]
+  },
+  {
+    "label": "Tester Generation",
+    "tags": ["tester files", "atomic writes", "failure preservation"]
+  },
+  {
+    "label": "Test Discovery",
+    "tags": ["tests source", "assertion parsing", "test identifiers"]
+  },
+  {
+    "label": "Execution Reporting",
+    "tags": ["exit statuses", "json output", "coverage accounting"]
+  }
+]

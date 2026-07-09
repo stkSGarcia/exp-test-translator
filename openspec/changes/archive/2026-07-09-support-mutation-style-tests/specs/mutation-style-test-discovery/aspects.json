@@ -1,0 +1,14 @@
+[
+  {
+    "label": "Mutation Group Recognition",
+    "tags": ["mutation calls", "assertion grouping", "inplace state"]
+  },
+  {
+    "label": "Traceability Validation",
+    "tags": ["single call trace", "mutated variables", "entrypoint isolation"]
+  },
+  {
+    "label": "Unsupported Pattern Errors",
+    "tags": ["invalid mutation", "intervening statements", "unrelated assertions"]
+  }
+]

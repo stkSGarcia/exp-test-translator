@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Single-call Traceability",
+    "tags": ["entrypoint count", "call validation", "discovery errors"]
+  },
+  {
+    "label": "Primitive Assertions",
+    "tags": ["expression model", "membership checks", "container access"]
+  },
+  {
+    "label": "Tester Evaluation",
+    "tags": ["single invocation", "generated testers", "expression runtime"]
+  },
+  {
+    "label": "Behavior Preservation",
+    "tags": ["tolerance helpers", "raise parsing", "json reporting"]
+  }
+]

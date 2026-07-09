@@ -1,0 +1,14 @@
+[
+  {
+    "label": "Recursive Test Discovery",
+    "tags": ["recursive tests", "python files", "directory traversal"]
+  },
+  {
+    "label": "Discovery Error Handling",
+    "tags": ["empty suites", "testlike files", "error json"]
+  },
+  {
+    "label": "Path Relative Identifiers",
+    "tags": ["relative paths", "line ids", "duplicate suffixes"]
+  }
+]

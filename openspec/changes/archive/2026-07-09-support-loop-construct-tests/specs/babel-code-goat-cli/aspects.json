@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Loop Constructs",
+    "tags": ["for loops", "while loops", "literal assignments"]
+  },
+  {
+    "label": "Loop Result Semantics",
+    "tags": ["loop tests", "zero iterations", "failing results"]
+  },
+  {
+    "label": "Parameterized Expansion",
+    "tags": ["loop variables", "iteration ids", "nested loops"]
+  },
+  {
+    "label": "Body Traceability",
+    "tags": ["single call", "entrypoint checks", "helper rejection"]
+  }
+]
