@@ -11,9 +11,11 @@ import importlib.util
 import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import subprocess
 import sys
@@ -98,6 +100,21 @@ class ExpressionBuild:
 
 
 MutationSource = tuple[str, int | None]
+
+
+@dataclass(frozen=True)
+class PreparedExecution:
+    lang: str
+    tests_dir: Path
+    solution_path: Path
+    tester: Path
+    payload: dict[str, Any]
+    all_ids: list[str]
+    scope_ids: list[str]
+    timeout_ms: int | None
+    total_timeout_ms: int | None
+    run_id: str | None
+    tol: float
 
 
 ALLOWED_IMPORTS = {
@@ -1204,6 +1221,18 @@ def parse_optional_positive_int(value: Any) -> int | None:
     return value
 
 
+def parse_non_negative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("value must be a non-negative integer")
+    return value
+
+
+def parse_positive_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("value must be a positive integer")
+    return value
+
+
 def scoped_tests(tests: list[dict[str, Any]], run_id: str | None) -> list[dict[str, Any]] | None:
     if run_id is None:
         return tests
@@ -1253,6 +1282,22 @@ def runtime_timeout_seconds(timeout_ms: int | None, total_timeout_ms: int | None
     if timeout_ms is not None:
         return timeout_ms * max(scope_count, 1) / 1000 + 1.0
     return None
+
+
+def aggregate_stats(samples: list[float]) -> dict[str, float]:
+    if not samples:
+        return {"mean": 0.0, "std": 0.0}
+    mean = sum(samples) / len(samples)
+    variance = sum((sample - mean) ** 2 for sample in samples) / len(samples)
+    return {"mean": mean, "std": math.sqrt(variance)}
+
+
+def current_child_memory_kb() -> float:
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    value = float(usage.ru_maxrss)
+    if sys.platform == "darwin":
+        return value / 1024.0
+    return value
 
 
 def is_tagged(value: Any, type_name: str | None = None) -> bool:
@@ -3277,81 +3322,168 @@ def command_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_test(args: argparse.Namespace) -> int:
+def prepare_execution(args: argparse.Namespace) -> PreparedExecution | None:
     if args.lang not in SUPPORTED_LANGS:
-        return print_result(RESULT_ERROR)
+        return None
     try:
         timeout_ms = parse_optional_positive_int(args.timeout_ms)
         total_timeout_ms = parse_optional_positive_int(args.total_timeout_ms)
     except ValueError:
-        return print_result(RESULT_ERROR)
+        return None
     if args.list_tests and args.run:
-        return print_result(RESULT_ERROR)
+        return None
     tests_dir = Path(args.tests_dir)
     tester = tests_dir / SUPPORTED_LANGS[args.lang]["tester"]
     if not tester.exists():
-        return print_result(RESULT_ERROR)
+        return None
     try:
         payload = extract_tester_payload(tester, args.lang)
         discovered = [test.to_jsonable() for test in discover_tests(tests_dir, payload["entrypoint"])]
         if discovered != payload["tests"]:
-            return print_result(RESULT_ERROR)
+            return None
     except Exception:
-        return print_result(RESULT_ERROR)
+        return None
     all_ids = [test["id"] for test in payload["tests"]]
     scoped = scoped_tests(payload["tests"], args.run)
     if scoped is None:
-        return print_result(RESULT_ERROR)
-    scope_ids = [test["id"] for test in scoped]
-    if args.list_tests:
-        return print_result(make_result("pass", all_ids, []))
+        return None
+    return PreparedExecution(
+        lang=args.lang,
+        tests_dir=tests_dir,
+        solution_path=Path(args.solution_path),
+        tester=tester,
+        payload=payload,
+        all_ids=all_ids,
+        scope_ids=[test["id"] for test in scoped],
+        timeout_ms=timeout_ms,
+        total_timeout_ms=total_timeout_ms,
+        run_id=args.run,
+        tol=args.tol,
+    )
+
+
+def execution_env(prepared: PreparedExecution) -> dict[str, str]:
+    env = os.environ.copy()
+    root = str(Path(__file__).resolve().parent)
+    env["BABEL_CODE_GOAT_ROOT"] = root
+    env["BABEL_CODE_GOAT_TOL"] = str(prepared.tol)
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    if prepared.run_id:
+        env[RUN_ID_ENV] = prepared.run_id
+    if prepared.timeout_ms is not None:
+        env[TIMEOUT_MS_ENV] = str(prepared.timeout_ms)
+    if prepared.total_timeout_ms is not None:
+        env[TOTAL_TIMEOUT_MS_ENV] = str(prepared.total_timeout_ms)
+    return env
+
+
+def parse_completed_result(completed: subprocess.CompletedProcess[str], scope_ids: list[str]) -> dict[str, Any] | None:
+    stdout = completed.stdout
+    if stdout.count("\n") != 1:
+        return None
+    line = stdout.rstrip("\n")
     try:
-        env = os.environ.copy()
-        root = str(Path(__file__).resolve().parent)
-        env["BABEL_CODE_GOAT_ROOT"] = root
-        env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
-        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        if args.run:
-            env[RUN_ID_ENV] = args.run
-        if timeout_ms is not None:
-            env[TIMEOUT_MS_ENV] = str(timeout_ms)
-        if total_timeout_ms is not None:
-            env[TOTAL_TIMEOUT_MS_ENV] = str(total_timeout_ms)
-        timeout = runtime_timeout_seconds(timeout_ms, total_timeout_ms, len(scope_ids))
-        if args.lang == "python":
-            command = [sys.executable, str(tester), str(Path(args.solution_path))]
+        result = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return normalize_runner_result(result, scope_ids)
+
+
+def execute_prepared(prepared: PreparedExecution) -> dict[str, Any] | None:
+    env = execution_env(prepared)
+    timeout = runtime_timeout_seconds(prepared.timeout_ms, prepared.total_timeout_ms, len(prepared.scope_ids))
+    try:
+        if prepared.lang == "python":
+            command = [sys.executable, str(prepared.tester), str(prepared.solution_path)]
             completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout)
-        elif args.lang in {"javascript", "typescript"}:
-            command = ["node", str(tester), str(Path(args.solution_path))]
+        elif prepared.lang in {"javascript", "typescript"}:
+            command = ["node", str(prepared.tester), str(prepared.solution_path)]
             completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout)
         else:
             with tempfile.TemporaryDirectory(prefix="bcg-compiled-") as temp_dir:
                 binary = Path(temp_dir) / "tester"
-                compile_command, extra_env = compiled_command(args.lang, tester, Path(args.solution_path), binary)
+                compile_command, extra_env = compiled_command(
+                    prepared.lang, prepared.tester, prepared.solution_path, binary
+                )
                 compile_env = env.copy()
                 if extra_env:
                     compile_env.update(extra_env)
                 compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=compile_env)
                 if compiled.returncode != 0:
-                    return print_result(RESULT_ERROR)
+                    return None
                 completed = subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return print_result(result_for_timeout(scope_ids))
+        return result_for_timeout(prepared.scope_ids)
     except Exception:
-        return print_result(RESULT_ERROR)
+        return None
+    return parse_completed_result(completed, prepared.scope_ids)
 
-    stdout = completed.stdout
-    if stdout.count("\n") != 1:
+
+def command_test(args: argparse.Namespace) -> int:
+    prepared = prepare_execution(args)
+    if prepared is None:
         return print_result(RESULT_ERROR)
-    line = stdout.rstrip("\n")
-    try:
-        result = json.loads(line)
-    except json.JSONDecodeError:
-        return print_result(RESULT_ERROR)
-    result = normalize_runner_result(result, scope_ids)
+    if args.list_tests:
+        return print_result(make_result("pass", prepared.all_ids, []))
+    result = execute_prepared(prepared)
     if result is None:
         return print_result(RESULT_ERROR)
     return print_result(result)
+
+
+def merge_profile_results(results: list[dict[str, Any]], scope_ids: list[str]) -> dict[str, Any] | None:
+    if not results:
+        return None
+    if any(result["status"] == "error" for result in results):
+        return RESULT_ERROR
+    failed = {test_id for result in results for test_id in result["failed"]}
+    passed = [test_id for test_id in scope_ids if test_id not in failed]
+    return make_result("fail" if failed else "pass", passed, [test_id for test_id in scope_ids if test_id in failed])
+
+
+def measured_profile_run(prepared: PreparedExecution, include_memory: bool) -> tuple[dict[str, Any] | None, float, float | None]:
+    start = time.perf_counter_ns()
+    result = execute_prepared(prepared)
+    runtime_ns = float(time.perf_counter_ns() - start)
+    memory_kb = current_child_memory_kb() if include_memory else None
+    return result, runtime_ns, memory_kb
+
+
+def command_profile(args: argparse.Namespace) -> int:
+    try:
+        trials = parse_positive_int(args.trials)
+        warmup = parse_non_negative_int(args.warmup)
+    except ValueError:
+        return print_result(RESULT_ERROR)
+    if warmup >= trials:
+        return print_result(RESULT_ERROR)
+    prepared = prepare_execution(args)
+    if prepared is None:
+        return print_result(RESULT_ERROR)
+    if args.list_tests:
+        return print_result(make_result("pass", prepared.all_ids, []))
+
+    measured_results: list[dict[str, Any]] = []
+    runtime_samples: list[float] = []
+    memory_samples: list[float] = []
+    for trial_index in range(trials):
+        result, runtime_ns, memory_kb = measured_profile_run(prepared, args.memory)
+        if result is None:
+            return print_result(RESULT_ERROR)
+        if trial_index < warmup:
+            continue
+        measured_results.append(result)
+        runtime_samples.append(runtime_ns)
+        if memory_kb is not None:
+            memory_samples.append(memory_kb)
+
+    profile_result = merge_profile_results(measured_results, prepared.scope_ids)
+    if profile_result is None:
+        return print_result(RESULT_ERROR)
+    profile_result["runtime_ns"] = aggregate_stats(runtime_samples)
+    if args.memory:
+        profile_result["memory_kb"] = aggregate_stats(memory_samples)
+    return print_result(profile_result)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3374,6 +3506,20 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--timeout-ms", type=int)
     test.add_argument("--total-timeout-ms", type=int)
     test.set_defaults(func=command_test)
+
+    profile = subparsers.add_parser("profile")
+    profile.add_argument("tests_dir")
+    profile.add_argument("solution_path")
+    profile.add_argument("--lang", required=True)
+    profile.add_argument("-n", "--trials", type=int, default=1)
+    profile.add_argument("--warmup", type=int, default=0)
+    profile.add_argument("--memory", action="store_true")
+    profile.add_argument("--tol", type=float, default=0.0)
+    profile.add_argument("--list-tests", action="store_true")
+    profile.add_argument("--run")
+    profile.add_argument("--timeout-ms", type=int)
+    profile.add_argument("--total-timeout-ms", type=int)
+    profile.set_defaults(func=command_profile)
     return parser
 
 

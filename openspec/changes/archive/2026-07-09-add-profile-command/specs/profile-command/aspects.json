@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Command Interface",
+    "tags": ["profile cli", "command flags", "generated tester"]
+  },
+  {
+    "label": "Execution Parity",
+    "tags": ["test selection", "timeout options", "tolerance behavior"]
+  },
+  {
+    "label": "Profiling Statistics",
+    "tags": ["runtime metrics", "memory measurement", "warmup exclusion"]
+  },
+  {
+    "label": "Failure Aggregation",
+    "tags": ["timeout samples", "failed tests", "error results"]
+  }
+]

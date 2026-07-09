@@ -1,0 +1,5 @@
+[
+  "babel-code-goat-cli/add-async-test-selection-timeouts",
+  "babel-code-goat-cli/add-babel-code-goat",
+  "compiled-language-targets/add-cpp-rust-targets"
+]
