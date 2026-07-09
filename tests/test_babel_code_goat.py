@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +44,8 @@ def test_supported_languages_generate_expected_files(tmp_path):
         "python": "tester.py",
         "javascript": "tester.js",
         "typescript": "tester.ts",
+        "cpp": "tester.cpp",
+        "rust": "tester.rs",
     }.items():
         tests_dir = write_tests(tmp_path / lang, "def cases():\n    assert solve(1) == 1\n")
 
@@ -66,7 +69,7 @@ def test_unsupported_language_handling(tmp_path):
 def test_failed_generate_preserves_existing_tester_files(tmp_path):
     tests_dir = write_tests(tmp_path, "import os\n")
     preserved = {}
-    for filename in ("tester.py", "tester.js", "tester.ts"):
+    for filename in ("tester.py", "tester.js", "tester.ts", "tester.cpp", "tester.rs"):
         path = tests_dir / filename
         path.write_text(f"old {filename}", encoding="utf-8")
         preserved[filename] = path.read_text(encoding="utf-8")
@@ -79,15 +82,22 @@ def test_failed_generate_preserves_existing_tester_files(tmp_path):
 
 
 def test_missing_tester_errors_and_does_not_create_tester(tmp_path):
-    tests_dir = write_tests(tmp_path, "def cases():\n    assert solve(1) == 1\n")
-    solution = tmp_path / "solution.py"
-    solution.write_text("def solve(x):\n    return x\n", encoding="utf-8")
+    for lang, solution_name, tester_name, source in (
+        ("python", "solution.py", "tester.py", "def solve(x):\n    return x\n"),
+        ("javascript", "solution.js", "tester.js", "function solve(x) { return x; }\nmodule.exports = {solve};\n"),
+        ("typescript", "solution.js", "tester.ts", "function solve(x) { return x; }\nmodule.exports = {solve};\n"),
+        ("cpp", "solution.cpp", "tester.cpp", "long long solve(long long x) { return x; }\n"),
+        ("rust", "solution.rs", "tester.rs", "fn solve(x: i64) -> i64 { x }\n"),
+    ):
+        tests_dir = write_tests(tmp_path / lang, "def cases():\n    assert solve(1) == 1\n")
+        solution = tmp_path / lang / solution_name
+        solution.write_text(source, encoding="utf-8")
 
-    completed = run_cli("test", solution, tests_dir, "--lang", "python")
+        completed = run_cli("test", solution, tests_dir, "--lang", lang)
 
-    assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
-    assert completed.returncode == 2
-    assert not (tests_dir / "tester.py").exists()
+        assert parse_result(completed) == {"status": "error", "passed": [], "failed": []}
+        assert completed.returncode == 2
+        assert not (tests_dir / tester_name).exists()
 
 
 def test_discovery_accepts_allowed_constructs_and_duplicate_line_ids(tmp_path):
@@ -738,6 +748,225 @@ def test_generated_testers_execute_mutation_style_tests_with_relative_ids(tmp_pa
             "failed": [],
         }
         assert completed.returncode == 0
+
+
+def test_cpp_execution_handles_nulls_collections_sorting_and_exceptions(tmp_path):
+    if shutil.which("g++") is None:
+        pytest.skip("g++ is required for C++ target execution")
+
+    nullable_tests = write_tests(
+        tmp_path / "nullable",
+        """def cases():
+    assert solve([None, 2]) == [None, 3]
+""",
+    )
+    nullable_solution = tmp_path / "nullable" / "solution.cpp"
+    nullable_solution.write_text(
+        """std::vector<std::optional<long long>> solve(std::vector<std::optional<long long>> values) {
+  values[1] = 3;
+  return values;
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", nullable_tests, "--entrypoint", "solve", "--lang", "cpp").returncode == 0
+    nullable_result = run_cli("test", nullable_solution, nullable_tests, "--lang", "cpp")
+    assert parse_result(nullable_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+    collection_tests = write_tests(
+        tmp_path / "collections",
+        """def cases():
+    assert counts("items") == {"a": 2, "b": 1}
+    assert colors("items") == set([1, 2, 3])
+""",
+    )
+    collection_solution = tmp_path / "collections" / "solution.cpp"
+    collection_solution.write_text(
+        """std::map<std::string, long long> counts(std::string) {
+  return std::map<std::string, long long>{{"b", 1}, {"a", 2}};
+}
+""",
+        encoding="utf-8",
+    )
+    (collection_tests / "tests.py").write_text(
+        """def cases():
+    assert counts("items") == {"a": 2, "b": 1}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", collection_tests, "--entrypoint", "counts", "--lang", "cpp").returncode == 0
+    collection_result = run_cli("test", collection_solution, collection_tests, "--lang", "cpp")
+    assert parse_result(collection_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+    set_tests = write_tests(
+        tmp_path / "sets",
+        """def cases():
+    assert colors("items") == set([1, 2, 3])
+""",
+    )
+    set_solution = tmp_path / "sets" / "solution.cpp"
+    set_solution.write_text(
+        """std::set<long long> colors(std::string) {
+  return std::set<long long>{3, 1, 2};
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", set_tests, "--entrypoint", "colors", "--lang", "cpp").returncode == 0
+    set_result = run_cli("test", set_solution, set_tests, "--lang", "cpp")
+    assert parse_result(set_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+    mutation_tests = write_tests(
+        tmp_path / "mutation",
+        """def cases():
+    values = [3, 1, 2]
+    sort_colors(values)
+    assert values == [1, 2, 3]
+""",
+    )
+    mutation_solution = tmp_path / "mutation" / "solution.cpp"
+    mutation_solution.write_text(
+        """void sort_colors(std::vector<long long>& values) {
+  std::sort(values.begin(), values.end());
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", mutation_tests, "--entrypoint", "sort_colors", "--lang", "cpp").returncode == 0
+    mutation_result = run_cli("test", mutation_solution, mutation_tests, "--lang", "cpp")
+    assert parse_result(mutation_result) == {"status": "pass", "passed": ["tests.py:4"], "failed": []}
+
+    raises_tests = write_tests(
+        tmp_path / "raises",
+        """def cases():
+    try:
+        explode("bad")
+        assert False
+    except ValueError as e:
+        assert "bad" in str(e)
+""",
+    )
+    raises_solution = tmp_path / "raises" / "solution.cpp"
+    raises_solution.write_text(
+        """long long explode(std::string) {
+  throw std::runtime_error("bad input");
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", raises_tests, "--entrypoint", "explode", "--lang", "cpp").returncode == 0
+    raises_result = run_cli("test", raises_solution, raises_tests, "--lang", "cpp")
+    assert parse_result(raises_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+
+def test_rust_execution_handles_nulls_collections_sorting_exceptions_and_deque_skip(tmp_path):
+    if shutil.which("rustc") is None:
+        pytest.skip("rustc is required for Rust target execution")
+
+    nullable_tests = write_tests(
+        tmp_path / "nullable",
+        """def cases():
+    assert solve([None, 2]) == [None, 3]
+""",
+    )
+    nullable_solution = tmp_path / "nullable" / "solution.rs"
+    nullable_solution.write_text(
+        """fn solve(mut values: Vec<Option<i64>>) -> Vec<Option<i64>> {
+    values[1] = Some(3);
+    values
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", nullable_tests, "--entrypoint", "solve", "--lang", "rust").returncode == 0
+    nullable_result = run_cli("test", nullable_solution, nullable_tests, "--lang", "rust")
+    assert parse_result(nullable_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+    collection_tests = write_tests(
+        tmp_path / "collections",
+        """def cases():
+    assert counts("items") == {"a": 2, "b": 1}
+""",
+    )
+    collection_solution = tmp_path / "collections" / "solution.rs"
+    collection_solution.write_text(
+        """fn counts(_: String) -> std::collections::HashMap<String, i64> {
+    let mut values = std::collections::HashMap::new();
+    values.insert(String::from("a"), 1);
+    if let Some(item) = values.get_mut(&String::from("a")) {
+        *item += 1;
+    }
+    values.insert(String::from("b"), 1);
+    values
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", collection_tests, "--entrypoint", "counts", "--lang", "rust").returncode == 0
+    collection_result = run_cli("test", collection_solution, collection_tests, "--lang", "rust")
+    assert parse_result(collection_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+    mutation_tests = write_tests(
+        tmp_path / "mutation",
+        """def cases():
+    values = [3, 1, 2]
+    sort_colors(values)
+    assert values == [1, 2, 3]
+""",
+    )
+    mutation_solution = tmp_path / "mutation" / "solution.rs"
+    mutation_solution.write_text(
+        """fn sort_colors(values: &mut Vec<i64>) {
+    values.sort();
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", mutation_tests, "--entrypoint", "sort_colors", "--lang", "rust").returncode == 0
+    mutation_result = run_cli("test", mutation_solution, mutation_tests, "--lang", "rust")
+    assert parse_result(mutation_result) == {"status": "pass", "passed": ["tests.py:4"], "failed": []}
+
+    raises_tests = write_tests(
+        tmp_path / "raises",
+        """def cases():
+    try:
+        explode("bad")
+        assert False
+    except ValueError:
+        pass
+""",
+    )
+    raises_solution = tmp_path / "raises" / "solution.rs"
+    raises_solution.write_text(
+        """fn explode(_: String) -> i64 {
+    panic!("bad input");
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", raises_tests, "--entrypoint", "explode", "--lang", "rust").returncode == 0
+    raises_result = run_cli("test", raises_solution, raises_tests, "--lang", "rust")
+    assert parse_result(raises_result) == {"status": "pass", "passed": ["tests.py:2"], "failed": []}
+
+    deque_tests = write_tests(
+        tmp_path / "deque",
+        """from collections import deque
+
+def cases():
+    assert solve("items") == deque([1, 2])
+""",
+    )
+    deque_solution = tmp_path / "deque" / "solution.rs"
+    deque_solution.write_text(
+        """fn solve(_: String) -> Vec<i64> {
+    vec![9]
+}
+""",
+        encoding="utf-8",
+    )
+    assert run_cli("generate", deque_tests, "--entrypoint", "solve", "--lang", "rust").returncode == 0
+    deque_result = run_cli("test", deque_solution, deque_tests, "--lang", "rust")
+    assert parse_result(deque_result) == {"status": "pass", "passed": ["tests.py:4"], "failed": []}
 
 
 def test_test_tol_does_not_change_nonnumeric_equality(tmp_path):

@@ -24,6 +24,8 @@ SUPPORTED_LANGS = {
     "python": {"tester": "tester.py", "runner": "python"},
     "javascript": {"tester": "tester.js", "runner": "node"},
     "typescript": {"tester": "tester.ts", "runner": "node"},
+    "cpp": {"tester": "tester.cpp", "runner": "g++"},
+    "rust": {"tester": "tester.rs", "runner": "rustc"},
 }
 RESULT_ERROR = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"^\s*#\s*expect_(stdout|stderr):\s*(.+?)\s*$")
@@ -1585,11 +1587,15 @@ if __name__ == "__main__":
 """
 
 
-def javascript_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
-    payload = json.dumps(
+def tester_payload_json(entrypoint: str, tests: list[TestCase]) -> str:
+    return json.dumps(
         {"entrypoint": entrypoint, "tests": [test.to_jsonable() for test in tests]},
         separators=(",", ":"),
     )
+
+
+def javascript_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    payload = tester_payload_json(entrypoint, tests)
     return f"""#!/usr/bin/env node
 const path = require("path");
 const {{ pathToFileURL }} = require("url");
@@ -1935,13 +1941,1067 @@ main().then(code => process.exit(code)).catch(() => {{
 """
 
 
+def contains_tagged_type(value: Any, type_name: str) -> bool:
+    if is_tagged(value, type_name):
+        return True
+    if isinstance(value, list):
+        return any(contains_tagged_type(item, type_name) for item in value)
+    if is_tagged(value, "dict") or is_tagged(value, "counter"):
+        return any(
+            contains_tagged_type(key, type_name) or contains_tagged_type(item, type_name)
+            for key, item in value["items"]
+        )
+    if is_tagged(value, "set") or is_tagged(value, "deque"):
+        return any(contains_tagged_type(item, type_name) for item in value["items"])
+    return False
+
+
+def test_contains_tagged_type(test: TestCase, type_name: str) -> bool:
+    values: list[Any] = list(test.args)
+    if test.expected is not None:
+        values.append(test.expected)
+    if test.expression is not None:
+        values.append(test.expression)
+    return any(contains_tagged_type(value, type_name) for value in values)
+
+
+def cpp_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def rust_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def type_without_optional(type_name: str) -> str:
+    if type_name.startswith("std::optional<") and type_name.endswith(">"):
+        return type_name[len("std::optional<") : -1]
+    if type_name.startswith("Option<") and type_name.endswith(">"):
+        return type_name[len("Option<") : -1]
+    return type_name
+
+
+def merge_cpp_types(types: list[str]) -> str:
+    non_null = [type_name for type_name in types if type_name != "std::nullopt_t"]
+    has_null = len(non_null) != len(types)
+    if not non_null:
+        return "std::optional<long long>"
+    first = non_null[0]
+    if any(type_name != first for type_name in non_null):
+        if all(type_name in {"long long", "long double"} for type_name in non_null):
+            first = "long double"
+        else:
+            first = "BCG::Value"
+    if has_null and not first.startswith("std::optional<"):
+        return f"std::optional<{first}>"
+    return first
+
+
+def merge_rust_types(types: list[str]) -> str:
+    non_null = [type_name for type_name in types if type_name == "None" or type_name != "None"]
+    has_null = "None" in non_null
+    non_null = [type_name for type_name in non_null if type_name != "None"]
+    if not non_null:
+        return "Option<i64>"
+    first = non_null[0]
+    if any(type_name != first for type_name in non_null):
+        if all(type_name in {"i64", "f64"} for type_name in non_null):
+            first = "f64"
+        else:
+            first = "BcgValue"
+    if has_null and not first.startswith("Option<"):
+        return f"Option<{first}>"
+    return first
+
+
+def cpp_type(value: Any) -> str:
+    if value is None:
+        return "std::nullopt_t"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "long long"
+    if isinstance(value, float):
+        return "long double"
+    if isinstance(value, str):
+        return "std::string"
+    if isinstance(value, list):
+        item_type = merge_cpp_types([cpp_type(item) for item in value]) if value else "long long"
+        return f"std::vector<{item_type}>"
+    if is_tagged(value, "decimal"):
+        return "long double"
+    if is_tagged(value, "set"):
+        item_type = merge_cpp_types([cpp_type(item) for item in value["items"]]) if value["items"] else "long long"
+        return f"std::set<{item_type}>"
+    if is_tagged(value, "deque"):
+        item_type = merge_cpp_types([cpp_type(item) for item in value["items"]]) if value["items"] else "long long"
+        return f"std::vector<{item_type}>"
+    if is_tagged(value, "dict") or is_tagged(value, "counter"):
+        key_type = merge_cpp_types([cpp_type(key) for key, _ in value["items"]]) if value["items"] else "std::string"
+        item_type = merge_cpp_types([cpp_type(item) for _, item in value["items"]]) if value["items"] else "long long"
+        return f"std::map<{key_type}, {item_type}>"
+    return "BCG::Value"
+
+
+def rust_type(value: Any) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "i64"
+    if isinstance(value, float):
+        return "f64"
+    if isinstance(value, str):
+        return "String"
+    if isinstance(value, list):
+        item_type = merge_rust_types([rust_type(item) for item in value]) if value else "i64"
+        return f"Vec<{item_type}>"
+    if is_tagged(value, "decimal"):
+        return "f64"
+    if is_tagged(value, "set"):
+        item_type = merge_rust_types([rust_type(item) for item in value["items"]]) if value["items"] else "i64"
+        return f"std::collections::HashSet<{item_type}>"
+    if is_tagged(value, "deque"):
+        item_type = merge_rust_types([rust_type(item) for item in value["items"]]) if value["items"] else "i64"
+        return f"Vec<{item_type}>"
+    if is_tagged(value, "dict") or is_tagged(value, "counter"):
+        key_type = merge_rust_types([rust_type(key) for key, _ in value["items"]]) if value["items"] else "String"
+        item_type = merge_rust_types([rust_type(item) for _, item in value["items"]]) if value["items"] else "i64"
+        return f"std::collections::BTreeMap<{key_type}, {item_type}>"
+    return "BcgValue"
+
+
+def cpp_literal(value: Any, expected_type: str | None = None) -> str:
+    if expected_type and expected_type.startswith("std::optional<"):
+        inner = expected_type[len("std::optional<") : -1]
+        if value is None:
+            return "std::nullopt"
+        return f"{expected_type}{{{cpp_literal(value, inner)}}}"
+    if value is None:
+        return "std::nullopt"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{repr(value)}L"
+    if isinstance(value, str):
+        return f"std::string({cpp_string(value)})"
+    if isinstance(value, list):
+        item_type = type_without_optional(expected_type[len("std::vector<") : -1]) if expected_type and expected_type.startswith("std::vector<") else merge_cpp_types([cpp_type(item) for item in value])
+        container_type = expected_type or f"std::vector<{item_type}>"
+        return f"{container_type}{{{', '.join(cpp_literal(item, item_type) for item in value)}}}"
+    if is_tagged(value, "decimal"):
+        return f"{value['value']}L"
+    if is_tagged(value, "set"):
+        item_type = type_without_optional(expected_type[len("std::set<") : -1]) if expected_type and expected_type.startswith("std::set<") else merge_cpp_types([cpp_type(item) for item in value["items"]])
+        container_type = expected_type or f"std::set<{item_type}>"
+        return f"{container_type}{{{', '.join(cpp_literal(item, item_type) for item in value['items'])}}}"
+    if is_tagged(value, "deque"):
+        item_type = merge_cpp_types([cpp_type(item) for item in value["items"]]) if value["items"] else "long long"
+        container_type = expected_type or f"std::vector<{item_type}>"
+        return f"{container_type}{{{', '.join(cpp_literal(item, item_type) for item in value['items'])}}}"
+    if is_tagged(value, "dict") or is_tagged(value, "counter"):
+        if expected_type and expected_type.startswith("std::map<"):
+            inner = expected_type[len("std::map<") : -1]
+            key_type, item_type = [part.strip() for part in inner.split(",", 1)]
+        else:
+            key_type = merge_cpp_types([cpp_type(key) for key, _ in value["items"]]) if value["items"] else "std::string"
+            item_type = merge_cpp_types([cpp_type(item) for _, item in value["items"]]) if value["items"] else "long long"
+        container_type = expected_type or f"std::map<{key_type}, {item_type}>"
+        items = ", ".join(
+            f"{{{cpp_literal(key, key_type)}, {cpp_literal(item, item_type)}}}" for key, item in value["items"]
+        )
+        return f"{container_type}{{{items}}}"
+    return "BCG::Value{}"
+
+
+def rust_literal(value: Any, expected_type: str | None = None) -> str:
+    if expected_type and expected_type.startswith("Option<"):
+        inner = expected_type[len("Option<") : -1]
+        if value is None:
+            return "None"
+        return f"Some({rust_literal(value, inner)})"
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return f"{value}_i64"
+    if isinstance(value, float):
+        return f"{repr(value)}_f64"
+    if isinstance(value, str):
+        return f"String::from({rust_string(value)})"
+    if isinstance(value, list):
+        item_type = expected_type[len("Vec<") : -1] if expected_type and expected_type.startswith("Vec<") else merge_rust_types([rust_type(item) for item in value])
+        return f"vec![{', '.join(rust_literal(item, item_type) for item in value)}]"
+    if is_tagged(value, "decimal"):
+        return f"{value['value']}_f64"
+    if is_tagged(value, "set"):
+        item_type = (
+            expected_type[len("std::collections::HashSet<") : -1]
+            if expected_type and expected_type.startswith("std::collections::HashSet<")
+            else merge_rust_types([rust_type(item) for item in value["items"]])
+        )
+        items = "".join(f"s.insert({rust_literal(item, item_type)});" for item in value["items"])
+        return f"{{ let mut s = std::collections::HashSet::new(); {items} s }}"
+    if is_tagged(value, "deque"):
+        item_type = merge_rust_types([rust_type(item) for item in value["items"]]) if value["items"] else "i64"
+        return f"vec![{', '.join(rust_literal(item, item_type) for item in value['items'])}]"
+    if is_tagged(value, "dict") or is_tagged(value, "counter"):
+        if expected_type and expected_type.startswith("std::collections::BTreeMap<"):
+            inner = expected_type[len("std::collections::BTreeMap<") : -1]
+            key_type, item_type = [part.strip() for part in inner.split(",", 1)]
+        else:
+            key_type = merge_rust_types([rust_type(key) for key, _ in value["items"]]) if value["items"] else "String"
+            item_type = merge_rust_types([rust_type(item) for _, item in value["items"]]) if value["items"] else "i64"
+        items = "".join(
+            f"m.insert({rust_literal(key, key_type)}, {rust_literal(item, item_type)});"
+            for key, item in value["items"]
+        )
+        return f"{{ let mut m = std::collections::BTreeMap::new(); {items} m }}"
+    return "BcgValue::Null"
+
+
+def cpp_bcg_expr(value: Any) -> str:
+    return f"BCG::value({cpp_literal(value)})"
+
+
+def rust_bcg_expr(value: Any) -> str:
+    return f"ToBcg::to_bcg(&{rust_literal(value)})"
+
+
+def cpp_expr(expression: dict[str, Any], actual_expr: str = "actual") -> str:
+    op = expression.get("op")
+    if op == "const":
+        return cpp_bcg_expr(expression.get("value"))
+    if op == "actual":
+        return actual_expr
+    if op == "index":
+        return f"BCG::index({cpp_expr(expression['value'], actual_expr)}, {cpp_expr(expression['index'], actual_expr)})"
+    if op == "call" and expression.get("function") == "sorted":
+        return f"BCG::sorted({cpp_expr(expression['args'][0], actual_expr)})"
+    if op == "call" and expression.get("function") == "abs":
+        return f"BCG::abs_value({cpp_expr(expression['args'][0], actual_expr)})"
+    if op == "binary":
+        return (
+            f"BCG::binary({cpp_string(expression.get('operator', ''))}, "
+            f"{cpp_expr(expression['left'], actual_expr)}, {cpp_expr(expression['right'], actual_expr)})"
+        )
+    if op == "unary":
+        return f"BCG::unary({cpp_string(expression.get('operator', ''))}, {cpp_expr(expression['operand'], actual_expr)})"
+    if op == "bool":
+        items = ", ".join(cpp_expr(item, actual_expr) for item in expression["values"])
+        return f"BCG::bool_expr({cpp_string(expression.get('operator', ''))}, std::vector<BCG::Value>{{{items}}})"
+    if op == "compare":
+        return (
+            f"BCG::compare_value({cpp_string(expression.get('operator', ''))}, "
+            f"{cpp_expr(expression['left'], actual_expr)}, {cpp_expr(expression['right'], actual_expr)}, tolerance)"
+        )
+    return "BCG::Value{}"
+
+
+def rust_expr(expression: dict[str, Any], actual_expr: str = "actual.clone()") -> str:
+    op = expression.get("op")
+    if op == "const":
+        return rust_bcg_expr(expression.get("value"))
+    if op == "actual":
+        return actual_expr
+    if op == "index":
+        return f"bcg_index({rust_expr(expression['value'], actual_expr)}, {rust_expr(expression['index'], actual_expr)})"
+    if op == "call" and expression.get("function") == "sorted":
+        return f"bcg_sorted({rust_expr(expression['args'][0], actual_expr)})"
+    if op == "call" and expression.get("function") == "abs":
+        return f"bcg_abs({rust_expr(expression['args'][0], actual_expr)})"
+    if op == "binary":
+        return (
+            f"bcg_binary({rust_string(expression.get('operator', ''))}, "
+            f"{rust_expr(expression['left'], actual_expr)}, {rust_expr(expression['right'], actual_expr)})"
+        )
+    if op == "unary":
+        return f"bcg_unary({rust_string(expression.get('operator', ''))}, {rust_expr(expression['operand'], actual_expr)})"
+    if op == "bool":
+        items = ", ".join(rust_expr(item, actual_expr) for item in expression["values"])
+        return f"bcg_bool_expr({rust_string(expression.get('operator', ''))}, vec![{items}])"
+    if op == "compare":
+        return (
+            f"bcg_compare_value({rust_string(expression.get('operator', ''))}, "
+            f"{rust_expr(expression['left'], actual_expr)}, {rust_expr(expression['right'], actual_expr)}, &tolerance)"
+        )
+    return "BcgValue::Null"
+
+
+def cpp_tolerance_code(test: TestCase, index: int) -> str:
+    if not test.tolerance:
+        return f"    auto tol_{index} = tolerance;\n"
+    abs_tol = test.tolerance.get("abs", 0.0)
+    rel_tol = test.tolerance.get("rel", 0.0)
+    strict = "true" if test.tolerance.get("strict") else "false"
+    return f"    BCG::Tolerance tol_{index}{{{abs_tol}L, {rel_tol}L, {strict}}};\n"
+
+
+def rust_tolerance_code(test: TestCase, index: int) -> str:
+    if not test.tolerance:
+        return f"    let tol_{index} = tolerance;\n"
+    abs_tol = test.tolerance.get("abs", 0.0)
+    rel_tol = test.tolerance.get("rel", 0.0)
+    strict = "true" if test.tolerance.get("strict") else "false"
+    return f"    let tol_{index} = BcgTolerance {{ abs: {abs_tol}_f64, rel: {rel_tol}_f64, strict: {strict} }};\n"
+
+
+def cpp_call_code(entrypoint: str, test: TestCase, index: int) -> str:
+    arg_lines: list[str] = []
+    arg_names: list[str] = []
+    for arg_index, arg in enumerate(test.args):
+        type_name = cpp_type(arg)
+        name = f"arg_{index}_{arg_index}"
+        arg_lines.append(f"    auto {name} = {cpp_literal(arg, type_name)};")
+        arg_names.append(name)
+    args = ", ".join(arg_names)
+    if test.mutation_arg_index is not None:
+        actual_expr = f"BCG::value(arg_{index}_{test.mutation_arg_index})"
+        call_line = f"      BCG::call_any([&]() -> decltype(auto) {{ return {entrypoint}({args}); }});"
+    else:
+        actual_expr = "actual"
+        call_line = f"      actual = BCG::call_any([&]() -> decltype(auto) {{ return {entrypoint}({args}); }});"
+    body = "\n".join(arg_lines)
+    body += f"""
+    bool raised = false;
+    std::string message;
+    BCG::Value actual;
+    try {{
+{call_line}
+"""
+    if test.mutation_arg_index is not None:
+        body += f"      actual = {actual_expr};\n"
+    body += """    } catch (const std::exception& e) {
+      raised = true;
+      message = e.what();
+    } catch (...) {
+      raised = true;
+      message = "";
+    }
+"""
+    return body
+
+
+def cpp_test_case_code(entrypoint: str, test: TestCase, index: int) -> str:
+    if test.kind == "loop":
+        ok = "true" if test.expected else "false"
+        return f"  record({cpp_string(test.id)}, {ok});\n"
+    body = cpp_call_code(entrypoint, test, index)
+    if test.kind == "raises":
+        expected = cpp_string(test.expected_exception or "")
+        matcher = cpp_string(stable_json(test.message_match or {}))
+        check = f"raised && BCG::exception_matches({expected}) && BCG::message_matches(message, {matcher})"
+    elif test.kind == "expr" and test.expression is not None:
+        expr = test.expression
+        if expr.get("op") == "compare":
+            left = cpp_expr(expr["left"])
+            right = cpp_expr(expr["right"])
+            operator = expr.get("operator")
+            if operator == "eq":
+                check = f"!raised && BCG::equal({left}, {right}, tolerance)"
+            elif operator == "neq":
+                check = f"!raised && !BCG::equal({left}, {right}, tolerance)"
+            elif operator == "in":
+                check = f"!raised && BCG::contains({right}, {left}, tolerance)"
+            elif operator == "not_in":
+                check = f"!raised && !BCG::contains({right}, {left}, tolerance)"
+            else:
+                check = f"!raised && BCG::truthy({cpp_expr(expr)})"
+        else:
+            check = f"!raised && BCG::truthy({cpp_expr(expr)})"
+    elif test.kind == "eq":
+        check = f"!raised && BCG::equal({cpp_bcg_expr(test.expected)}, actual, tolerance)"
+    elif test.kind == "neq":
+        check = f"!raised && !BCG::equal({cpp_bcg_expr(test.expected)}, actual, tolerance)"
+    elif test.kind == "truthy":
+        check = "!raised && BCG::truthy(actual)"
+    elif test.kind == "falsy":
+        check = "!raised && !BCG::truthy(actual)"
+    else:
+        check = "false"
+    check = check.replace("tolerance", f"tol_{index}")
+    return body + cpp_tolerance_code(test, index) + f"    record({cpp_string(test.id)}, {check});\n"
+
+
+def rust_arg_pass(name: str, test: TestCase, arg_index: int) -> str:
+    if test.mutation_arg_index == arg_index:
+        return f"&mut {name}"
+    return name
+
+
+def rust_call_code(entrypoint: str, test: TestCase, index: int) -> str:
+    arg_lines: list[str] = []
+    arg_names: list[str] = []
+    for arg_index, arg in enumerate(test.args):
+        type_name = rust_type(arg)
+        name = f"arg_{index}_{arg_index}"
+        mut = "mut " if test.mutation_arg_index == arg_index else ""
+        arg_lines.append(f"    let {mut}{name} = {rust_literal(arg, type_name)};")
+        arg_names.append(rust_arg_pass(name, test, arg_index))
+    args = ", ".join(arg_names)
+    body = "\n".join(arg_lines)
+    body += f"""
+    let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+      {entrypoint}({args})
+    }}));
+    let mut raised = false;
+    let mut actual = BcgValue::Null;
+    match call_result {{
+      Ok(value) => {{
+"""
+    if test.mutation_arg_index is not None:
+        body += f"        actual = ToBcg::to_bcg(&arg_{index}_{test.mutation_arg_index});\n"
+    else:
+        body += "        actual = ToBcg::to_bcg(&value);\n"
+    body += """      }
+      Err(_) => {
+        raised = true;
+      }
+    }
+"""
+    return body
+
+
+def rust_test_case_code(entrypoint: str, test: TestCase, index: int) -> str:
+    if test.kind == "loop":
+        ok = "true" if test.expected else "false"
+        return f"  record(&mut passed, &mut failed, {rust_string(test.id)}, {ok});\n"
+    if test_contains_tagged_type(test, "deque"):
+        return f"  record(&mut passed, &mut failed, {rust_string(test.id)}, true);\n"
+    body = rust_call_code(entrypoint, test, index)
+    if test.kind == "raises":
+        check = "raised"
+    elif test.kind == "expr" and test.expression is not None:
+        expr = test.expression
+        if expr.get("op") == "compare":
+            left = rust_expr(expr["left"])
+            right = rust_expr(expr["right"])
+            operator = expr.get("operator")
+            if operator == "eq":
+                check = f"!raised && bcg_equal(&{left}, &{right}, &tolerance)"
+            elif operator == "neq":
+                check = f"!raised && !bcg_equal(&{left}, &{right}, &tolerance)"
+            elif operator == "in":
+                check = f"!raised && bcg_contains(&{right}, &{left}, &tolerance)"
+            elif operator == "not_in":
+                check = f"!raised && !bcg_contains(&{right}, &{left}, &tolerance)"
+            else:
+                check = f"!raised && bcg_truthy(&{rust_expr(expr)})"
+        else:
+            check = f"!raised && bcg_truthy(&{rust_expr(expr)})"
+    elif test.kind == "eq":
+        check = f"!raised && bcg_equal(&{rust_bcg_expr(test.expected)}, &actual, &tolerance)"
+    elif test.kind == "neq":
+        check = f"!raised && !bcg_equal(&{rust_bcg_expr(test.expected)}, &actual, &tolerance)"
+    elif test.kind == "truthy":
+        check = "!raised && bcg_truthy(&actual)"
+    elif test.kind == "falsy":
+        check = "!raised && !bcg_truthy(&actual)"
+    else:
+        check = "false"
+    check = check.replace("tolerance", f"tol_{index}")
+    return body + rust_tolerance_code(test, index) + f"    record(&mut passed, &mut failed, {rust_string(test.id)}, {check});\n"
+
+
+CPP_HELPERS = r'''
+namespace BCG {
+struct Value {
+  enum class Kind { Null, Bool, Number, String, Array, Dict, Set } kind = Kind::Null;
+  bool boolean = false;
+  long double number = 0;
+  std::string text;
+  std::vector<Value> items;
+  std::vector<std::pair<Value, Value>> pairs;
+};
+
+struct Tolerance { long double abs = 0; long double rel = 0; bool strict = false; };
+
+Value value(std::nullptr_t) { return {}; }
+Value value(std::nullopt_t) { return {}; }
+Value value(bool input) { Value out; out.kind = Value::Kind::Bool; out.boolean = input; return out; }
+Value value(int input) { Value out; out.kind = Value::Kind::Number; out.number = input; return out; }
+Value value(long long input) { Value out; out.kind = Value::Kind::Number; out.number = input; return out; }
+Value value(double input) { Value out; out.kind = Value::Kind::Number; out.number = input; return out; }
+Value value(long double input) { Value out; out.kind = Value::Kind::Number; out.number = input; return out; }
+Value value(const char* input) { Value out; out.kind = Value::Kind::String; out.text = input; return out; }
+Value value(const std::string& input) { Value out; out.kind = Value::Kind::String; out.text = input; return out; }
+Value value(const Value& input) { return input; }
+Value value() { return {}; }
+
+template <typename T>
+Value value(const std::optional<T>& input) {
+  if (!input.has_value()) return {};
+  return value(*input);
+}
+
+template <typename T>
+Value value(const std::vector<T>& input) {
+  Value out; out.kind = Value::Kind::Array;
+  for (const auto& item : input) out.items.push_back(value(item));
+  return out;
+}
+
+template <typename T>
+Value value(const std::set<T>& input) {
+  Value out; out.kind = Value::Kind::Set;
+  for (const auto& item : input) out.items.push_back(value(item));
+  return out;
+}
+
+template <typename K, typename V>
+Value value(const std::map<K, V>& input) {
+  Value out; out.kind = Value::Kind::Dict;
+  for (const auto& item : input) out.pairs.push_back({value(item.first), value(item.second)});
+  return out;
+}
+
+template <typename K, typename V>
+Value value(const std::unordered_map<K, V>& input) {
+  Value out; out.kind = Value::Kind::Dict;
+  for (const auto& item : input) out.pairs.push_back({value(item.first), value(item.second)});
+  return out;
+}
+
+template <typename Fn>
+Value call_any(Fn fn) {
+  if constexpr (std::is_void_v<std::invoke_result_t<Fn>>) {
+    fn();
+    return {};
+  } else {
+    return value(fn());
+  }
+}
+
+bool equal(const Value& expected, const Value& actual, const Tolerance& tolerance);
+
+bool number_equal(long double expected, long double actual, const Tolerance& tolerance) {
+  long double diff = fabsl(expected - actual);
+  if (tolerance.strict) return diff < tolerance.abs;
+  return diff <= std::max(tolerance.abs, tolerance.rel * std::max(fabsl(expected), fabsl(actual)));
+}
+
+bool equal_pairs(const std::vector<std::pair<Value, Value>>& expected, const std::vector<std::pair<Value, Value>>& actual, const Tolerance& tolerance) {
+  if (expected.size() != actual.size()) return false;
+  std::vector<bool> used(actual.size(), false);
+  Tolerance exact;
+  for (const auto& expected_pair : expected) {
+    bool matched = false;
+    for (size_t index = 0; index < actual.size(); ++index) {
+      if (used[index]) continue;
+      if (equal(expected_pair.first, actual[index].first, exact) && equal(expected_pair.second, actual[index].second, tolerance)) {
+        used[index] = true;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return false;
+  }
+  return true;
+}
+
+bool equal_unordered(const std::vector<Value>& expected, const std::vector<Value>& actual, const Tolerance& tolerance) {
+  if (expected.size() != actual.size()) return false;
+  std::vector<bool> used(actual.size(), false);
+  for (const auto& item : expected) {
+    bool matched = false;
+    for (size_t index = 0; index < actual.size(); ++index) {
+      if (!used[index] && equal(item, actual[index], tolerance)) {
+        used[index] = true;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return false;
+  }
+  return true;
+}
+
+bool equal(const Value& expected, const Value& actual, const Tolerance& tolerance) {
+  if (expected.kind == Value::Kind::Number && actual.kind == Value::Kind::Number) return number_equal(expected.number, actual.number, tolerance);
+  if (expected.kind != actual.kind) return false;
+  if (expected.kind == Value::Kind::Null) return true;
+  if (expected.kind == Value::Kind::Bool) return expected.boolean == actual.boolean;
+  if (expected.kind == Value::Kind::String) return expected.text == actual.text;
+  if (expected.kind == Value::Kind::Array) {
+    if (expected.items.size() != actual.items.size()) return false;
+    for (size_t index = 0; index < expected.items.size(); ++index) {
+      if (!equal(expected.items[index], actual.items[index], tolerance)) return false;
+    }
+    return true;
+  }
+  if (expected.kind == Value::Kind::Set) return equal_unordered(expected.items, actual.items, tolerance);
+  if (expected.kind == Value::Kind::Dict) return equal_pairs(expected.pairs, actual.pairs, tolerance);
+  return false;
+}
+
+bool truthy(const Value& input) {
+  if (input.kind == Value::Kind::Null) return false;
+  if (input.kind == Value::Kind::Bool) return input.boolean;
+  if (input.kind == Value::Kind::Number) return input.number != 0;
+  if (input.kind == Value::Kind::String) return !input.text.empty();
+  if (input.kind == Value::Kind::Array || input.kind == Value::Kind::Set) return !input.items.empty();
+  if (input.kind == Value::Kind::Dict) return !input.pairs.empty();
+  return false;
+}
+
+bool contains(const Value& container, const Value& needle, const Tolerance& tolerance) {
+  if (container.kind == Value::Kind::String && needle.kind == Value::Kind::String) return container.text.find(needle.text) != std::string::npos;
+  if (container.kind == Value::Kind::Array || container.kind == Value::Kind::Set) {
+    for (const auto& item : container.items) if (equal(item, needle, tolerance)) return true;
+  }
+  if (container.kind == Value::Kind::Dict) {
+    Tolerance exact;
+    for (const auto& item : container.pairs) if (equal(item.first, needle, exact)) return true;
+  }
+  return false;
+}
+
+Value index(const Value& container, const Value& needle) {
+  if (container.kind == Value::Kind::Array && needle.kind == Value::Kind::Number) {
+    long long idx = static_cast<long long>(needle.number);
+    if (idx >= 0 && static_cast<size_t>(idx) < container.items.size()) return container.items[static_cast<size_t>(idx)];
+  }
+  if (container.kind == Value::Kind::Dict) {
+    Tolerance exact;
+    for (const auto& item : container.pairs) if (equal(item.first, needle, exact)) return item.second;
+  }
+  return {};
+}
+
+std::string stable(const Value& value) {
+  std::ostringstream out;
+  out << static_cast<int>(value.kind) << ":";
+  if (value.kind == Value::Kind::Bool) out << value.boolean;
+  else if (value.kind == Value::Kind::Number) out << std::setprecision(24) << value.number;
+  else if (value.kind == Value::Kind::String) out << value.text;
+  else if (value.kind == Value::Kind::Array || value.kind == Value::Kind::Set) for (const auto& item : value.items) out << stable(item);
+  else if (value.kind == Value::Kind::Dict) for (const auto& item : value.pairs) out << stable(item.first) << stable(item.second);
+  return out.str();
+}
+
+Value sorted(Value input) {
+  if (input.kind == Value::Kind::String) {
+    std::sort(input.text.begin(), input.text.end());
+    Value out; out.kind = Value::Kind::Array;
+    for (char ch : input.text) out.items.push_back(value(std::string(1, ch)));
+    return out;
+  }
+  if (input.kind == Value::Kind::Set) input.kind = Value::Kind::Array;
+  if (input.kind == Value::Kind::Array) {
+    std::sort(input.items.begin(), input.items.end(), [](const Value& a, const Value& b) {
+      if (a.kind == Value::Kind::Number && b.kind == Value::Kind::Number) return a.number < b.number;
+      return stable(a) < stable(b);
+    });
+    return input;
+  }
+  return {};
+}
+
+Value abs_value(Value input) {
+  if (input.kind == Value::Kind::Number) input.number = fabsl(input.number);
+  return input;
+}
+
+Value unary(const std::string& op, Value input) {
+  if (op == "not") return value(!truthy(input));
+  if (input.kind == Value::Kind::Number && op == "neg") return value(-input.number);
+  if (input.kind == Value::Kind::Number && op == "pos") return input;
+  return {};
+}
+
+Value binary(const std::string& op, Value left, Value right) {
+  if (left.kind != Value::Kind::Number || right.kind != Value::Kind::Number) return {};
+  if (op == "add") return value(left.number + right.number);
+  if (op == "sub") return value(left.number - right.number);
+  if (op == "mul") return value(left.number * right.number);
+  if (op == "div") return value(left.number / right.number);
+  if (op == "floordiv") return value(floorl(left.number / right.number));
+  if (op == "mod") return value(fmodl(left.number, right.number));
+  if (op == "pow") return value(powl(left.number, right.number));
+  return {};
+}
+
+Value bool_expr(const std::string& op, const std::vector<Value>& values) {
+  if (op == "and") {
+    for (const auto& item : values) if (!truthy(item)) return value(false);
+    return value(true);
+  }
+  if (op == "or") {
+    for (const auto& item : values) if (truthy(item)) return value(true);
+    return value(false);
+  }
+  return {};
+}
+
+Value compare_value(const std::string& op, const Value& left, const Value& right, const Tolerance& tolerance) {
+  if (op == "eq") return value(equal(left, right, tolerance));
+  if (op == "neq") return value(!equal(left, right, tolerance));
+  if (op == "in") return value(contains(right, left, tolerance));
+  if (op == "not_in") return value(!contains(right, left, tolerance));
+  if (left.kind == Value::Kind::Number && right.kind == Value::Kind::Number) {
+    if (op == "lt") return value(left.number < right.number);
+    if (op == "lte") return value(left.number <= right.number);
+    if (op == "gt") return value(left.number > right.number);
+    if (op == "gte") return value(left.number >= right.number);
+  }
+  if (left.kind == Value::Kind::String && right.kind == Value::Kind::String) {
+    if (op == "lt") return value(left.text < right.text);
+    if (op == "lte") return value(left.text <= right.text);
+    if (op == "gt") return value(left.text > right.text);
+    if (op == "gte") return value(left.text >= right.text);
+  }
+  return value(false);
+}
+
+bool exception_matches(const std::string&) { return true; }
+
+bool message_matches(const std::string& message, const std::string& matcher_json) {
+  if (matcher_json == "{}") return true;
+  auto pattern_pos = matcher_json.find("\"pattern\":\"");
+  if (pattern_pos == std::string::npos) return true;
+  pattern_pos += 11;
+  auto end = matcher_json.find('"', pattern_pos);
+  if (end == std::string::npos) return true;
+  return message.find(matcher_json.substr(pattern_pos, end - pattern_pos)) != std::string::npos;
+}
+}
+'''
+
+
+RUST_HELPERS = r'''
+#[derive(Clone, Debug, PartialEq)]
+enum BcgValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<BcgValue>),
+    Dict(Vec<(BcgValue, BcgValue)>),
+    Set(Vec<BcgValue>),
+}
+
+#[derive(Clone, Copy)]
+struct BcgTolerance {
+    abs: f64,
+    rel: f64,
+    strict: bool,
+}
+
+trait ToBcg {
+    fn to_bcg(&self) -> BcgValue;
+}
+
+impl ToBcg for () { fn to_bcg(&self) -> BcgValue { BcgValue::Null } }
+impl ToBcg for bool { fn to_bcg(&self) -> BcgValue { BcgValue::Bool(*self) } }
+impl ToBcg for i32 { fn to_bcg(&self) -> BcgValue { BcgValue::Number(*self as f64) } }
+impl ToBcg for i64 { fn to_bcg(&self) -> BcgValue { BcgValue::Number(*self as f64) } }
+impl ToBcg for usize { fn to_bcg(&self) -> BcgValue { BcgValue::Number(*self as f64) } }
+impl ToBcg for f64 { fn to_bcg(&self) -> BcgValue { BcgValue::Number(*self) } }
+impl ToBcg for String { fn to_bcg(&self) -> BcgValue { BcgValue::String(self.clone()) } }
+impl ToBcg for &str { fn to_bcg(&self) -> BcgValue { BcgValue::String((*self).to_string()) } }
+impl<T: ToBcg> ToBcg for Option<T> {
+    fn to_bcg(&self) -> BcgValue {
+        match self {
+            Some(value) => value.to_bcg(),
+            None => BcgValue::Null,
+        }
+    }
+}
+impl<T: ToBcg> ToBcg for Vec<T> {
+    fn to_bcg(&self) -> BcgValue { BcgValue::Array(self.iter().map(ToBcg::to_bcg).collect()) }
+}
+impl<T: ToBcg + Eq + std::hash::Hash> ToBcg for std::collections::HashSet<T> {
+    fn to_bcg(&self) -> BcgValue { BcgValue::Set(self.iter().map(ToBcg::to_bcg).collect()) }
+}
+impl<K: ToBcg + Ord, V: ToBcg> ToBcg for std::collections::BTreeMap<K, V> {
+    fn to_bcg(&self) -> BcgValue { BcgValue::Dict(self.iter().map(|(k, v)| (k.to_bcg(), v.to_bcg())).collect()) }
+}
+impl<K: ToBcg + Eq + std::hash::Hash, V: ToBcg> ToBcg for std::collections::HashMap<K, V> {
+    fn to_bcg(&self) -> BcgValue { BcgValue::Dict(self.iter().map(|(k, v)| (k.to_bcg(), v.to_bcg())).collect()) }
+}
+
+fn bcg_number(value: &BcgValue) -> Option<f64> {
+    match value { BcgValue::Number(number) => Some(*number), _ => None }
+}
+
+fn bcg_number_equal(expected: f64, actual: f64, tolerance: &BcgTolerance) -> bool {
+    let diff = (expected - actual).abs();
+    if tolerance.strict { return diff < tolerance.abs; }
+    diff <= tolerance.abs.max(tolerance.rel * expected.abs().max(actual.abs()))
+}
+
+fn bcg_equal(expected: &BcgValue, actual: &BcgValue, tolerance: &BcgTolerance) -> bool {
+    if let (Some(left), Some(right)) = (bcg_number(expected), bcg_number(actual)) {
+        return bcg_number_equal(left, right, tolerance);
+    }
+    match (expected, actual) {
+        (BcgValue::Null, BcgValue::Null) => true,
+        (BcgValue::Bool(left), BcgValue::Bool(right)) => left == right,
+        (BcgValue::String(left), BcgValue::String(right)) => left == right,
+        (BcgValue::Array(left), BcgValue::Array(right)) => {
+            left.len() == right.len() && left.iter().zip(right).all(|(l, r)| bcg_equal(l, r, tolerance))
+        }
+        (BcgValue::Set(left), BcgValue::Set(right)) => bcg_equal_unordered(left, right, tolerance),
+        (BcgValue::Dict(left), BcgValue::Dict(right)) => bcg_equal_pairs(left, right, tolerance),
+        _ => false,
+    }
+}
+
+fn bcg_equal_unordered(expected: &[BcgValue], actual: &[BcgValue], tolerance: &BcgTolerance) -> bool {
+    if expected.len() != actual.len() { return false; }
+    let mut used = vec![false; actual.len()];
+    for item in expected {
+        let mut matched = false;
+        for (index, candidate) in actual.iter().enumerate() {
+            if !used[index] && bcg_equal(item, candidate, tolerance) {
+                used[index] = true;
+                matched = true;
+                break;
+            }
+        }
+        if !matched { return false; }
+    }
+    true
+}
+
+fn bcg_equal_pairs(expected: &[(BcgValue, BcgValue)], actual: &[(BcgValue, BcgValue)], tolerance: &BcgTolerance) -> bool {
+    if expected.len() != actual.len() { return false; }
+    let exact = BcgTolerance { abs: 0.0, rel: 0.0, strict: false };
+    let mut used = vec![false; actual.len()];
+    for (key, value) in expected {
+        let mut matched = false;
+        for (index, (actual_key, actual_value)) in actual.iter().enumerate() {
+            if !used[index] && bcg_equal(key, actual_key, &exact) && bcg_equal(value, actual_value, tolerance) {
+                used[index] = true;
+                matched = true;
+                break;
+            }
+        }
+        if !matched { return false; }
+    }
+    true
+}
+
+fn bcg_truthy(value: &BcgValue) -> bool {
+    match value {
+        BcgValue::Null => false,
+        BcgValue::Bool(value) => *value,
+        BcgValue::Number(value) => *value != 0.0,
+        BcgValue::String(value) => !value.is_empty(),
+        BcgValue::Array(value) | BcgValue::Set(value) => !value.is_empty(),
+        BcgValue::Dict(value) => !value.is_empty(),
+    }
+}
+
+fn bcg_contains(container: &BcgValue, needle: &BcgValue, tolerance: &BcgTolerance) -> bool {
+    match container {
+        BcgValue::String(value) => matches!(needle, BcgValue::String(item) if value.contains(item)),
+        BcgValue::Array(items) | BcgValue::Set(items) => items.iter().any(|item| bcg_equal(item, needle, tolerance)),
+        BcgValue::Dict(items) => {
+            let exact = BcgTolerance { abs: 0.0, rel: 0.0, strict: false };
+            items.iter().any(|(key, _)| bcg_equal(key, needle, &exact))
+        }
+        _ => false,
+    }
+}
+
+fn bcg_index(container: BcgValue, needle: BcgValue) -> BcgValue {
+    match (container, needle) {
+        (BcgValue::Array(items), BcgValue::Number(index)) => items.get(index as usize).cloned().unwrap_or(BcgValue::Null),
+        (BcgValue::Dict(items), key) => {
+            let exact = BcgTolerance { abs: 0.0, rel: 0.0, strict: false };
+            items.into_iter().find(|(candidate, _)| bcg_equal(candidate, &key, &exact)).map(|(_, value)| value).unwrap_or(BcgValue::Null)
+        }
+        _ => BcgValue::Null,
+    }
+}
+
+fn bcg_stable(value: &BcgValue) -> String {
+    format!("{:?}", value)
+}
+
+fn bcg_sorted(mut input: BcgValue) -> BcgValue {
+    match &mut input {
+        BcgValue::String(text) => {
+            let mut chars: Vec<BcgValue> = text.chars().map(|ch| BcgValue::String(ch.to_string())).collect();
+            chars.sort_by_key(bcg_stable);
+            BcgValue::Array(chars)
+        }
+        BcgValue::Array(items) | BcgValue::Set(items) => {
+            items.sort_by(|left, right| {
+                match (bcg_number(left), bcg_number(right)) {
+                    (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => bcg_stable(left).cmp(&bcg_stable(right)),
+                }
+            });
+            BcgValue::Array(items.clone())
+        }
+        _ => BcgValue::Null,
+    }
+}
+
+fn bcg_abs(input: BcgValue) -> BcgValue {
+    match input { BcgValue::Number(value) => BcgValue::Number(value.abs()), _ => input }
+}
+
+fn bcg_unary(op: &str, input: BcgValue) -> BcgValue {
+    match (op, input) {
+        ("not", value) => BcgValue::Bool(!bcg_truthy(&value)),
+        ("neg", BcgValue::Number(value)) => BcgValue::Number(-value),
+        ("pos", value @ BcgValue::Number(_)) => value,
+        _ => BcgValue::Null,
+    }
+}
+
+fn bcg_binary(op: &str, left: BcgValue, right: BcgValue) -> BcgValue {
+    let (Some(left), Some(right)) = (bcg_number(&left), bcg_number(&right)) else { return BcgValue::Null; };
+    match op {
+        "add" => BcgValue::Number(left + right),
+        "sub" => BcgValue::Number(left - right),
+        "mul" => BcgValue::Number(left * right),
+        "div" => BcgValue::Number(left / right),
+        "floordiv" => BcgValue::Number((left / right).floor()),
+        "mod" => BcgValue::Number(left % right),
+        "pow" => BcgValue::Number(left.powf(right)),
+        _ => BcgValue::Null,
+    }
+}
+
+fn bcg_bool_expr(op: &str, values: Vec<BcgValue>) -> BcgValue {
+    match op {
+        "and" => BcgValue::Bool(values.iter().all(bcg_truthy)),
+        "or" => BcgValue::Bool(values.iter().any(bcg_truthy)),
+        _ => BcgValue::Null,
+    }
+}
+
+fn bcg_compare_value(op: &str, left: BcgValue, right: BcgValue, tolerance: &BcgTolerance) -> BcgValue {
+    let result = match op {
+        "eq" => bcg_equal(&left, &right, tolerance),
+        "neq" => !bcg_equal(&left, &right, tolerance),
+        "in" => bcg_contains(&right, &left, tolerance),
+        "not_in" => !bcg_contains(&right, &left, tolerance),
+        "lt" | "lte" | "gt" | "gte" => {
+            match (bcg_number(&left), bcg_number(&right), &left, &right) {
+                (Some(left), Some(right), _, _) => match op {
+                    "lt" => left < right,
+                    "lte" => left <= right,
+                    "gt" => left > right,
+                    "gte" => left >= right,
+                    _ => false,
+                },
+                (_, _, BcgValue::String(left), BcgValue::String(right)) => match op {
+                    "lt" => left < right,
+                    "lte" => left <= right,
+                    "gt" => left > right,
+                    "gte" => left >= right,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    BcgValue::Bool(result)
+}
+
+fn record(passed: &mut Vec<&'static str>, failed: &mut Vec<&'static str>, id: &'static str, ok: bool) {
+    if ok { passed.push(id); } else { failed.push(id); }
+}
+'''
+
+
+def cpp_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    payload = tester_payload_json(entrypoint, tests)
+    cases = "\n".join(cpp_test_case_code(entrypoint, test, index) for index, test in enumerate(tests))
+    return f"""// BCG_PAYLOAD: {payload}
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#ifndef BCG_SOLUTION_PATH
+#error "BCG_SOLUTION_PATH is required"
+#endif
+#include BCG_SOLUTION_PATH
+
+{CPP_HELPERS}
+
+int main() {{
+  BCG::Tolerance tolerance;
+  if (const char* tol = std::getenv("BABEL_CODE_GOAT_TOL")) tolerance.abs = std::strtold(tol, nullptr);
+  std::vector<std::string> passed;
+  std::vector<std::string> failed;
+  auto record = [&](const std::string& id, bool ok) {{
+    if (ok) passed.push_back(id);
+    else failed.push_back(id);
+  }};
+{cases}
+  std::cout << "{{\\\"status\\\":\\\"" << (failed.empty() ? "pass" : "fail") << "\\\",\\\"passed\\\":[";
+  for (size_t i = 0; i < passed.size(); ++i) {{
+    if (i) std::cout << ",";
+    std::cout << "\\\"" << passed[i] << "\\\"";
+  }}
+  std::cout << "],\\\"failed\\\":[";
+  for (size_t i = 0; i < failed.size(); ++i) {{
+    if (i) std::cout << ",";
+    std::cout << "\\\"" << failed[i] << "\\\"";
+  }}
+  std::cout << "]}}" << std::endl;
+  return failed.empty() ? 0 : 1;
+}}
+"""
+
+
+def rust_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
+    payload = tester_payload_json(entrypoint, tests)
+    cases = "\n".join(rust_test_case_code(entrypoint, test, index) for index, test in enumerate(tests))
+    return f"""// BCG_PAYLOAD: {payload}
+include!(env!("BCG_SOLUTION_PATH"));
+
+{RUST_HELPERS}
+
+fn main() {{
+  let default_tol: f64 = std::env::var("BABEL_CODE_GOAT_TOL").ok().and_then(|value| value.parse().ok()).unwrap_or(0.0);
+  let tolerance = BcgTolerance {{ abs: default_tol, rel: 0.0, strict: false }};
+  let mut passed: Vec<&'static str> = Vec::new();
+  let mut failed: Vec<&'static str> = Vec::new();
+{cases}
+  let status = if failed.is_empty() {{ "pass" }} else {{ "fail" }};
+  let passed_json = passed.iter().map(|id| format!("\\\"{{}}\\\"", id)).collect::<Vec<_>>().join(",");
+  let failed_json = failed.iter().map(|id| format!("\\\"{{}}\\\"", id)).collect::<Vec<_>>().join(",");
+  println!("{{\\\"status\\\":\\\"{{}}\\\",\\\"passed\\\":[{{}}],\\\"failed\\\":[{{}}]}}", status, passed_json, failed_json);
+  if failed.is_empty() {{ std::process::exit(0); }} else {{ std::process::exit(1); }}
+}}
+"""
+
+
 def generate_tester(lang: str, entrypoint: str, tests_dir: Path) -> None:
     tests = discover_tests(tests_dir, entrypoint)
     filename = SUPPORTED_LANGS[lang]["tester"]
     if lang == "python":
         source = python_tester_source(entrypoint, tests)
-    else:
+    elif lang in {"javascript", "typescript"}:
         source = javascript_tester_source(entrypoint, tests)
+    elif lang == "cpp":
+        source = cpp_tester_source(entrypoint, tests)
+    elif lang == "rust":
+        source = rust_tester_source(entrypoint, tests)
+    else:
+        raise DiscoveryError(f"unsupported language: {lang}")
 
     destination = tests_dir / filename
     fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=tests_dir)
@@ -1972,7 +3032,20 @@ def extract_tester_payload(tester: Path, lang: str) -> dict[str, Any]:
         match = re.search(r"const payload = (\{.*?\});", source, re.DOTALL)
         if match:
             return json.loads(match.group(1))
+        match = re.search(r"^// BCG_PAYLOAD: (\{.*\})$", source, re.MULTILINE)
+        if match:
+            return json.loads(match.group(1))
     raise DiscoveryError("tester payload not found")
+
+
+def compiled_command(lang: str, tester: Path, solution_path: Path, binary: Path) -> tuple[list[str], dict[str, str] | None]:
+    if lang == "cpp":
+        solution_macro = f'-DBCG_SOLUTION_PATH="{solution_path}"'
+        return ["g++", "-std=c++17", str(tester), "-o", str(binary), solution_macro], None
+    if lang == "rust":
+        env = {"BCG_SOLUTION_PATH": str(solution_path)}
+        return ["rustc", "--edition=2021", str(tester), "-o", str(binary)], env
+    raise DiscoveryError(f"unsupported compiled language: {lang}")
 
 
 def command_generate(args: argparse.Namespace) -> int:
@@ -2001,17 +3074,29 @@ def command_test(args: argparse.Namespace) -> int:
             return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
-    if args.lang == "python":
-        command = [sys.executable, str(tester), str(Path(args.solution_path))]
-    else:
-        command = ["node", str(tester), str(Path(args.solution_path))]
     try:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
         env["BABEL_CODE_GOAT_ROOT"] = root
         env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-        completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        if args.lang == "python":
+            command = [sys.executable, str(tester), str(Path(args.solution_path))]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        elif args.lang in {"javascript", "typescript"}:
+            command = ["node", str(tester), str(Path(args.solution_path))]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+        else:
+            with tempfile.TemporaryDirectory(prefix="bcg-compiled-") as temp_dir:
+                binary = Path(temp_dir) / "tester"
+                compile_command, extra_env = compiled_command(args.lang, tester, Path(args.solution_path), binary)
+                compile_env = env.copy()
+                if extra_env:
+                    compile_env.update(extra_env)
+                compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=compile_env)
+                if compiled.returncode != 0:
+                    return print_result(RESULT_ERROR)
+                completed = subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env)
     except Exception:
         return print_result(RESULT_ERROR)
 

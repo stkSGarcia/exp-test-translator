@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Compiled Language Interface",
+    "tags": ["language flags", "cpp rust", "command support"]
+  },
+  {
+    "label": "Generated Tester Workflow",
+    "tags": ["tester files", "generate test", "missing validation"]
+  },
+  {
+    "label": "Value Model Parity",
+    "tags": ["nested nulls", "optional values", "collection equality"]
+  },
+  {
+    "label": "Runtime Semantics",
+    "tags": ["compiled execution", "exception assertions", "deque skips"]
+  }
+]
