@@ -501,6 +501,180 @@ def solve(*args):
     }
 
 
+def test_test_list_tests_and_run_selection_use_discovered_ids(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve(1) == 1
+    for x in [2, 3]:
+        assert solve(x) == x
+    assert solve(99) == 0
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """def solve(x):
+    return x
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+
+    listed = run_cli("test", tmp_path / "missing.py", tests_dir, "--lang", "python", "--list-tests")
+    assert parse_result(listed) == {
+        "status": "pass",
+        "passed": ["tests.py:2", "tests.py:3", "tests.py:4:0", "tests.py:4:1", "tests.py:5"],
+        "failed": [],
+    }
+    assert listed.returncode == 0
+
+    selected_pass = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "tests.py:4:1")
+    assert parse_result(selected_pass) == {"status": "pass", "passed": ["tests.py:4:1"], "failed": []}
+    assert selected_pass.returncode == 0
+
+    selected_fail = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "tests.py:5")
+    assert parse_result(selected_fail) == {"status": "fail", "passed": [], "failed": ["tests.py:5"]}
+    assert selected_fail.returncode == 1
+
+    missing = run_cli("test", solution, tests_dir, "--lang", "python", "--run", "missing")
+    assert parse_result(missing) == {"status": "error", "passed": [], "failed": []}
+    assert missing.returncode == 2
+
+
+def test_python_and_javascript_execution_await_async_values_and_exceptions(tmp_path):
+    for lang, solution_name, source in (
+        (
+            "python",
+            "solution.py",
+            """import asyncio
+
+async def solve(kind):
+    await asyncio.sleep(0)
+    if kind == "boom":
+        raise ValueError("bad")
+    return 3
+""",
+        ),
+        (
+            "javascript",
+            "solution.js",
+            """async function solve(kind) {
+  await new Promise(resolve => setTimeout(resolve, 1));
+  if (kind === "boom") {
+    const error = new Error("bad");
+    error.name = "ValueError";
+    throw error;
+  }
+  return 3;
+}
+module.exports = {solve};
+""",
+        ),
+        (
+            "typescript",
+            "solution.js",
+            """async function solve(kind) {
+  await new Promise(resolve => setTimeout(resolve, 1));
+  if (kind === "boom") {
+    const error = new Error("bad");
+    error.name = "ValueError";
+    throw error;
+  }
+  return 3;
+}
+module.exports = {solve};
+""",
+        ),
+    ):
+        tests_dir = write_tests(
+            tmp_path / lang,
+            """def cases():
+    assert solve("value") == 3
+    try:
+        solve("boom")
+        assert False
+    except ValueError:
+        pass
+""",
+        )
+        solution = tmp_path / lang / solution_name
+        solution.write_text(source, encoding="utf-8")
+
+        assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", lang).returncode == 0
+        completed = run_cli("test", solution, tests_dir, "--lang", lang)
+
+        assert parse_result(completed) == {
+            "status": "pass",
+            "passed": ["tests.py:2", "tests.py:3"],
+            "failed": [],
+        }
+        assert completed.returncode == 0
+
+
+def test_timeout_ms_fails_slow_test_and_preserves_later_outcome(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve("slow") == 1
+    assert solve("fast") == 2
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """import time
+
+def solve(kind):
+    if kind == "slow":
+        time.sleep(0.05)
+        return 1
+    return 2
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python", "--timeout-ms", "10")
+
+    assert parse_result(completed) == {"status": "fail", "passed": ["tests.py:3"], "failed": ["tests.py:2"]}
+    assert completed.returncode == 1
+
+
+def test_total_timeout_ms_fails_not_executed_tests(tmp_path):
+    tests_dir = write_tests(
+        tmp_path,
+        """def cases():
+    assert solve("slow") == 1
+    assert solve("later") == 2
+    assert solve("last") == 3
+""",
+    )
+    solution = tmp_path / "solution.py"
+    solution.write_text(
+        """import time
+
+def solve(kind):
+    if kind == "slow":
+        time.sleep(0.05)
+        return 1
+    if kind == "later":
+        return 2
+    return 3
+""",
+        encoding="utf-8",
+    )
+
+    assert run_cli("generate", tests_dir, "--entrypoint", "solve", "--lang", "python").returncode == 0
+    completed = run_cli("test", solution, tests_dir, "--lang", "python", "--total-timeout-ms", "10")
+
+    assert parse_result(completed) == {
+        "status": "fail",
+        "passed": [],
+        "failed": ["tests.py:2", "tests.py:3", "tests.py:4"],
+    }
+    assert completed.returncode == 1
+
+
 def test_python_execution_evaluates_primitive_expressions_once(tmp_path):
     tests_dir = write_tests(
         tmp_path,

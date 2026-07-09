@@ -1,0 +1,7 @@
+[
+  "babel-code-goat-cli/add-babel-code-goat",
+  "babel-code-goat-cli/support-loop-construct-tests",
+  "babel-code-goat-cli/support-mutation-style-tests",
+  "babel-code-goat-cli/support-single-call-test-traceability",
+  "compiled-language-targets/add-cpp-rust-targets"
+]

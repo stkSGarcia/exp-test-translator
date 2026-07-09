@@ -1,0 +1,18 @@
+[
+  {
+    "label": "Command Interface",
+    "tags": ["test flags", "test listing", "test selection"]
+  },
+  {
+    "label": "Result Accounting",
+    "tags": ["coverage accounting", "scoped ids", "error envelope"]
+  },
+  {
+    "label": "Async Execution",
+    "tags": ["async completion", "awaitable values", "async exceptions"]
+  },
+  {
+    "label": "Timeout Handling",
+    "tags": ["per test timeout", "total timeout", "not executed tests"]
+  }
+]

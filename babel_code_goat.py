@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ast
 from collections import Counter, defaultdict, deque
 import contextlib
@@ -13,9 +14,11 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,9 +33,16 @@ SUPPORTED_LANGS = {
 RESULT_ERROR = {"status": "error", "passed": [], "failed": []}
 EXPECT_RE = re.compile(r"^\s*#\s*expect_(stdout|stderr):\s*(.+?)\s*$")
 TAG_KEY = "__bcg_type__"
+RUN_ID_ENV = "BABEL_CODE_GOAT_RUN_ID"
+TIMEOUT_MS_ENV = "BABEL_CODE_GOAT_TIMEOUT_MS"
+TOTAL_TIMEOUT_MS_ENV = "BABEL_CODE_GOAT_TOTAL_TIMEOUT_MS"
 
 
 class DiscoveryError(Exception):
+    pass
+
+
+class ExecutionTimeout(Exception):
     pass
 
 
@@ -1186,6 +1196,65 @@ def print_result(result: dict[str, Any]) -> int:
     return {"pass": 0, "fail": 1, "error": 2}[result["status"]]
 
 
+def parse_optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("timeout must be a positive integer")
+    return value
+
+
+def scoped_tests(tests: list[dict[str, Any]], run_id: str | None) -> list[dict[str, Any]] | None:
+    if run_id is None:
+        return tests
+    selected = [test for test in tests if test.get("id") == run_id]
+    return selected or None
+
+
+def result_for_timeout(scope_ids: list[str]) -> dict[str, Any]:
+    return make_result("fail", [], scope_ids)
+
+
+def normalize_runner_result(result: Any, scope_ids: list[str]) -> dict[str, Any] | None:
+    if not isinstance(result, dict) or list(result.keys()) != ["status", "passed", "failed"]:
+        return None
+    if result.get("status") not in {"pass", "fail", "error"}:
+        return None
+    if not isinstance(result.get("passed"), list) or not isinstance(result.get("failed"), list):
+        return None
+    if not all(isinstance(item, str) for item in result["passed"] + result["failed"]):
+        return None
+    if result["status"] == "error":
+        return result
+
+    scope_set = set(scope_ids)
+    seen: set[str] = set()
+    passed: list[str] = []
+    failed: list[str] = []
+    for test_id in result["passed"]:
+        if test_id not in scope_set or test_id in seen:
+            return None
+        seen.add(test_id)
+        passed.append(test_id)
+    for test_id in result["failed"]:
+        if test_id not in scope_set or test_id in seen:
+            return None
+        seen.add(test_id)
+        failed.append(test_id)
+    for test_id in scope_ids:
+        if test_id not in seen:
+            failed.append(test_id)
+    return make_result("pass" if not failed else "fail", passed, failed)
+
+
+def runtime_timeout_seconds(timeout_ms: int | None, total_timeout_ms: int | None, scope_count: int) -> float | None:
+    if total_timeout_ms is not None:
+        return total_timeout_ms / 1000 + 1.0
+    if timeout_ms is not None:
+        return timeout_ms * max(scope_count, 1) / 1000 + 1.0
+    return None
+
+
 def is_tagged(value: Any, type_name: str | None = None) -> bool:
     return isinstance(value, dict) and TAG_KEY in value and (type_name is None or value[TAG_KEY] == type_name)
 
@@ -1485,9 +1554,57 @@ def resolve_python_callable(solution_path: Path, entrypoint: str) -> Any:
     raise RuntimeError("entrypoint not found")
 
 
+@contextlib.contextmanager
+def python_time_limit(timeout_ms: int | None):
+    if timeout_ms is None:
+        yield
+        return
+
+    def raise_timeout(_signum: int, _frame: Any) -> None:
+        raise ExecutionTimeout()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, raise_timeout)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, max(timeout_ms, 1) / 1000)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def await_python_value(value: Any, timeout_ms: int | None) -> Any:
+    if not inspect.isawaitable(value):
+        return value
+
+    async def resolve() -> Any:
+        return await value
+
+    if timeout_ms is None:
+        return asyncio.run(resolve())
+    return asyncio.run(asyncio.wait_for(resolve(), timeout=timeout_ms / 1000))
+
+
+def effective_timeout_ms(timeout_ms: int | None, deadline: float | None) -> int | None:
+    if deadline is None:
+        return timeout_ms
+    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+    if timeout_ms is None:
+        return remaining_ms
+    return min(timeout_ms, remaining_ms)
+
+
 def execute_python_tests(
-    solution_path: Path, entrypoint: str, tests: list[dict[str, Any]], default_tol: float = 0.0
+    solution_path: Path,
+    entrypoint: str,
+    tests: list[dict[str, Any]],
+    default_tol: float = 0.0,
+    selected_id: str | None = None,
+    timeout_ms: int | None = None,
+    total_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
+    tests = scoped_tests(tests, selected_id) or []
+    deadline = time.monotonic() + total_timeout_ms / 1000 if total_timeout_ms is not None else None
     callable_under_test = None
     if any(test["kind"] != "loop" for test in tests):
         try:
@@ -1497,30 +1614,50 @@ def execute_python_tests(
 
     passed: list[str] = []
     failed: list[str] = []
-    for test in tests:
+    for index, test in enumerate(tests):
+        if deadline is not None and time.monotonic() >= deadline:
+            failed.extend(item["id"] for item in tests[index:])
+            break
         stdout_buffer = io.StringIO()
         stderr_buffer = io.StringIO()
         ok = False
+        timed_out = False
+        current_timeout_ms = effective_timeout_ms(timeout_ms, deadline)
         try:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-                if test["kind"] == "loop":
-                    ok = bool(test.get("expected"))
+                try:
+                    with python_time_limit(current_timeout_ms):
+                        if test["kind"] == "loop":
+                            ok = bool(test.get("expected"))
+                            actual = None
+                            raised = False
+                            raised_exc = None
+                        else:
+                            raised = False
+                            raised_exc = None
+                            decoded_args = [decode_arg(arg) for arg in test["args"]]
+                            try:
+                                actual = callable_under_test(*decoded_args)
+                                actual = await_python_value(actual, current_timeout_ms)
+                                if test.get("mutation_arg_index") is not None:
+                                    actual = decoded_args[test["mutation_arg_index"]]
+                            except (ExecutionTimeout, TimeoutError, asyncio.TimeoutError):
+                                timed_out = True
+                                raised = False
+                                raised_exc = None
+                                actual = None
+                            except Exception as exc:
+                                raised = True
+                                raised_exc = exc
+                                actual = None
+                except (ExecutionTimeout, TimeoutError, asyncio.TimeoutError):
+                    timed_out = True
+                    raised = False
+                    raised_exc = None
                     actual = None
-                    raised = False
-                    raised_exc = None
-                else:
-                    raised = False
-                    raised_exc = None
-                    decoded_args = [decode_arg(arg) for arg in test["args"]]
-                    try:
-                        actual = callable_under_test(*decoded_args)
-                        if test.get("mutation_arg_index") is not None:
-                            actual = decoded_args[test["mutation_arg_index"]]
-                    except Exception as exc:
-                        raised = True
-                        raised_exc = exc
-                        actual = None
-                if test["kind"] == "loop":
+                if timed_out:
+                    ok = False
+                elif test["kind"] == "loop":
                     pass
                 elif test["kind"] == "raises":
                     ok = (
@@ -1555,6 +1692,17 @@ def execute_python_tests(
             passed.append(test["id"])
         else:
             failed.append(test["id"])
+        if (
+            timed_out
+            and deadline is not None
+            and (timeout_ms is None or (current_timeout_ms is not None and current_timeout_ms < timeout_ms))
+            and index + 1 < len(tests)
+        ):
+            failed.extend(item["id"] for item in tests[index + 1 :])
+            break
+        if deadline is not None and time.monotonic() >= deadline and index + 1 < len(tests):
+            failed.extend(item["id"] for item in tests[index + 1 :])
+            break
     return make_result("pass" if not failed else "fail", passed, failed)
 
 
@@ -1575,11 +1723,23 @@ from babel_code_goat import execute_python_tests, print_result
 
 PAYLOAD = {payload!r}
 
+def env_int(name):
+    value = os.environ.get(name)
+    return int(value) if value else None
+
 def main():
     if len(sys.argv) != 2:
         return print_result({{"status": "error", "passed": [], "failed": []}})
     data = json.loads(PAYLOAD)
-    result = execute_python_tests(Path(sys.argv[1]), data["entrypoint"], data["tests"], float(os.environ.get("BABEL_CODE_GOAT_TOL", "0")))
+    result = execute_python_tests(
+        Path(sys.argv[1]),
+        data["entrypoint"],
+        data["tests"],
+        float(os.environ.get("BABEL_CODE_GOAT_TOL", "0")),
+        os.environ.get("{RUN_ID_ENV}") or None,
+        env_int("{TIMEOUT_MS_ENV}"),
+        env_int("{TOTAL_TIMEOUT_MS_ENV}"),
+    )
     return print_result(result)
 
 if __name__ == "__main__":
@@ -1602,6 +1762,29 @@ const {{ pathToFileURL }} = require("url");
 const payload = {payload};
 const TAG = "{TAG_KEY}";
 const defaultTol = Number(process.env.BABEL_CODE_GOAT_TOL || "0");
+const selectedId = process.env.{RUN_ID_ENV} || null;
+const timeoutMs = process.env.{TIMEOUT_MS_ENV} ? Number(process.env.{TIMEOUT_MS_ENV}) : null;
+const totalTimeoutMs = process.env.{TOTAL_TIMEOUT_MS_ENV} ? Number(process.env.{TOTAL_TIMEOUT_MS_ENV}) : null;
+
+class BcgTimeout extends Error {{}}
+
+function scopedTests() {{
+  return selectedId ? payload.tests.filter(test => test.id === selectedId) : payload.tests;
+}}
+
+function withTimeout(work, ms) {{
+  if (!ms || ms <= 0) return work();
+  return Promise.race([
+    work(),
+    new Promise((_, reject) => setTimeout(() => reject(new BcgTimeout("timeout")), ms)),
+  ]);
+}}
+
+function remainingTimeout(deadline) {{
+  if (!deadline) return timeoutMs;
+  const remaining = Math.max(0, deadline - Date.now());
+  return timeoutMs ? Math.min(timeoutMs, remaining) : remaining;
+}}
 
 function isTagged(value, typeName) {{
   return value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, TAG) && (!typeName || value[TAG] === typeName);
@@ -1873,20 +2056,27 @@ async function main() {{
     return 2;
   }}
   const solutionPath = path.resolve(process.argv[2]);
+  const tests = scopedTests();
+  const deadline = totalTimeoutMs ? Date.now() + totalTimeoutMs : null;
   let fn;
-  const hasExecutableTests = payload.tests.some(test => test.kind !== "loop");
+  const hasExecutableTests = tests.some(test => test.kind !== "loop");
   if (hasExecutableTests) {{
     try {{
       fn = findCallable(await loadSolution(solutionPath), payload.entrypoint);
     }} catch (error) {{
-      console.log(JSON.stringify({{status: "fail", passed: [], failed: payload.tests.map(test => test.id)}}));
+      console.log(JSON.stringify({{status: "fail", passed: [], failed: tests.map(test => test.id)}}));
       return 1;
     }}
   }}
 
   const passed = [];
   const failed = [];
-  for (const test of payload.tests) {{
+  for (let index = 0; index < tests.length; index++) {{
+    const test = tests[index];
+    if (deadline && Date.now() >= deadline) {{
+      failed.push(...tests.slice(index).map(item => item.id));
+      break;
+    }}
     let stdout = "";
     let stderr = "";
     const oldOut = process.stdout.write;
@@ -1894,40 +2084,53 @@ async function main() {{
     process.stdout.write = function(chunk, encoding, cb) {{ stdout += String(chunk); if (typeof cb === "function") cb(); return true; }};
     process.stderr.write = function(chunk, encoding, cb) {{ stderr += String(chunk); if (typeof cb === "function") cb(); return true; }};
     let ok = false;
+    let timedOut = false;
+    const currentTimeoutMs = remainingTimeout(deadline);
     try {{
-      let actual;
-      let raised = false;
-      let raisedError = null;
-      if (test.kind === "loop") {{
-        ok = !!test.expected;
-      }} else {{
-        const decodedArgs = test.args.map(decodeArg);
-        try {{
-          actual = fn(...decodedArgs);
-          if (actual && typeof actual.then === "function") actual = await actual;
-          if (test.mutation_arg_index !== null && test.mutation_arg_index !== undefined) actual = decodedArgs[test.mutation_arg_index];
-        }} catch (error) {{
-          raised = true;
-          raisedError = error;
+      await withTimeout(async () => {{
+        let actual;
+        let raised = false;
+        let raisedError = null;
+        if (test.kind === "loop") {{
+          ok = !!test.expected;
+        }} else {{
+          const decodedArgs = test.args.map(decodeArg);
+          try {{
+            actual = fn(...decodedArgs);
+            if (actual && typeof actual.then === "function") actual = await actual;
+            if (test.mutation_arg_index !== null && test.mutation_arg_index !== undefined) actual = decodedArgs[test.mutation_arg_index];
+          }} catch (error) {{
+            raised = true;
+            raisedError = error;
+          }}
         }}
-      }}
-      if (test.kind === "loop") {{}}
-      else if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
-      else if (raised) ok = false;
-      else if (test.kind === "expr") ok = !!evaluateExpression(test.expression, actual, tolerancePolicy(test));
-      else if (test.kind === "eq") ok = deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
-      else if (test.kind === "neq") ok = !deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
-      else if (test.kind === "truthy") ok = !!actual;
-      else if (test.kind === "falsy") ok = !actual;
+        if (test.kind === "loop") {{}}
+        else if (test.kind === "raises") ok = raised && exceptionMatches(raisedError, test.expected_exception) && messageMatches(raisedError, test.message_match);
+        else if (raised) ok = false;
+        else if (test.kind === "expr") ok = !!evaluateExpression(test.expression, actual, tolerancePolicy(test));
+        else if (test.kind === "eq") ok = deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
+        else if (test.kind === "neq") ok = !deepEqual(test.expected, normalize(actual), tolerancePolicy(test));
+        else if (test.kind === "truthy") ok = !!actual;
+        else if (test.kind === "falsy") ok = !actual;
+      }}, currentTimeoutMs);
     }} catch (error) {{
+      if (error instanceof BcgTimeout) timedOut = true;
       ok = false;
     }} finally {{
       process.stdout.write = oldOut;
       process.stderr.write = oldErr;
     }}
-    if (test.expect_stdout !== null && stdout !== test.expect_stdout) ok = false;
-    if (test.expect_stderr !== null && stderr !== test.expect_stderr) ok = false;
+    if (!timedOut && test.expect_stdout !== null && stdout !== test.expect_stdout) ok = false;
+    if (!timedOut && test.expect_stderr !== null && stderr !== test.expect_stderr) ok = false;
     (ok ? passed : failed).push(test.id);
+    if (timedOut && deadline && (!timeoutMs || currentTimeoutMs < timeoutMs) && index + 1 < tests.length) {{
+      failed.push(...tests.slice(index + 1).map(item => item.id));
+      break;
+    }}
+    if (deadline && Date.now() >= deadline && index + 1 < tests.length) {{
+      failed.push(...tests.slice(index + 1).map(item => item.id));
+      break;
+    }}
   }}
   const status = failed.length === 0 ? "pass" : "fail";
   console.log(JSON.stringify({{status, passed, failed}}));
@@ -2327,6 +2530,11 @@ def cpp_test_case_code(entrypoint: str, test: TestCase, index: int) -> str:
     return body + cpp_tolerance_code(test, index) + f"    record({cpp_string(test.id)}, {check});\n"
 
 
+def cpp_guarded_test_case_code(entrypoint: str, test: TestCase, index: int) -> str:
+    body = cpp_test_case_code(entrypoint, test, index)
+    return f"  if (run_id.empty() || run_id == {cpp_string(test.id)}) {{\n{body}  }}\n"
+
+
 def rust_arg_pass(name: str, test: TestCase, arg_index: int) -> str:
     if test.mutation_arg_index == arg_index:
         return f"&mut {name}"
@@ -2405,6 +2613,11 @@ def rust_test_case_code(entrypoint: str, test: TestCase, index: int) -> str:
         check = "false"
     check = check.replace("tolerance", f"tol_{index}")
     return body + rust_tolerance_code(test, index) + f"    record(&mut passed, &mut failed, {rust_string(test.id)}, {check});\n"
+
+
+def rust_guarded_test_case_code(entrypoint: str, test: TestCase, index: int) -> str:
+    body = rust_test_case_code(entrypoint, test, index)
+    return f"  if run_id.as_deref().map_or(true, |id| id == {rust_string(test.id)}) {{\n{body}  }}\n"
 
 
 CPP_HELPERS = r'''
@@ -2917,9 +3130,10 @@ fn record(passed: &mut Vec<&'static str>, failed: &mut Vec<&'static str>, id: &'
 
 def cpp_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
     payload = tester_payload_json(entrypoint, tests)
-    cases = "\n".join(cpp_test_case_code(entrypoint, test, index) for index, test in enumerate(tests))
+    cases = "\n".join(cpp_guarded_test_case_code(entrypoint, test, index) for index, test in enumerate(tests))
     return f"""// BCG_PAYLOAD: {payload}
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -2943,6 +3157,8 @@ def cpp_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
 int main() {{
   BCG::Tolerance tolerance;
   if (const char* tol = std::getenv("BABEL_CODE_GOAT_TOL")) tolerance.abs = std::strtold(tol, nullptr);
+  std::string run_id;
+  if (const char* selected = std::getenv("{RUN_ID_ENV}")) run_id = selected;
   std::vector<std::string> passed;
   std::vector<std::string> failed;
   auto record = [&](const std::string& id, bool ok) {{
@@ -2968,7 +3184,7 @@ int main() {{
 
 def rust_tester_source(entrypoint: str, tests: list[TestCase]) -> str:
     payload = tester_payload_json(entrypoint, tests)
-    cases = "\n".join(rust_test_case_code(entrypoint, test, index) for index, test in enumerate(tests))
+    cases = "\n".join(rust_guarded_test_case_code(entrypoint, test, index) for index, test in enumerate(tests))
     return f"""// BCG_PAYLOAD: {payload}
 include!(env!("BCG_SOLUTION_PATH"));
 
@@ -2977,6 +3193,7 @@ include!(env!("BCG_SOLUTION_PATH"));
 fn main() {{
   let default_tol: f64 = std::env::var("BABEL_CODE_GOAT_TOL").ok().and_then(|value| value.parse().ok()).unwrap_or(0.0);
   let tolerance = BcgTolerance {{ abs: default_tol, rel: 0.0, strict: false }};
+  let run_id = std::env::var("{RUN_ID_ENV}").ok();
   let mut passed: Vec<&'static str> = Vec::new();
   let mut failed: Vec<&'static str> = Vec::new();
 {cases}
@@ -3063,6 +3280,13 @@ def command_generate(args: argparse.Namespace) -> int:
 def command_test(args: argparse.Namespace) -> int:
     if args.lang not in SUPPORTED_LANGS:
         return print_result(RESULT_ERROR)
+    try:
+        timeout_ms = parse_optional_positive_int(args.timeout_ms)
+        total_timeout_ms = parse_optional_positive_int(args.total_timeout_ms)
+    except ValueError:
+        return print_result(RESULT_ERROR)
+    if args.list_tests and args.run:
+        return print_result(RESULT_ERROR)
     tests_dir = Path(args.tests_dir)
     tester = tests_dir / SUPPORTED_LANGS[args.lang]["tester"]
     if not tester.exists():
@@ -3074,18 +3298,32 @@ def command_test(args: argparse.Namespace) -> int:
             return print_result(RESULT_ERROR)
     except Exception:
         return print_result(RESULT_ERROR)
+    all_ids = [test["id"] for test in payload["tests"]]
+    scoped = scoped_tests(payload["tests"], args.run)
+    if scoped is None:
+        return print_result(RESULT_ERROR)
+    scope_ids = [test["id"] for test in scoped]
+    if args.list_tests:
+        return print_result(make_result("pass", all_ids, []))
     try:
         env = os.environ.copy()
         root = str(Path(__file__).resolve().parent)
         env["BABEL_CODE_GOAT_ROOT"] = root
         env["BABEL_CODE_GOAT_TOL"] = str(args.tol)
         env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+        if args.run:
+            env[RUN_ID_ENV] = args.run
+        if timeout_ms is not None:
+            env[TIMEOUT_MS_ENV] = str(timeout_ms)
+        if total_timeout_ms is not None:
+            env[TOTAL_TIMEOUT_MS_ENV] = str(total_timeout_ms)
+        timeout = runtime_timeout_seconds(timeout_ms, total_timeout_ms, len(scope_ids))
         if args.lang == "python":
             command = [sys.executable, str(tester), str(Path(args.solution_path))]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout)
         elif args.lang in {"javascript", "typescript"}:
             command = ["node", str(tester), str(Path(args.solution_path))]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+            completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env, timeout=timeout)
         else:
             with tempfile.TemporaryDirectory(prefix="bcg-compiled-") as temp_dir:
                 binary = Path(temp_dir) / "tester"
@@ -3096,7 +3334,9 @@ def command_test(args: argparse.Namespace) -> int:
                 compiled = subprocess.run(compile_command, text=True, capture_output=True, check=False, env=compile_env)
                 if compiled.returncode != 0:
                     return print_result(RESULT_ERROR)
-                completed = subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env)
+                completed = subprocess.run([str(binary)], text=True, capture_output=True, check=False, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return print_result(result_for_timeout(scope_ids))
     except Exception:
         return print_result(RESULT_ERROR)
 
@@ -3108,13 +3348,8 @@ def command_test(args: argparse.Namespace) -> int:
         result = json.loads(line)
     except json.JSONDecodeError:
         return print_result(RESULT_ERROR)
-    if (
-        not isinstance(result, dict)
-        or list(result.keys()) != ["status", "passed", "failed"]
-        or result.get("status") not in {"pass", "fail", "error"}
-        or not isinstance(result.get("passed"), list)
-        or not isinstance(result.get("failed"), list)
-    ):
+    result = normalize_runner_result(result, scope_ids)
+    if result is None:
         return print_result(RESULT_ERROR)
     return print_result(result)
 
@@ -3134,6 +3369,10 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("tests_dir")
     test.add_argument("--lang", required=True)
     test.add_argument("--tol", type=float, default=0.0)
+    test.add_argument("--list-tests", action="store_true")
+    test.add_argument("--run")
+    test.add_argument("--timeout-ms", type=int)
+    test.add_argument("--total-timeout-ms", type=int)
     test.set_defaults(func=command_test)
     return parser
 
